@@ -1,0 +1,13 @@
+/* Jetson IMU TUI styles */
+
+Screen {
+    background: $background;
+}
+
+#readouts {
+    height: 1fr;
+}
+
+#console-wrap {
+    height: 12;
+}
