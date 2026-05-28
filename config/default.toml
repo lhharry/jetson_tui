@@ -1,0 +1,9 @@
+[buses]
+1 = "Left"
+7 = "Right"
+
+[defaults]
+log_dir = "./logs"
+ui_refresh_hz = 30
+record_hz = 100
+plot_window_samples = 500
