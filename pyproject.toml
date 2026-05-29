@@ -7,7 +7,6 @@ requires-python = ">=3.11"
 license = { file = "LICENSE" }
 dependencies = [
     "textual>=8.0,<9",
-    "textual-plotext>=1.0,<2",
     "imu-python==0.1.1",
     # imu-python's base modules import adafruit_extended_bus unconditionally
     # even though it lives in its [hw] extra. Pull it in so plain `pip install .`
