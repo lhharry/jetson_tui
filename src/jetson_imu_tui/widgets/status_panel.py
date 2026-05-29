@@ -12,7 +12,7 @@ from textual.widgets import Static
 class StatusPanel(Static):
     DEFAULT_CSS = """
     StatusPanel {
-        height: 3;
+        height: 4;
         padding: 0 1;
         background: $boost;
         color: $text;
@@ -24,6 +24,7 @@ class StatusPanel(Static):
 
     def __init__(self) -> None:
         super().__init__(id="status-panel")
+        self.border_title = "Status"
         self._imus: dict[str, str] = {}
         self._streaming = False
         self._recording = False
@@ -36,6 +37,7 @@ class StatusPanel(Static):
             Static("(disconnected)", id="imu-states", classes="field"),
             Static("Streaming: OFF", id="streaming-state", classes="field"),
             Static("Rec: OFF", id="recording-state", classes="field"),
+            Static("Data: -- Hz", id="data-hz", classes="field"),
         )
         yield Horizontal(
             Static("Freq: 100 Hz", id="freq-state", classes="field"),
@@ -61,6 +63,10 @@ class StatusPanel(Static):
     def set_log_dir(self, path: Path) -> None:
         self._log_dir = path
         self.query_one("#log-state", Static).update(f"Logs: {path}")
+
+    def set_data_hz(self, hz: int) -> None:
+        text = "Data: -- Hz" if hz <= 0 else f"Data: {hz} Hz"
+        self.query_one("#data-hz", Static).update(text)
 
     def _refresh_imus(self) -> None:
         if not self._imus:

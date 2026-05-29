@@ -42,6 +42,8 @@ class JetsonImuApp(App):
         self._log_dir = config.log_dir
         self._loguru_handle: int | None = None
         self._main_screen: MainScreen | None = None
+        self._latest: dict[str, tuple] = {}
+        self._pump_count = 0
 
     @property
     def main_screen(self) -> MainScreen:
@@ -71,18 +73,45 @@ class JetsonImuApp(App):
         except Exception:
             self._loguru_handle = None
         ms.console.write_line("Ready. Press [c] to connect.")
-        self.set_interval(1.0 / max(1, self.app_config.ui_refresh_hz), self._tick)
+        cfg = self.app_config
+        self.set_interval(1.0 / max(1, cfg.data_hz), self._pump)
+        self.set_interval(1.0 / max(1, cfg.ui_refresh_hz), self._refresh_readouts)
+        self.set_interval(1.0, self._calc_rates)
 
-    def _tick(self) -> None:
+    def _pump(self) -> None:
+        """High-rate data acquisition: snapshot + ring-buffer append only (cheap)."""
         if not self.service.is_connected() or not self.streaming:
             return
         snap = self.service.snapshot()
-        ms = self.main_screen
+        latest: dict[str, tuple] = {}
         for label, data in snap.items():
-            self.buffers.append(label, data)
+            euler = self.buffers.append(label, data)
+            latest[label] = (data, euler)
+        self._latest = latest
+        self._pump_count += 1
+
+    def _refresh_readouts(self) -> None:
+        """Lower-rate, more expensive on-screen number update.
+
+        Skipped entirely when the main screen isn't on top (e.g. the plot screen is
+        open) — those widgets aren't visible, but the pump still fills the buffers.
+        """
+        if not self.streaming or self.screen is not self._main_screen:
+            return
+        ms = self.main_screen
+        for label, (data, euler) in self._latest.items():
             ro = ms.readout(label)
             if ro is not None:
-                ro.update_from(data)
+                ro.update_from(data, euler)
+
+    def _calc_rates(self) -> None:
+        hz = self._pump_count
+        self._pump_count = 0
+        if self._main_screen is not None:
+            try:
+                self.main_screen.status.set_data_hz(hz)
+            except Exception:
+                pass
 
     # ------------------------------------------------------------------ Actions
 
@@ -115,6 +144,7 @@ class JetsonImuApp(App):
         ms.status.set_streaming(self.streaming)
         ms.console.write_line(f"Streaming {'ON' if self.streaming else 'OFF'}")
         if not self.streaming:
+            self._latest = {}
             for label in self.app_config.labels:
                 ro = ms.readout(label)
                 if ro is not None:
@@ -173,7 +203,15 @@ class JetsonImuApp(App):
         self.push_screen(FolderModal(self._log_dir), _apply)
 
     def action_plot(self) -> None:
-        self.push_screen(PlotScreen(self.buffers))
+        cfg = self.app_config
+        self.push_screen(
+            PlotScreen(
+                self.buffers,
+                fps=cfg.plot_fps,
+                window_s=cfg.plot_window_seconds,
+                smoothing=cfg.plot_smoothing,
+            )
+        )
 
     # ------------------------------------------------------------------ Workers
 
@@ -218,8 +256,10 @@ class JetsonImuApp(App):
 
     def _on_disconnected(self) -> None:
         ms = self.main_screen
+        self._latest = {}
         ms.status.set_imus({})
         ms.status.set_streaming(False)
+        ms.status.set_data_hz(0)
         for label in self.app_config.labels:
             ro = ms.readout(label)
             if ro is not None:

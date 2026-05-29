@@ -4,6 +4,10 @@
 
 [defaults]
 log_dir = "./logs"
-ui_refresh_hz = 30
+data_hz = 30             # sensor poll + buffer append (data fidelity)
+ui_refresh_hz = 15       # on-screen numeric readout refresh
+plot_fps = 15            # plot redraw rate
+plot_window_seconds = 10 # fixed scrolling x-window
+plot_smoothing = 1       # moving-average window (1 = off)
 record_hz = 100
-plot_window_samples = 500
+plot_window_samples = 600  # ~ data_hz * window_seconds + margin

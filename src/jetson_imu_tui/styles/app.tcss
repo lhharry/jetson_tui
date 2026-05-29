@@ -6,8 +6,14 @@ Screen {
 
 #readouts {
     height: 1fr;
+    margin: 0 0 1 0;
+}
+
+#readouts IMUReadout {
+    width: 1fr;
+    margin: 0 1 0 0;
 }
 
 #console-wrap {
-    height: 12;
+    height: 10;
 }

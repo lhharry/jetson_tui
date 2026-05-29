@@ -33,11 +33,16 @@ class RingBuffers:
                 for axis in axes:
                     self.data[(label, signal, axis)] = deque(maxlen=self.maxlen)
 
-    def append(self, label: str, imu_data: IMUData | None) -> None:
+    def append(self, label: str, imu_data: IMUData | None):
+        """Append a sample and return the Euler orientation it computed.
+
+        Returning the Euler object lets callers (e.g. the readout widget) reuse it
+        instead of calling ``quat.to_euler`` a second time on the same sample.
+        """
         if label not in self.time:
-            return
+            return None
         if imu_data is None:
-            return
+            return None
         self.time[label].append(imu_data.timestamp)
         euler = imu_data.quat.to_euler("ZYX")
         self.data[(label, "euler", "x")].append(euler.x * RAD_TO_DEG)
@@ -56,3 +61,4 @@ class RingBuffers:
         self.data[(label, "quat", "x")].append(q.x)
         self.data[(label, "quat", "y")].append(q.y)
         self.data[(label, "quat", "z")].append(q.z)
+        return euler
