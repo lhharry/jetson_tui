@@ -14,11 +14,22 @@ LABEL_COLORS = {"Left": "magenta+", "Right": "cyan+"}
 DEFAULT_COLORS = ("magenta+", "cyan+", "yellow+", "green+")
 
 SIGNAL_TITLES = {
-    "euler": "Euler angles (deg)",
+    "euler": "Euler angles (deg, ZYX)",
     "accel": "Acceleration (m/s^2)",
     "gyro": "Gyroscope (rad/s)",
     "quat": "Quaternion",
 }
+
+PLOT_REDRAW_INTERVAL = 0.2
+PLOT_MAX_POINTS = 150
+
+
+def _downsample(seq: list[float], cap: int) -> list[float]:
+    n = len(seq)
+    if n <= cap:
+        return seq
+    step = n // cap
+    return seq[::step][-cap:]
 
 
 class PlotScreen(Screen):
@@ -49,7 +60,7 @@ class PlotScreen(Screen):
         yield Footer()
 
     def on_mount(self) -> None:
-        self.set_interval(0.1, self._redraw)
+        self.set_interval(PLOT_REDRAW_INTERVAL, self._redraw)
         self._redraw()
 
     def action_set_signal(self, signal: str) -> None:
@@ -78,15 +89,16 @@ class PlotScreen(Screen):
         labels = self._buffers.labels
         if self._signal == "quat":
             for li, label in enumerate(labels):
-                t = list(self._buffers.time[label])
-                if not t:
+                t_full = list(self._buffers.time[label])
+                if not t_full:
                     continue
-                t0 = t[0]
-                ts = [x - t0 for x in t]
+                t0 = t_full[0]
+                ts = _downsample([x - t0 for x in t_full], PLOT_MAX_POINTS)
                 for ai, axis in enumerate(axes):
-                    y = list(self._buffers.data[(label, "quat", axis)])
-                    if len(y) != len(ts):
+                    y_full = list(self._buffers.data[(label, "quat", axis)])
+                    if len(y_full) != len(t_full):
                         continue
+                    y = _downsample(y_full, PLOT_MAX_POINTS)
                     color = DEFAULT_COLORS[(li * len(axes) + ai) % len(DEFAULT_COLORS)]
                     plt.plot(ts, y, label=f"{label}_{axis}", color=color)
             plt.title(SIGNAL_TITLES[self._signal])
@@ -96,12 +108,13 @@ class PlotScreen(Screen):
             for ai, axis in enumerate(axes, start=1):
                 sub = plt.subplot(ai, 1)
                 for label in labels:
-                    t = list(self._buffers.time[label])
-                    y = list(self._buffers.data[(label, self._signal, axis)])
-                    if not t or len(t) != len(y):
+                    t_full = list(self._buffers.time[label])
+                    y_full = list(self._buffers.data[(label, self._signal, axis)])
+                    if not t_full or len(t_full) != len(y_full):
                         continue
-                    t0 = t[0]
-                    ts = [x - t0 for x in t]
+                    t0 = t_full[0]
+                    ts = _downsample([x - t0 for x in t_full], PLOT_MAX_POINTS)
+                    y = _downsample(y_full, PLOT_MAX_POINTS)
                     color = LABEL_COLORS.get(label, DEFAULT_COLORS[0])
                     sub.plot(ts, y, label=label, color=color)
                 sub.title(f"{SIGNAL_TITLES[self._signal]} — {axis}")

@@ -6,6 +6,8 @@ from pathlib import Path
 
 from loguru import logger
 from textual.app import App
+
+logger.remove()
 from textual.binding import Binding
 from textual.worker import Worker
 
@@ -60,6 +62,7 @@ class JetsonImuApp(App):
             if ro is not None:
                 ro.set_subtitle(f"{label} (disconnected)")
         try:
+            logger.remove()
             self._loguru_handle = logger.add(
                 ms.console.loguru_sink,
                 level="WARNING",
