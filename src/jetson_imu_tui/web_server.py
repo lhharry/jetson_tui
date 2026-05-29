@@ -1,11 +1,9 @@
 """Headless web server: serve latest IMU values for a browser uPlot frontend.
 
-Deliberately minimal (mirrors a proven Raspberry-Pi design): Flask + three routes
-(`GET /`, `GET /data`, `POST /record`). No websocket, no ring buffer, no async — the
-browser polls `/data`, accumulates points, and draws with uPlot. All rendering happens
-in the browser on the laptop, so the Jetson spends ~zero CPU on the UI.
-
-Run via `jetson-imu-tui --serve`.
+Deliberately minimal (mirrors a proven Raspberry-Pi design): Flask + a few routes
+(`GET /`, `GET /data`, `POST /record`, `POST /freq`). No websocket, no ring buffer,
+no async — the browser polls `/data`, accumulates points, and draws with uPlot. All
+rendering happens in the browser on the laptop, so the Jetson spends ~zero CPU on the UI.
 """
 
 from __future__ import annotations
@@ -215,123 +213,248 @@ _HTML = """<!DOCTYPE html>
 <link rel="stylesheet" href="https://cdn.jsdelivr.net/npm/uplot@1.6.31/dist/uPlot.min.css">
 <script src="https://cdn.jsdelivr.net/npm/uplot@1.6.31/dist/uPlot.iife.min.js"></script>
 <style>
-  html,body{margin:0;height:100%;font-family:system-ui,Arial,sans-serif;background:#0f1115;color:#ddd}
-  #bar{display:flex;gap:8px;align-items:center;padding:8px 12px;background:#171a21;border-bottom:1px solid #2a2f3a}
-  #bar .grow{flex:1}
-  button{padding:6px 12px;font-size:14px;border-radius:6px;border:1px solid #3a3f4b;background:#222733;color:#ddd;cursor:pointer}
-  button:hover{background:#2c3340}
-  button.active{background:#2563eb;border-color:#2563eb;color:#fff}
-  #status{font-variant-numeric:tabular-nums;color:#9aa4b2;font-size:13px}
-  #charts{height:calc(100% - 49px);padding:6px;box-sizing:border-box;display:flex;flex-direction:column;gap:6px}
-  .chart{background:#fff;border-radius:6px;padding:2px 4px}
-  .uplot, .u-wrap{width:100% !important}
-  #freq{width:56px;background:#222733;color:#ddd;border:1px solid #3a3f4b;border-radius:5px;padding:4px 6px}
-  #readout{display:none;height:calc(100% - 49px);margin:0;padding:16px 20px;box-sizing:border-box;
-           overflow:auto;font:15px/1.7 ui-monospace,Menlo,Consolas,monospace;color:#e5e7eb}
+  :root{--bg:#0e1014;--panel:#161922;--panel2:#1d212c;--border:#2a2f3a;--fg:#e5e7eb;--muted:#9aa4b2;--accent:#3b82f6}
+  :root.light{--bg:#f5f7fa;--panel:#ffffff;--panel2:#eef1f6;--border:#d6dce6;--fg:#1b1f27;--muted:#5b6472;--accent:#2563eb}
+  *{box-sizing:border-box}
+  html,body{margin:0;height:100%;font-family:system-ui,-apple-system,"Segoe UI",Roboto,Arial,sans-serif;background:var(--bg);color:var(--fg)}
+  #app{display:flex;flex-direction:column;height:100%}
+  #bar{display:flex;gap:9px;align-items:center;padding:9px 14px;background:var(--panel);border-bottom:1px solid var(--border);flex-wrap:wrap}
+  .seg{display:inline-flex;background:var(--panel2);border:1px solid var(--border);border-radius:8px;overflow:hidden}
+  .seg button{border:0;background:transparent;color:var(--muted);padding:7px 14px;font-size:13px;cursor:pointer}
+  .seg button:hover{background:rgba(127,127,127,.15);color:var(--fg)}
+  .seg button.active{background:var(--accent);color:#fff}
+  .btn{border:1px solid var(--border);background:var(--panel2);color:var(--fg);padding:7px 13px;border-radius:8px;font-size:13px;cursor:pointer}
+  .btn:hover{filter:brightness(1.08)}
+  .btn.rec-on{background:#ef4444;border-color:#ef4444;color:#fff}
+  .btn.pause-on{background:#f59e0b;border-color:#f59e0b;color:#111}
+  .reclabel{display:flex;align-items:center;gap:6px;color:var(--muted);font-size:12px}
+  .num{width:64px;background:var(--panel2);color:var(--fg);border:1px solid var(--border);border-radius:6px;padding:6px}
+  #yman{align-items:center;gap:5px}
+  .grow{flex:1}
+  #status{font-variant-numeric:tabular-nums;color:var(--muted);font-size:12px;white-space:nowrap}
+  #dot{display:inline-block;width:8px;height:8px;border-radius:50%;background:#22c55e;margin-right:7px;vertical-align:middle}
+  #charts{flex:1;min-height:0;display:flex;flex-direction:column;gap:8px;padding:8px}
+  .chart{flex:1;min-height:0;display:flex;flex-direction:column;background:var(--panel);border:1px solid var(--border);border-radius:10px;padding:6px 10px}
+  .chead{display:flex;align-items:center;gap:16px;padding:1px 2px 5px;font-size:12px;color:var(--muted)}
+  .ctitle{font-weight:700;color:var(--fg);text-transform:uppercase;letter-spacing:.05em}
+  .cval{display:inline-flex;align-items:center;gap:6px;font-variant-numeric:tabular-nums}
+  .cval i{width:10px;height:10px;border-radius:3px;display:inline-block}
+  .cval b{color:var(--fg);min-width:60px;display:inline-block}
+  .canvas{flex:1;min-height:0}
+  #readout{display:none;flex:1;min-height:0;overflow:auto;padding:14px;gap:14px;
+           grid-template-columns:repeat(auto-fit,minmax(330px,1fr))}
+  .rcard{background:var(--panel);border:1px solid var(--border);border-radius:12px;padding:14px 18px}
+  .rtitle{font-size:15px;font-weight:700;margin-bottom:6px}
+  .rgroup{display:flex;align-items:center;gap:12px;padding:9px 0;border-top:1px solid var(--border)}
+  .rgname{width:58px;color:var(--muted);font-size:11px;text-transform:uppercase;line-height:1.2}
+  .runit{display:block;font-size:10px;color:var(--muted);opacity:.8}
+  .rvals{display:flex;gap:20px;flex-wrap:wrap;font-variant-numeric:tabular-nums}
+  .rax{display:inline-flex;gap:7px;align-items:baseline}
+  .rax i{font-style:normal;font-weight:700;width:11px}
+  .rax b{font-size:19px;color:var(--fg);min-width:90px;text-align:right;display:inline-block}
 </style>
 </head>
 <body>
-  <div id="bar">
-    <button class="sigbtn active" data-sig="euler" onclick="setSignal('euler')">Euler</button>
-    <button class="sigbtn" data-sig="accel" onclick="setSignal('accel')">Accel</button>
-    <button class="sigbtn" data-sig="gyro" onclick="setSignal('gyro')">Gyro</button>
-    <button class="sigbtn" data-sig="quat" onclick="setSignal('quat')">Quat</button>
-    <button id="viewBtn" onclick="toggleView()">Numbers</button>
-    <button id="pauseBtn" onclick="togglePause()">Pause</button>
-    <button id="recBtn" onclick="toggleRecord()">Record</button>
-    <label style="font-size:13px;color:#9aa4b2">Hz <input id="freq" type="number" min="1" max="200" step="1"></label>
-    <span class="grow"></span>
-    <span id="status">connecting...</span>
+  <div id="app">
+    <div id="bar">
+      <div class="seg" id="sigseg">
+        <button class="sigbtn active" data-sig="euler" onclick="setSignal('euler')">Euler</button>
+        <button class="sigbtn" data-sig="accel" onclick="setSignal('accel')">Accel</button>
+        <button class="sigbtn" data-sig="gyro" onclick="setSignal('gyro')">Gyro</button>
+        <button class="sigbtn" data-sig="quat" onclick="setSignal('quat')">Quat</button>
+      </div>
+      <button id="viewBtn" class="btn" onclick="toggleView()">Numbers</button>
+      <button id="pauseBtn" class="btn" onclick="togglePause()">Pause</button>
+      <button id="yBtn" class="btn" onclick="toggleYMode()">Y: Auto</button>
+      <span id="yman" style="display:none">
+        <input id="ymin" class="num" type="number" step="any" title="Y min">
+        <span style="color:var(--muted)">–</span>
+        <input id="ymax" class="num" type="number" step="any" title="Y max">
+      </span>
+      <span class="grow"></span>
+      <button id="themeBtn" class="btn" onclick="toggleTheme()">Light</button>
+      <button id="recBtn" class="btn" onclick="toggleRecord()">Record</button>
+      <label class="reclabel" title="Recording rate — only affects logging to disk, not the plot">
+        Rec Hz <input id="freq" class="num" type="number" min="1" max="200" step="1"></label>
+      <span id="status"><span id="dot"></span>connecting…</span>
+    </div>
+    <div id="charts"></div>
+    <div id="readout"></div>
   </div>
-  <div id="charts"></div>
-  <pre id="readout"></pre>
 <script>
 const WINDOW_S = __WINDOW_S__;
 const POLL_MS  = __POLL_MS__;
 const SIGNALS = { euler:['x','y','z'], accel:['x','y','z'], gyro:['x','y','z'], quat:['w','x','y','z'] };
-const COLORS  = ['#d946ef', '#06b6d4'];  // Left magenta, Right cyan
+const UNITS   = { euler:'deg', accel:'m/s^2', gyro:'rad/s', quat:'' };
+const THEMES = {
+  dark:  { axis:'#8b93a7', grid:'#222a38', series:['#e879f9','#22d3ee'], ax:{x:'#f87171',y:'#4ade80',z:'#60a5fa',w:'#fbbf24'} },
+  light: { axis:'#5b6472', grid:'#e2e6ee', series:['#c026d3','#0891b2'], ax:{x:'#dc2626',y:'#16a34a',z:'#2563eb',w:'#d97706'} },
+};
+const theme = () => document.documentElement.classList.contains('light') ? THEMES.light : THEMES.dark;
 
 let labels = ['Left','Right'];
 let signal = 'euler';
-let view = 'plot';        // 'plot' | 'numbers'
+let view = 'plot';
 let paused = false;
-let samples = [];     // each: {t, euler:{Left:[...],...}, accel:..., gyro:..., quat:...}
-let charts = [];
+let samples = [];
+let charts = [], heads = [], ro = null;
 let latestT = 0;
+let yBySignal = {};               // signal -> {auto:true} | {auto:false, min, max}
+
+const fmt = (sig, v) => v == null ? '--' : v.toFixed(sig === 'quat' ? 3 : 2);
+
+function chartOpts(w, h){
+  const T = theme();
+  const series = [{}];
+  labels.forEach((lab, k) => series.push({ stroke: T.series[k % T.series.length], width: 2, points:{show:false} }));
+  const ym = yBySignal[signal];
+  const yscale = (ym && !ym.auto && ym.max > ym.min) ? { range: [ym.min, ym.max] } : {};
+  return {
+    width: w, height: h,
+    legend: { show:false },
+    cursor: { drag:{ x:true, y:false }, points:{ show:false } },
+    scales: { x: { time:false, range: () => [latestT - WINDOW_S, latestT] }, y: yscale },
+    axes: [
+      { stroke:T.axis, grid:{ stroke:T.grid }, ticks:{ stroke:T.grid },
+        values:(u,vs)=>vs.map(v=>(v - latestT).toFixed(0)) },
+      { stroke:T.axis, grid:{ stroke:T.grid }, ticks:{ stroke:T.grid }, size:54 },
+    ],
+    series,
+  };
+}
 
 function rebuildCharts(){
+  if(ro) ro.disconnect();
   charts.forEach(u => u.destroy());
-  charts = [];
+  charts = []; heads = [];
   const wrap = document.getElementById('charts');
   wrap.innerHTML = '';
-  const axes = SIGNALS[signal];
-  const w = wrap.clientWidth - 12;
-  const h = Math.max(110, Math.floor((wrap.clientHeight - 6*(axes.length-1)) / axes.length) - 8);
-  axes.forEach((ax, i) => {
-    const div = document.createElement('div');
-    div.className = 'chart';
-    wrap.appendChild(div);
-    const series = [{}];
-    labels.forEach((lab, k) => series.push({ label: lab, stroke: COLORS[k % COLORS.length], width: 2, points:{show:false} }));
-    const opts = {
-      width: w, height: h, title: signal + '  ' + ax,
-      cursor: { drag: { x:true, y:false } },
-      legend: { live: true },
-      scales: { x: { time:false, range: (u,_min,_max)=>[latestT - WINDOW_S, latestT] } },
-      series,
-      axes: [ { values:(u,vals)=>vals.map(v=>(v - latestT).toFixed(1)) }, {} ],
-    };
-    const init = [[]]; labels.forEach(()=>init.push([]));
-    charts.push(new uPlot(opts, init, div));
+  const T = theme();
+  ro = new ResizeObserver(entries => {
+    for(const e of entries){
+      const u = e.target.__u;
+      if(u && e.contentRect.width > 0 && e.contentRect.height > 0)
+        u.setSize({ width: e.contentRect.width, height: e.contentRect.height });
+    }
+  });
+  SIGNALS[signal].forEach((ax) => {
+    const card = document.createElement('div'); card.className = 'chart';
+    const head = document.createElement('div'); head.className = 'chead';
+    head.innerHTML = '<span class="ctitle">' + signal + ' <span style="color:' + T.ax[ax] + '">' + ax + '</span></span>'
+      + labels.map((lab,k)=>'<span class="cval"><i style="background:' + T.series[k%T.series.length] + '"></i>'
+          + lab + ' <b data-v="' + k + '">--</b></span>').join('');
+    const body = document.createElement('div'); body.className = 'canvas';
+    card.appendChild(head); card.appendChild(body); wrap.appendChild(card);
+    const u = new uPlot(chartOpts(body.clientWidth || 300, body.clientHeight || 140),
+                        [[], ...labels.map(()=>[])], body);
+    body.__u = u; charts.push(u); heads.push(head); ro.observe(body);
   });
   redraw();
 }
 
 function redraw(){
-  const axes = SIGNALS[signal];
   const ts = samples.map(s => s.t);
+  const last = samples[samples.length - 1];
   charts.forEach((u, i) => {
     const cols = [ts];
-    labels.forEach(lab => {
-      cols.push(samples.map(s => { const v = s[signal] && s[signal][lab]; return v ? v[i] : null; }));
-    });
+    labels.forEach(lab => cols.push(samples.map(s => { const v = s[signal] && s[signal][lab]; return v ? v[i] : null; })));
     u.setData(cols);
+    if(last) labels.forEach((lab,k) => {
+      const el = heads[i].querySelector('b[data-v="' + k + '"]');
+      const v = last[signal] && last[signal][lab];
+      if(el) el.textContent = v ? fmt(signal, v[i]) : '--';
+    });
+  });
+}
+
+function buildReadout(){
+  const T = theme();
+  const wrap = document.getElementById('readout');
+  wrap.innerHTML = labels.map(lab =>
+    '<div class="rcard"><div class="rtitle">' + lab + '</div>'
+    + ['euler','accel','gyro','quat'].map(sig =>
+        '<div class="rgroup"><div class="rgname">' + sig
+          + (UNITS[sig] ? '<span class="runit">' + UNITS[sig] + '</span>' : '') + '</div>'
+        + '<div class="rvals">'
+        + SIGNALS[sig].map((ax,i) => '<span class="rax"><i style="color:' + T.ax[ax] + '">' + ax
+            + '</i><b data-k="' + lab + '|' + sig + '|' + i + '">--</b></span>').join('')
+        + '</div></div>').join('')
+    + '</div>').join('');
+}
+
+function updateReadout(d){
+  for(const lab of labels) for(const sig of ['euler','accel','gyro','quat']) SIGNALS[sig].forEach((ax,i) => {
+    const el = document.querySelector('b[data-k="' + lab + '|' + sig + '|' + i + '"]');
+    if(!el) return;
+    const v = d[sig] && d[sig][lab];
+    el.textContent = v ? fmt(sig, v[i]) : '--';
   });
 }
 
 function setSignal(s){
   signal = s;
   document.querySelectorAll('.sigbtn').forEach(b => b.classList.toggle('active', b.dataset.sig === s));
-  if(view === 'plot') rebuildCharts();   // history kept: samples hold all signals
+  if(view === 'plot') rebuildCharts();
+  syncYControls();
 }
 function togglePause(){
   paused = !paused;
-  document.getElementById('pauseBtn').textContent = paused ? 'Resume' : 'Pause';
+  const b = document.getElementById('pauseBtn');
+  b.textContent = paused ? 'Resume' : 'Pause';
+  b.classList.toggle('pause-on', paused);
 }
-async function toggleRecord(){
-  try { await fetch('/record', {method:'POST'}); } catch(e) {}
-}
+async function toggleRecord(){ try { await fetch('/record', {method:'POST'}); } catch(e) {} }
+
 function toggleView(){
   view = (view === 'plot') ? 'numbers' : 'plot';
   document.getElementById('viewBtn').textContent = (view === 'plot') ? 'Numbers' : 'Plots';
   document.getElementById('charts').style.display = (view === 'plot') ? 'flex' : 'none';
-  document.getElementById('readout').style.display = (view === 'plot') ? 'none' : 'block';
-  if(view === 'plot') rebuildCharts();
+  document.getElementById('readout').style.display = (view === 'plot') ? 'none' : 'grid';
+  if(view === 'plot'){ rebuildCharts(); }
+  else { buildReadout(); if(samples.length) updateReadout(samples[samples.length-1]); }
 }
 
-function fmtVals(arr, axes){
-  return axes.map((a, i) => a + ' ' + (arr ? arr[i].toFixed(3) : '--').padStart(9)).join('   ');
+// ---- manual Y range -------------------------------------------------------
+function syncYControls(){
+  const ym = yBySignal[signal] || { auto:true };
+  document.getElementById('yBtn').textContent = ym.auto ? 'Y: Auto' : 'Y: Manual';
+  const man = document.getElementById('yman');
+  man.style.display = ym.auto ? 'none' : 'inline-flex';
+  if(!ym.auto){ document.getElementById('ymin').value = ym.min; document.getElementById('ymax').value = ym.max; }
 }
-function updateReadout(d){
-  let s = '';
-  for(const sig of ['euler','accel','gyro','quat']){
-    const axes = SIGNALS[sig];
-    s += sig.toUpperCase().padEnd(7);
-    labels.forEach(lab => { s += lab + ':  ' + fmtVals(d[sig] && d[sig][lab], axes) + '      '; });
-    s += '\\n';
+function toggleYMode(){
+  const cur = yBySignal[signal] || { auto:true };
+  if(cur.auto){
+    let mn = 0, mx = 1;
+    if(charts.length && charts[0].scales && charts[0].scales.y && charts[0].scales.y.min != null){
+      mn = charts[0].scales.y.min; mx = charts[0].scales.y.max;
+    }
+    const dec = (mx - mn) < 1 ? 3 : 2;
+    yBySignal[signal] = { auto:false, min:+mn.toFixed(dec), max:+mx.toFixed(dec) };
+  } else {
+    yBySignal[signal] = { auto:true };
   }
-  document.getElementById('readout').textContent = s;
+  syncYControls();
+  if(view === 'plot') rebuildCharts();
 }
+function applyYInput(){
+  const mn = parseFloat(document.getElementById('ymin').value);
+  const mx = parseFloat(document.getElementById('ymax').value);
+  if(isFinite(mn) && isFinite(mx) && mx > mn){
+    yBySignal[signal] = { auto:false, min:mn, max:mx };
+    if(view === 'plot') rebuildCharts();
+  }
+}
+
+// ---- theme ----------------------------------------------------------------
+function applyTheme(light){
+  document.documentElement.classList.toggle('light', light);
+  document.getElementById('themeBtn').textContent = light ? 'Dark' : 'Light';
+  try { localStorage.setItem('theme', light ? 'light' : 'dark'); } catch(_) {}
+  if(view === 'plot'){ if(charts.length) rebuildCharts(); }
+  else { buildReadout(); if(samples.length) updateReadout(samples[samples.length-1]); }
+}
+function toggleTheme(){ applyTheme(!document.documentElement.classList.contains('light')); }
 
 async function tick(){
   if(!paused){
@@ -339,29 +462,39 @@ async function tick(){
       const d = await (await fetch('/data')).json();
       latestT = d.t;
       const ks = Object.keys(d.euler || {});
-      if(ks.length && JSON.stringify(ks) !== JSON.stringify(labels)){ labels = ks; if(view==='plot') rebuildCharts(); }
+      if(ks.length && JSON.stringify(ks) !== JSON.stringify(labels)){
+        labels = ks;
+        if(view === 'plot') rebuildCharts(); else buildReadout();
+      }
       samples.push(d);
       const cutoff = latestT - WINDOW_S;
       while(samples.length && samples[0].t < cutoff) samples.shift();
-      document.getElementById('status').textContent =
-        'rec: ' + (d.recording ? 'ON' : 'off') + ' | ' + d.hz + ' Hz | t=' + d.t.toFixed(1);
-      document.getElementById('recBtn').textContent = d.recording ? 'Stop Rec' : 'Record';
-      document.getElementById('recBtn').classList.toggle('active', !!d.recording);
+
+      document.getElementById('status').innerHTML = '<span id="dot"></span>live · t=' + d.t.toFixed(1) + 's';
+      const rb = document.getElementById('recBtn');
+      rb.textContent = d.recording ? 'Recording' : 'Record';
+      rb.classList.toggle('rec-on', !!d.recording);
       const f = document.getElementById('freq');
       if(document.activeElement !== f) f.value = d.hz;
+
       if(view === 'plot') redraw(); else updateReadout(d);
     } catch(e) { /* skip dropped poll */ }
   }
   setTimeout(tick, POLL_MS);
 }
 
-window.addEventListener('resize', () => { if(view === 'plot') rebuildCharts(); });
 window.addEventListener('DOMContentLoaded', () => {
+  let saved = 'dark';
+  try { saved = localStorage.getItem('theme') || 'dark'; } catch(_) {}
+  applyTheme(saved === 'light');
   document.getElementById('freq').addEventListener('change', async (e) => {
     const v = parseInt(e.target.value, 10);
     if(v >= 1 && v <= 200){ try { await fetch('/freq?hz=' + v, {method:'POST'}); } catch(_) {} }
   });
+  document.getElementById('ymin').addEventListener('change', applyYInput);
+  document.getElementById('ymax').addEventListener('change', applyYInput);
   rebuildCharts();
+  syncYControls();
   tick();
 });
 </script>

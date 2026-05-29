@@ -15,12 +15,12 @@ workloads (e.g. an AI model) on the same board.
 - Four signal views (Euler / Accel / Gyro / Quaternion); Left + Right overlaid.
 - Switch to a **numbers** view for live numeric readouts of every signal.
 - **Record** toggle and an adjustable **recording frequency** (1–200 Hz) from the page.
-- Recording writes four tab-separated files per session under
+- Recording writes four comma-separated files per session under
   `<log_dir>/YYYY_MM_DD/HH_MM_SS/`:
-  - `quaternions.tsv` — `Time Left_w Left_x Left_y Left_z Right_w Right_x Right_y Right_z`
-  - `accelerometers.tsv` — `Time Left_x Left_y Left_z Right_x Right_y Right_z`
-  - `gyroscopes.tsv` — same columns as accel
-  - `euler_angles.tsv` — degrees (ZYX intrinsic: x=roll, y=pitch, z=yaw)
+  - `quaternions.csv` — `Time,Left_w,Left_x,Left_y,Left_z,Right_w,Right_x,Right_y,Right_z`
+  - `accelerometers.csv` — `Time,Left_x,Left_y,Left_z,Right_x,Right_y,Right_z`
+  - `gyroscopes.csv` — same columns as accel
+  - `euler_angles.csv` — degrees (ZYX intrinsic: x=roll, y=pitch, z=yaw)
 
 ## Install
 

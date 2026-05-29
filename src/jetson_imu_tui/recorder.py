@@ -1,4 +1,4 @@
-"""Threaded TSV recorder that writes 4 files in lockstep."""
+"""Threaded CSV recorder that writes 4 files in lockstep."""
 
 from __future__ import annotations
 
@@ -16,7 +16,7 @@ def _hdr(labels: list[str], axes: tuple[str, ...]) -> str:
     cols = ["Time"]
     for label in labels:
         cols.extend(f"{label}_{a}" for a in axes)
-    return "\t".join(cols) + "\n"
+    return ",".join(cols) + "\n"
 
 
 class Recorder:
@@ -37,10 +37,10 @@ class Recorder:
     def __enter__(self) -> "Recorder":
         self.folder.mkdir(parents=True, exist_ok=True)
         layout = {
-            "quaternions.tsv": ("quat", ("w", "x", "y", "z")),
-            "accelerometers.tsv": ("accel", ("x", "y", "z")),
-            "gyroscopes.tsv": ("gyro", ("x", "y", "z")),
-            "euler_angles.tsv": ("euler", ("x", "y", "z")),
+            "quaternions.csv": ("quat", ("w", "x", "y", "z")),
+            "accelerometers.csv": ("accel", ("x", "y", "z")),
+            "gyroscopes.csv": ("gyro", ("x", "y", "z")),
+            "euler_angles.csv": ("euler", ("x", "y", "z")),
         }
         for fname, (_signal, axes) in layout.items():
             fh = open(self.folder / fname, "w", encoding="utf-8", newline="")
@@ -99,12 +99,12 @@ class Recorder:
                     f"{e.y * RAD_TO_DEG:.6f}",
                     f"{e.z * RAD_TO_DEG:.6f}",
                 ]
-            rows["quaternions.tsv"].extend(quat_vals)
-            rows["accelerometers.tsv"].extend(accel_vals)
-            rows["gyroscopes.tsv"].extend(gyro_vals)
-            rows["euler_angles.tsv"].extend(euler_vals)
+            rows["quaternions.csv"].extend(quat_vals)
+            rows["accelerometers.csv"].extend(accel_vals)
+            rows["gyroscopes.csv"].extend(gyro_vals)
+            rows["euler_angles.csv"].extend(euler_vals)
         for fname, cells in rows.items():
             fh = self._files.get(fname)
             if fh is None:
                 continue
-            fh.write("\t".join(cells) + "\n")
+            fh.write(",".join(cells) + "\n")
