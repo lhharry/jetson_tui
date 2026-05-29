@@ -10,7 +10,7 @@ from imu_python.base_classes import IMUData
 
 
 SIGNAL_AXES = {
-    "euler": ("roll", "pitch", "yaw"),
+    "euler": ("x", "y", "z"),
     "accel": ("x", "y", "z"),
     "gyro": ("x", "y", "z"),
     "quat": ("w", "x", "y", "z"),
@@ -40,9 +40,9 @@ class RingBuffers:
             return
         self.time[label].append(imu_data.timestamp)
         euler = imu_data.quat.to_euler("ZYX")
-        self.data[(label, "euler", "roll")].append(euler.x * RAD_TO_DEG)
-        self.data[(label, "euler", "pitch")].append(euler.y * RAD_TO_DEG)
-        self.data[(label, "euler", "yaw")].append(euler.z * RAD_TO_DEG)
+        self.data[(label, "euler", "x")].append(euler.x * RAD_TO_DEG)
+        self.data[(label, "euler", "y")].append(euler.y * RAD_TO_DEG)
+        self.data[(label, "euler", "z")].append(euler.z * RAD_TO_DEG)
         accel = imu_data.device_data.accel
         self.data[(label, "accel", "x")].append(accel.x)
         self.data[(label, "accel", "y")].append(accel.y)

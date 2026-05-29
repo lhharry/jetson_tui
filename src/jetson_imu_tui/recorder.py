@@ -40,7 +40,7 @@ class Recorder:
             "quaternions.tsv": ("quat", ("w", "x", "y", "z")),
             "accelerometers.tsv": ("accel", ("x", "y", "z")),
             "gyroscopes.tsv": ("gyro", ("x", "y", "z")),
-            "euler_angles.tsv": ("euler", ("roll", "pitch", "yaw")),
+            "euler_angles.tsv": ("euler", ("x", "y", "z")),
         }
         for fname, (_signal, axes) in layout.items():
             fh = open(self.folder / fname, "w", encoding="utf-8", newline="")

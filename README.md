@@ -17,7 +17,7 @@ recorder, frequency / log-folder pickers, and an in-terminal plot via
   - `quaternions.tsv` — `Time Left_w Left_x Left_y Left_z Right_w Right_x Right_y Right_z`
   - `accelerometers.tsv` — `Time Left_x Left_y Left_z Right_x Right_y Right_z`
   - `gyroscopes.tsv` — same columns as accel
-  - `euler_angles.tsv` — degrees, `Time Left_roll Left_pitch Left_yaw Right_roll Right_pitch Right_yaw`
+  - `euler_angles.tsv` — degrees (ZYX intrinsic: x=roll, y=pitch, z=yaw), `Time Left_x Left_y Left_z Right_x Right_y Right_z`
 - Plot screen with four signal modes (Euler / Accel / Gyro / Quaternion) and
   pause toggle. Both IMUs are overlaid in the same panel.
 - Loguru warnings from `imu-python` (e.g. uncalibrated magnetometer) surface in

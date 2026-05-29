@@ -29,9 +29,9 @@ class IMUReadout(Static):
     def compose(self) -> ComposeResult:
         yield Vertical(
             Static(self._subtitle, id="subtitle", classes="row"),
-            Static("Roll  --", id="roll", classes="row"),
-            Static("Pitch --", id="pitch", classes="row"),
-            Static("Yaw   --", id="yaw", classes="row"),
+            Static("Eul x --", id="euler-x", classes="row"),
+            Static("Eul y --", id="euler-y", classes="row"),
+            Static("Eul z --", id="euler-z", classes="row"),
             Static("Accel --", id="accel", classes="row"),
             Static("Gyro  --", id="gyro", classes="row"),
             Static("Quat  --", id="quat", classes="row"),
@@ -43,17 +43,17 @@ class IMUReadout(Static):
 
     def update_from(self, data: IMUData | None) -> None:
         if data is None:
-            self.query_one("#roll", Static).update("Roll  --")
-            self.query_one("#pitch", Static).update("Pitch --")
-            self.query_one("#yaw", Static).update("Yaw   --")
+            self.query_one("#euler-x", Static).update("Eul x --")
+            self.query_one("#euler-y", Static).update("Eul y --")
+            self.query_one("#euler-z", Static).update("Eul z --")
             self.query_one("#accel", Static).update("Accel --")
             self.query_one("#gyro", Static).update("Gyro  --")
             self.query_one("#quat", Static).update("Quat  --")
             return
         e = data.quat.to_euler("ZYX")
-        self.query_one("#roll", Static).update(f"Roll  {e.x * RAD_TO_DEG:+8.2f}°")
-        self.query_one("#pitch", Static).update(f"Pitch {e.y * RAD_TO_DEG:+8.2f}°")
-        self.query_one("#yaw", Static).update(f"Yaw   {e.z * RAD_TO_DEG:+8.2f}°")
+        self.query_one("#euler-x", Static).update(f"Eul x {e.x * RAD_TO_DEG:+8.2f}°")
+        self.query_one("#euler-y", Static).update(f"Eul y {e.y * RAD_TO_DEG:+8.2f}°")
+        self.query_one("#euler-z", Static).update(f"Eul z {e.z * RAD_TO_DEG:+8.2f}°")
         a = data.device_data.accel
         self.query_one("#accel", Static).update(
             f"Accel x {a.x:+7.3f}  y {a.y:+7.3f}  z {a.z:+7.3f}"
