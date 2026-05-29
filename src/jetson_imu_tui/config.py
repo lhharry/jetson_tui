@@ -13,13 +13,11 @@ DEFAULT_CONFIG = Path(__file__).resolve().parents[2] / "config" / "default.toml"
 class AppConfig:
     bus_labels: dict[int, str] = field(default_factory=lambda: {1: "Left", 7: "Right"})
     log_dir: Path = Path("./logs")
-    data_hz: int = 30
-    ui_refresh_hz: int = 15
     plot_fps: int = 15
     plot_window_seconds: float = 10.0
-    plot_smoothing: int = 1
     record_hz: int = 100
-    plot_window_samples: int = 600
+    web_host: str = "::"
+    web_port: int = 8000
 
     @property
     def labels(self) -> list[str]:
@@ -36,11 +34,9 @@ def load_config(path: Path | None = None) -> AppConfig:
     return AppConfig(
         bus_labels=bus_labels or {1: "Left", 7: "Right"},
         log_dir=Path(defaults.get("log_dir", "./logs")).expanduser(),
-        data_hz=int(defaults.get("data_hz", 30)),
-        ui_refresh_hz=int(defaults.get("ui_refresh_hz", 15)),
         plot_fps=int(defaults.get("plot_fps", 15)),
         plot_window_seconds=float(defaults.get("plot_window_seconds", 10.0)),
-        plot_smoothing=int(defaults.get("plot_smoothing", 1)),
         record_hz=int(defaults.get("record_hz", 100)),
-        plot_window_samples=int(defaults.get("plot_window_samples", 600)),
+        web_host=str(defaults.get("web_host", "::")),
+        web_port=int(defaults.get("web_port", 8000)),
     )

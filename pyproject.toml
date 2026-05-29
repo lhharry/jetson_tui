@@ -1,12 +1,12 @@
 [project]
 name = "jetson-imu-tui"
 version = "0.1.0"
-description = "Textual TUI for streaming and recording two BNO055 IMUs on the Jetson"
+description = "Headless web server for streaming, recording, and browser-plotting two BNO055 IMUs on the Jetson"
 readme = "README.md"
 requires-python = ">=3.11"
 license = { file = "LICENSE" }
 dependencies = [
-    "textual>=8.0,<9",
+    "flask>=3,<4",
     "imu-python==0.1.1",
     # imu-python's base modules import adafruit_extended_bus unconditionally
     # even though it lives in its [hw] extra. Pull it in so plain `pip install .`

@@ -4,10 +4,8 @@
 
 [defaults]
 log_dir = "./logs"
-data_hz = 30             # sensor poll + buffer append (data fidelity)
-ui_refresh_hz = 15       # on-screen numeric readout refresh
-plot_fps = 15            # plot redraw rate
-plot_window_seconds = 10 # fixed scrolling x-window
-plot_smoothing = 1       # moving-average window (1 = off)
-record_hz = 100
-plot_window_samples = 600  # ~ data_hz * window_seconds + margin
+plot_fps = 15             # browser poll rate (samples/sec fetched by the page)
+plot_window_seconds = 10  # rolling time window shown in the plots
+record_hz = 100           # TSV recording rate
+web_host = "::"           # bind host: "::" = IPv6+IPv4 dual-stack; "0.0.0.0" = IPv4 only
+web_port = 8000           # server port
