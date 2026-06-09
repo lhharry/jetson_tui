@@ -147,6 +147,10 @@ def create_app(state: ServerState, window_s: float, poll_ms: int) -> Flask:
         hz = request.args.get("hz") or (request.get_json(silent=True) or {}).get("hz")
         return jsonify({"hz": state.set_record_hz(hz)})
 
+    @app.route("/calibration", methods=["GET"])
+    def calibration() -> Response:
+        return jsonify(state.service.calibration_status())
+
     @app.route("/axis-remap", methods=["GET"])
     def axis_remap_get() -> Response:
         return jsonify(state.service.get_axis_remap())
@@ -302,6 +306,12 @@ _HTML = """<!DOCTYPE html>
   .muted{color:var(--muted);font-size:12px;font-variant-numeric:tabular-nums}
   #cubeWrap{height:240px;background:var(--panel2);border:1px solid var(--border);border-radius:10px;overflow:hidden}
   #cube{display:block;width:100%;height:100%}
+  .calrow{display:flex;align-items:center;gap:10px;padding:6px 0}
+  .calname{width:52px;font-size:12px;color:var(--muted);text-transform:uppercase;letter-spacing:.04em}
+  .calbars{display:flex;gap:5px}
+  .calseg{width:30px;height:12px;border-radius:3px;background:var(--panel2);border:1px solid var(--border)}
+  .calseg.on{background:#22c55e;border-color:#22c55e}
+  .calready{font-size:12px;font-weight:700;margin-left:8px}
 </style>
 </head>
 <body>
@@ -316,6 +326,7 @@ _HTML = """<!DOCTYPE html>
       <button id="viewBtn" class="btn" onclick="toggleView()">Numbers</button>
       <button id="pauseBtn" class="btn" onclick="togglePause()">Pause</button>
       <button id="axisBtn" class="btn" onclick="openAxis()">Axis</button>
+      <button id="calibBtn" class="btn" onclick="openCalib()">Calib</button>
       <button id="yBtn" class="btn" onclick="toggleYMode()">Y: Auto</button>
       <span id="yman" style="display:none">
         <input id="ymin" class="num" type="number" step="any" title="Y min">
@@ -363,6 +374,28 @@ _HTML = """<!DOCTYPE html>
           </div>
           <div id="cubeWrap"><canvas id="cube"></canvas></div>
           <div class="muted" style="font-size:11px">Rotate the physical sensor — the cube follows the (remapped) reported orientation.</div>
+        </div>
+      </div>
+    </div>
+  </div>
+
+  <div id="calibOverlay" class="overlay" onclick="if(event.target===this)closeCalib()">
+    <div class="modal" role="dialog" aria-modal="true" aria-label="Calibration status">
+      <div class="mhead">
+        <span class="mtitle">Calibration &nbsp;<span class="muted">BNO055 onboard · IMUPLUS (no magnetometer)</span></span>
+        <span class="grow"></span>
+        <button class="btn" onclick="closeCalib()">Close</button>
+      </div>
+      <div class="mbody">
+        <div class="mcol" id="calibBody" style="min-width:340px"></div>
+        <div class="mcol" style="min-width:240px">
+          <div class="mlabel">How to calibrate</div>
+          <div class="muted" style="font-size:12px;line-height:1.6">
+            • <b>Gyro</b> — set the sensor down and keep it still for a few seconds.<br>
+            • <b>Accel</b> — slowly tilt it through a few stable positions (≈45°/90°).<br>
+            • <b>Mag</b> — unused in IMUPLUS mode; it stays at 0 by design.<br>
+            • Each level goes 0→3; <b>ready</b> = gyro and accel both at 3.
+          </div>
         </div>
       </div>
     </div>
@@ -649,7 +682,43 @@ function renderCube(){
 }
 function stopCube(){ cube.on=false; if(cube.raf) cancelAnimationFrame(cube.raf); cube.raf=0; }
 window.addEventListener('resize', ()=>{ if(cube.on) resizeCube(); });
-window.addEventListener('keydown', e=>{ if(e.key==='Escape') closeAxis(); });
+
+// ---- calibration status modal --------------------------------------------
+let calibTimer = null;
+function openCalib(){
+  document.getElementById('calibOverlay').classList.add('open');
+  pollCalib();
+  calibTimer = setInterval(pollCalib, 400);
+}
+function closeCalib(){
+  document.getElementById('calibOverlay').classList.remove('open');
+  if(calibTimer){ clearInterval(calibTimer); calibTimer=null; }
+}
+function calBars(v){
+  let s='';
+  for(let i=1;i<=3;i++) s+='<span class="calseg'+((v>=i)?' on':'')+'"></span>';
+  return '<span class="calbars">'+s+'</span>';
+}
+async function pollCalib(){
+  let d={};
+  try{ d = await (await fetch('/calibration')).json(); }catch(e){ return; }
+  const body=document.getElementById('calibBody');
+  const labs=Object.keys(d);
+  if(!labs.length){ body.innerHTML='<div class="muted">No sensors connected.</div>'; return; }
+  body.innerHTML=labs.map(lab=>{
+    const c=d[lab];
+    if(!c) return '<div class="rtitle" style="margin-top:8px">'+lab+' <span class="muted">no data</span></div>';
+    const ready=c.ready
+      ? '<span class="calready" style="color:#22c55e">● ready</span>'
+      : '<span class="calready muted">converging…</span>';
+    return '<div class="rtitle" style="margin-top:8px">'+lab+' '+ready+'</div>'
+      +'<div class="calrow"><span class="calname">Sys</span>'+calBars(c.sys)+'<span class="muted">'+c.sys+'/3</span></div>'
+      +'<div class="calrow"><span class="calname">Gyro</span>'+calBars(c.gyro)+'<span class="muted">'+c.gyro+'/3</span></div>'
+      +'<div class="calrow"><span class="calname">Accel</span>'+calBars(c.accel)+'<span class="muted">'+c.accel+'/3</span></div>'
+      +'<div class="calrow"><span class="calname">Mag</span><span class="muted">n/a (IMUPLUS)</span></div>';
+  }).join('');
+}
+window.addEventListener('keydown', e=>{ if(e.key==='Escape'){ closeAxis(); closeCalib(); } });
 
 async function tick(){
   if(!paused){

@@ -1,41 +1,43 @@
-"""IMU lifecycle and snapshot helpers wrapping imu-python.
+"""IMU lifecycle, signals, calibration and axis-remap — backed by the official Adafruit
+``adafruit_bno055`` driver using the BNO055's **onboard** sensor fusion.
 
-Also implements BNO055 **axis remap** (datasheet §3.4): write AXIS_MAP_CONFIG (0x41)
-and AXIS_MAP_SIGN (0x42) while the chip is in CONFIG_MODE so the reported axes match the
-physical mounting. A single shared mapping is applied to every connected sensor.
+The chip runs in **IMUPLUS** mode (relative 6-DOF orientation from accelerometer + gyroscope,
+magnetometer OFF), so euler / quaternion / acceleration / gyroscope are read directly from the
+chip's fused output — no software Madgwick filter. Each configured I2C bus (from
+``config/default.toml`` ``[buses]``) is opened with ``adafruit_extended_bus.ExtendedI2C`` and a
+``BNO055_I2C`` driver at address 0x28.
 
-The register I/O path through `imu-python` is not part of its public API, so the low-level
-read/write handle is *resolved defensively* at runtime (`_resolve_regio`): we look for an
-adafruit_bno055-style driver (``_write_register``/``_read_register``) first, then a
-busio-style I2C bus (``writeto``/``writeto_then_readfrom``). On mock IMUs (dev host) or when
-no handle is found, writes become safe no-ops and the chosen bytes are still stored/persisted
-so the UI and persistence flow keep working.
+Downstream consumers (``web_server._payload`` and ``recorder``) only use ``signals()`` →
+``{label: {"euler","accel","gyro","quat"}}``, so this module owns all sensor specifics.
 """
 
 from __future__ import annotations
 
 import json
 import threading
-import time
 from dataclasses import dataclass
 from pathlib import Path
 
 from loguru import logger
 
-from imu_python.base_classes import IMUData
-from imu_python.definitions import MOCK_NAME
-from imu_python.factory import IMUFactory
-from imu_python.sensor_manager import IMUManager
-from jetson_imu_tui.ring_buffer import RAD_TO_DEG
+import adafruit_bno055
+from adafruit_extended_bus import ExtendedI2C
 
-# --- BNO055 registers / modes (Page 0) -------------------------------------
-REG_PAGE_ID = 0x07
-REG_OPR_MODE = 0x3D
+# --- BNO055 specifics ------------------------------------------------------
+BNO055_ADDRESS = 0x28  # both buses use the default address
 REG_AXIS_MAP_CONFIG = 0x41
 REG_AXIS_MAP_SIGN = 0x42
-MODE_CONFIG = 0x00
-MODE_AMG = 0x07  # the operation mode this project runs (raw accel/mag/gyro)
-BNO055_ADDRESS = 0x28  # both buses use the default address (see README)
+
+# Onboard fusion mode this project runs (accel+gyro, magnetometer off → no figure-8,
+# no magnetic-distortion heading errors; orientation is relative).
+FUSION_MODE = adafruit_bno055.IMUPLUS_MODE
+CONFIG_MODE = adafruit_bno055.CONFIG_MODE
+
+# Gyro output normalization to rad/s (the UI label and CSV expect rad/s). The Adafruit
+# driver's units depend on the library version / UNIT_SEL — VERIFY ON DEVICE: rotate at a
+# known rate; if values are ~57x too large the lib is returning deg/s, so set this to
+# math.pi / 180. Leave at 1.0 if the lib already returns rad/s.
+_GYRO_TO_RADS = 1.0
 
 # Default mapping = P1 (identity: X->X, Y->Y, Z->Z, all positive).
 DEFAULT_CONFIG = 0x24
@@ -79,109 +81,19 @@ def _placement_for(config: int, sign: int) -> str | None:
     return None
 
 
-# --- defensive register-I/O resolution -------------------------------------
-class _RegIO:
-    """Tiny adapter exposing ``write(reg, val)`` / ``read(reg) -> int`` over whatever
-    low-level handle we managed to find on a manager."""
-
-    def __init__(self, write, read) -> None:
-        self.write = write
-        self.read = read
-
-
-def _candidate_objects(root, max_depth: int = 3) -> list:
-    """Shallow BFS over instance attributes to collect candidate handle objects."""
-    seen: set[int] = set()
-    out: list = []
-    frontier = [(root, 0)]
-    while frontier:
-        obj, depth = frontier.pop()
-        if id(obj) in seen:
-            continue
-        seen.add(id(obj))
-        out.append(obj)
-        if depth >= max_depth:
-            continue
-        try:
-            attrs = vars(obj)
-        except TypeError:
-            continue
-        for value in attrs.values():
-            if value is None or isinstance(
-                value, (int, float, str, bytes, bool, list, dict, tuple, set, frozenset)
-            ):
-                continue
-            frontier.append((value, depth + 1))
-    return out
-
-
-def _acquire(try_lock) -> bool:
-    if not callable(try_lock):
-        return True
-    for _ in range(2000):
-        if try_lock():
-            return True
-    return False
-
-
-def _resolve_regio(manager: IMUManager) -> _RegIO | None:
-    """Find a register read/write path on a manager. Prefer an adafruit_bno055-style driver
-    (it manages its own I2C locking); fall back to a raw busio.I2C bus at 0x28."""
-    objs = _candidate_objects(manager)
-
-    # 1) adafruit_bno055-style driver: _write_register(reg, val) / _read_register(reg)
-    for obj in objs:
-        w = getattr(obj, "_write_register", None)
-        r = getattr(obj, "_read_register", None)
-        if callable(w) and callable(r):
-            return _RegIO(
-                lambda reg, val, w=w: w(reg & 0xFF, val & 0xFF),
-                lambda reg, r=r: int(r(reg & 0xFF)) & 0xFF,
-            )
-
-    # 2) busio.I2C-style bus: writeto / writeto_then_readfrom (lock around transactions)
-    for obj in objs:
-        writeto = getattr(obj, "writeto", None)
-        wtrf = getattr(obj, "writeto_then_readfrom", None)
-        if callable(writeto) and callable(wtrf):
-            try_lock = getattr(obj, "try_lock", None)
-            unlock = getattr(obj, "unlock", None)
-            addr = BNO055_ADDRESS
-
-            def _w(reg, val, bus=obj, addr=addr, try_lock=try_lock, unlock=unlock):
-                locked = _acquire(try_lock)
-                try:
-                    bus.writeto(addr, bytes([reg & 0xFF, val & 0xFF]))
-                finally:
-                    if locked and callable(unlock):
-                        unlock()
-
-            def _r(reg, bus=obj, addr=addr, wtrf=wtrf, try_lock=try_lock, unlock=unlock):
-                buf = bytearray(1)
-                locked = _acquire(try_lock)
-                try:
-                    bus.writeto_then_readfrom(addr, bytes([reg & 0xFF]), buf)
-                finally:
-                    if locked and callable(unlock):
-                        unlock()
-                return buf[0]
-
-            return _RegIO(_w, _r)
-
-    return None
-
 @dataclass
 class ImuInfo:
     label: str
     bus_id: int
     sensor_name: str
-    is_mock: bool
 
 
 class ImuService:
     def __init__(self, bus_labels: dict[int, str], state_path: Path | str | None = None) -> None:
         self._bus_labels = dict(bus_labels)
-        self.managers: dict[str, IMUManager] = {}
+        self.sensors: dict[str, adafruit_bno055.BNO055_I2C] = {}
+        self._buses: dict[str, ExtendedI2C] = {}
+        self._locks: dict[str, threading.Lock] = {}
         self._state_path = Path(state_path) if state_path else None
         self._axis_lock = threading.Lock()
         self._axis_config = DEFAULT_CONFIG
@@ -196,21 +108,21 @@ class ImuService:
         return [self._bus_labels[k] for k in sorted(self._bus_labels)]
 
     def connect(self) -> list[ImuInfo]:
-        if self.managers:
+        if self.sensors:
             return self.info()
-        # free_threading is auto-gated inside imu-python; pass False to keep things
-        # predictable on stock CPython.
-        managers = IMUFactory.detect_and_create(free_threading=False, log_data=False)
-        labeled: dict[str, IMUManager] = {}
-        for m in managers:
-            bus_id = int(m.i2c_id) if m.i2c_id is not None else -1
-            label = self._bus_labels.get(bus_id, f"bus_{bus_id}")
-            labeled[label] = m
-        for m in labeled.values():
-            m.start()
-        self.managers = labeled
+        for bus_id in sorted(self._bus_labels):
+            label = self._bus_labels[bus_id]
+            try:
+                i2c = ExtendedI2C(bus_id)
+                sensor = adafruit_bno055.BNO055_I2C(i2c, address=BNO055_ADDRESS)
+                sensor.mode = FUSION_MODE
+                self._buses[label] = i2c
+                self.sensors[label] = sensor
+                self._locks[label] = threading.Lock()
+            except Exception as err:  # pragma: no cover - hardware dependent
+                logger.warning(f"{label} (bus {bus_id}): no BNO055 ({err})")
         # Axis remap is volatile (lost on power-cycle): re-apply a persisted non-default map.
-        if (self._axis_config, self._axis_sign) != (DEFAULT_CONFIG, DEFAULT_SIGN):
+        if self.sensors and (self._axis_config, self._axis_sign) != (DEFAULT_CONFIG, DEFAULT_SIGN):
             try:
                 self.set_axis_remap(self._axis_config, self._axis_sign, persist=False)
             except Exception as err:  # pragma: no cover - hardware dependent
@@ -218,30 +130,110 @@ class ImuService:
         return self.info()
 
     def disconnect(self) -> None:
-        for m in self.managers.values():
-            m.stop()
-        self.managers.clear()
+        for i2c in self._buses.values():
+            try:
+                i2c.deinit()
+            except Exception:
+                pass
+        self.sensors.clear()
+        self._buses.clear()
+        self._locks.clear()
 
     def info(self) -> list[ImuInfo]:
         out: list[ImuInfo] = []
-        for label, m in self.managers.items():
-            bus_id = int(m.i2c_id) if m.i2c_id is not None else -1
-            name = m.imu_descriptor.name
-            out.append(
-                ImuInfo(label=label, bus_id=bus_id, sensor_name=name, is_mock=name == MOCK_NAME)
-            )
+        for label, _sensor in self.sensors.items():
+            bus_id = next((b for b, lab in self._bus_labels.items() if lab == label), -1)
+            out.append(ImuInfo(label=label, bus_id=bus_id, sensor_name="BNO055"))
         return out
 
     def is_connected(self) -> bool:
-        return bool(self.managers)
+        return bool(self.sensors)
 
-    def snapshot(self) -> dict[str, IMUData | None]:
-        out: dict[str, IMUData | None] = {}
-        for label, m in self.managers.items():
+    # --- data --------------------------------------------------------------
+    def _read(self, label: str, sensor: adafruit_bno055.BNO055_I2C) -> dict[str, list[float]] | None:
+        """Read the chip's fused outputs under the per-sensor lock. None on a bad/partial read."""
+        lock = self._locks.get(label)
+        try:
+            if lock is not None:
+                with lock:
+                    eul = sensor.euler
+                    quat = sensor.quaternion
+                    acc = sensor.acceleration
+                    gyr = sensor.gyro
+            else:  # pragma: no cover - locks always present for connected sensors
+                eul, quat, acc, gyr = sensor.euler, sensor.quaternion, sensor.acceleration, sensor.gyro
+        except Exception:
+            return None
+        vals = (eul, quat, acc, gyr)
+        if any(v is None for v in vals) or any(c is None for v in vals for c in v):
+            return None
+        # Adafruit euler is (heading, roll, pitch) in degrees → keep the existing
+        # contract x=roll, y=pitch, z=heading/yaw (degrees). quaternion is (w, x, y, z).
+        return {
+            "euler": [float(eul[1]), float(eul[2]), float(eul[0])],
+            "accel": [float(acc[0]), float(acc[1]), float(acc[2])],
+            "gyro": [float(gyr[0]) * _GYRO_TO_RADS, float(gyr[1]) * _GYRO_TO_RADS, float(gyr[2]) * _GYRO_TO_RADS],
+            "quat": [float(quat[0]), float(quat[1]), float(quat[2]), float(quat[3])],
+        }
+
+    def signals(self) -> dict[str, dict[str, list[float]] | None]:
+        """Latest derived signals per label, with the zero offset applied when active."""
+        off = self._offset
+        out: dict[str, dict[str, list[float]] | None] = {}
+        for label, sensor in self.sensors.items():
+            sig = self._read(label, sensor)
+            if sig is not None and off is not None and label in off:
+                o = off[label]
+                for key in ("euler", "accel", "gyro"):
+                    sig[key] = [v - ov for v, ov in zip(sig[key], o[key])]
+            out[label] = sig
+        return out
+
+    # --- zero / tare -------------------------------------------------------
+    @property
+    def is_zeroed(self) -> bool:
+        return self._offset is not None
+
+    def zero_toggle(self) -> bool:
+        """Capture the current euler/accel/gyro as the zero reference, or clear it. Returns
+        True if now zeroed. Quaternion is never offset."""
+        with self._offset_lock:
+            if self._offset is None:
+                captured: dict[str, dict[str, list[float]]] = {}
+                for label, sensor in self.sensors.items():
+                    sig = self._read(label, sensor)
+                    if sig is not None:
+                        captured[label] = {
+                            "euler": list(sig["euler"]),
+                            "accel": list(sig["accel"]),
+                            "gyro": list(sig["gyro"]),
+                        }
+                self._offset = captured
+            else:
+                self._offset = None
+            return self._offset is not None
+
+    # --- calibration (status only) ----------------------------------------
+    def calibration_status(self) -> dict[str, dict | None]:
+        """Per-label BNO055 calibration levels (0-3). In IMUPLUS the magnetometer is unused,
+        so readiness is based on gyro + accel."""
+        out: dict[str, dict | None] = {}
+        for label, sensor in self.sensors.items():
+            lock = self._locks.get(label)
             try:
-                out[label] = m.get_data()
+                if lock is not None:
+                    with lock:
+                        sys_c, gyro_c, accel_c, mag_c = sensor.calibration_status
+                else:  # pragma: no cover
+                    sys_c, gyro_c, accel_c, mag_c = sensor.calibration_status
+                out[label] = {
+                    "sys": int(sys_c),
+                    "gyro": int(gyro_c),
+                    "accel": int(accel_c),
+                    "mag": int(mag_c),
+                    "ready": int(gyro_c) >= 3 and int(accel_c) >= 3,
+                }
             except Exception:
-                # A manager may be momentarily stopped during an axis-remap apply.
                 out[label] = None
         return out
 
@@ -284,28 +276,26 @@ class ImuService:
 
             any_hw = False
             all_ok = True
-            for label, m in self.managers.items():
-                entry = self._apply_to_manager(m, config_byte, sign_byte)
+            for label, sensor in self.sensors.items():
+                entry = self._apply_axis(label, sensor, config_byte, sign_byte)
                 result["applied"][label] = entry
                 any_hw = any_hw or entry["hardware"]
                 all_ok = all_ok and entry["ok"]
 
-            # Store + persist even if there were no managers (e.g. set before connect).
             self._axis_config = config_byte
             self._axis_sign = sign_byte
             result["hardware"] = any_hw
             result["ok"] = all_ok
             result["message"] = (
-                "Applied to hardware."
-                if any_hw
-                else "Stored (no hardware write — mock/dev host or no I2C handle resolved)."
+                "Applied to hardware." if any_hw else "Stored (no sensors connected)."
             )
             if persist:
                 self._save_state()
             return result
 
-    def _apply_to_manager(self, m: IMUManager, config_byte: int, sign_byte: int) -> dict:
-        """Stop the manager, run the CONFIG_MODE write sequence, read back, restart."""
+    def _apply_axis(self, label: str, sensor: adafruit_bno055.BNO055_I2C, config_byte: int, sign_byte: int) -> dict:
+        """Write AXIS_MAP_CONFIG/SIGN on one sensor (CONFIG mode → write → restore fusion),
+        then read back. The Adafruit ``mode`` setter handles the 19/7 ms switch delays."""
         entry: dict = {
             "ok": False,
             "hardware": False,
@@ -313,45 +303,15 @@ class ImuService:
             "readback_sign": None,
             "error": None,
         }
-        name = getattr(getattr(m, "imu_descriptor", None), "name", "")
-        if name == MOCK_NAME:
-            entry["ok"] = True
-            entry["error"] = "mock (simulated)"
-            return entry
-
-        io = _resolve_regio(m)
-        if io is None:
-            # Not a hard failure: the UI/persistence flow continues, but flag no hardware.
-            entry["ok"] = True
-            entry["error"] = "no register I/O handle resolved (see plan Step 1 / fallback)"
-            logger.warning(
-                "axis-remap: could not resolve a register I/O handle on the manager; "
-                "mapping stored but NOT written to the chip."
-            )
-            return entry
-
+        lock = self._locks.get(label)
         try:
-            try:
-                m.stop()
-            except Exception:
-                pass
-            # Preserve and restore the current operation mode (default AMG).
-            try:
-                prev_mode = io.read(REG_OPR_MODE) & 0x0F
-            except Exception:
-                prev_mode = None
-            op_mode = prev_mode if prev_mode not in (None, MODE_CONFIG) else MODE_AMG
-
-            io.write(REG_PAGE_ID, 0x00)
-            io.write(REG_OPR_MODE, MODE_CONFIG)
-            time.sleep(0.02)  # any -> CONFIG takes 19 ms
-            io.write(REG_AXIS_MAP_CONFIG, config_byte)
-            io.write(REG_AXIS_MAP_SIGN, sign_byte)
-            io.write(REG_OPR_MODE, op_mode)
-            time.sleep(0.01)  # CONFIG -> any takes 7 ms
-
-            rc = io.read(REG_AXIS_MAP_CONFIG)
-            rs = io.read(REG_AXIS_MAP_SIGN)
+            with lock:  # type: ignore[arg-type]
+                sensor.mode = CONFIG_MODE
+                sensor._write_register(REG_AXIS_MAP_CONFIG, config_byte)
+                sensor._write_register(REG_AXIS_MAP_SIGN, sign_byte)
+                sensor.mode = FUSION_MODE
+                rc = sensor._read_register(REG_AXIS_MAP_CONFIG)
+                rs = sensor._read_register(REG_AXIS_MAP_SIGN)
             entry["readback_config"] = rc
             entry["readback_sign"] = rs
             entry["hardware"] = True
@@ -360,12 +320,6 @@ class ImuService:
                 entry["error"] = "readback mismatch (mapping may have been rejected by the chip)"
         except Exception as err:  # pragma: no cover - hardware dependent
             entry["error"] = f"{type(err).__name__}: {err}"
-        finally:
-            try:
-                m.start()
-            except Exception as err:  # pragma: no cover - hardware dependent
-                if entry["error"] is None:
-                    entry["error"] = f"manager restart failed: {err}"
         return entry
 
     # --- persistence -------------------------------------------------------
@@ -389,59 +343,3 @@ class ImuService:
             )
         except Exception as err:
             logger.warning(f"axis-remap: failed to save {self._state_path}: {err}")
-        return {label: m.get_data() for label, m in self.managers.items()}
-
-    @staticmethod
-    def _derive(data: IMUData) -> dict[str, list[float]]:
-        """Raw derived signals (euler in degrees, accel, gyro, quat) for one IMU."""
-        e = data.quat.to_euler("ZYX")
-        a = data.device_data.accel
-        g = data.device_data.gyro
-        q = data.quat
-        return {
-            "euler": [e.x * RAD_TO_DEG, e.y * RAD_TO_DEG, e.z * RAD_TO_DEG],
-            "accel": [a.x, a.y, a.z],
-            "gyro": [g.x, g.y, g.z],
-            "quat": [q.w, q.x, q.y, q.z],
-        }
-
-    def signals(self) -> dict[str, dict[str, list[float]] | None]:
-        """Derived signals per label with the zero offset applied to euler/accel/gyro.
-
-        Quaternion is never offset. Labels with no data return None.
-        """
-        offset = self._offset
-        out: dict[str, dict[str, list[float]] | None] = {}
-        for label, data in self.snapshot().items():
-            if data is None:
-                out[label] = None
-                continue
-            sig = self._derive(data)
-            if offset is not None and label in offset:
-                off = offset[label]
-                for key in ("euler", "accel", "gyro"):
-                    sig[key] = [v - o for v, o in zip(sig[key], off[key])]
-            out[label] = sig
-        return out
-
-    @property
-    def is_zeroed(self) -> bool:
-        return self._offset is not None
-
-    def zero_toggle(self) -> bool:
-        """Toggle tare: capture current absolute readings as zero, or clear.
-
-        Returns True if an offset is now active, False if cleared.
-        """
-        with self._offset_lock:
-            if self._offset is not None:
-                self._offset = None
-                return False
-            offset: dict[str, dict[str, list[float]]] = {}
-            for label, data in self.snapshot().items():
-                if data is None:
-                    continue
-                sig = self._derive(data)
-                offset[label] = {k: list(sig[k]) for k in ("euler", "accel", "gyro")}
-            self._offset = offset
-            return True

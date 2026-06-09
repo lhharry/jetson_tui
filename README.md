@@ -2,8 +2,9 @@
 
 A headless service that streams and records two BNO055 IMUs on an NVIDIA Jetson and
 serves their data to a browser for live plotting. Left thigh sits on `/dev/i2c-1`,
-right thigh on `/dev/i2c-7` (both at default address `0x28`). Reading and on-board
-fusion are handled by the [`imu-python`](https://pypi.org/project/imu-python/) package.
+right thigh on `/dev/i2c-7` (both at default address `0x28`). Reading and fusion use the
+official [`adafruit-circuitpython-bno055`](https://github.com/adafruit/Adafruit_CircuitPython_BNO055)
+driver with the BNO055's **onboard** sensor fusion (no software filter on the host).
 
 Rendering happens **in the browser on your laptop** (with [uPlot](https://github.com/leeoniya/uPlot)),
 not on the Jetson — so the Jetson spends ~no CPU on the UI, leaving headroom for other
@@ -14,6 +15,11 @@ workloads (e.g. an AI model) on the same board.
 - Auto-connects both IMUs on start and serves a single live page.
 - Four signal views (Euler / Accel / Gyro / Quaternion); Left + Right overlaid.
 - Switch to a **numbers** view for live numeric readouts of every signal.
+- **Zero** (tare) the current Euler/Accel/Gyro readings from the page.
+- **Axis** popup: remap the BNO055 output axes (datasheet §3.4 placements P0–P7 or a manual
+  axis/sign mapping), applied to the chip's `AXIS_MAP_CONFIG`/`AXIS_MAP_SIGN` registers, with a
+  live 3D cube to confirm the result.
+- **Calib** popup: live onboard calibration status (sys / gyro / accel, 0–3) with guidance.
 - **Record** toggle and an adjustable **recording frequency** (1–200 Hz) from the page.
 - Recording writes four comma-separated files per session under
   `<log_dir>/YYYY_MM_DD/HH_MM_SS/`:
@@ -24,10 +30,8 @@ workloads (e.g. an AI model) on the same board.
 
 ## Install
 
-### Jetson hardware
-
 ```bash
-pip install -e '.[hw]'   # hw = BNO055 driver + jetson-gpio
+pip install -e .   # flask + adafruit-circuitpython-bno055 + Adafruit-Blinka + adafruit-extended-bus
 ```
 
 Make sure the user is in the `i2c` group and both buses are exposed:
@@ -41,14 +45,9 @@ i2cdetect -y 7   # expect 0x28 on both
 On Jetson Nano (legacy), bus 7 may need a device-tree overlay. On Orin Nano dev
 kits, pins 3/5 already map to bus 7 out of the box.
 
-### Dev host (laptop, no Jetson hardware)
-
-`imu-python` falls back to mock IMUs when no I2C bus is reachable, so everything runs
-end-to-end with synthetic data:
-
-```bash
-pip install -e .
-```
+> **Hardware required.** There is no mock fallback — the Adafruit driver talks to a real
+> BNO055 over I2C. On a machine without the sensors, labels simply report `null` and the
+> page shows no data.
 
 ## Run
 
@@ -76,7 +75,9 @@ text readout, **Pause** to freeze, set the **Hz** field to change recording rate
 needs internet for the library (the Jetson does not).
 
 HTTP API (for scripting): `GET /` (page), `GET /data` (latest values + status JSON),
-`POST /record` (toggle), `POST /freq?hz=N` (set recording rate). `Ctrl-C` stops cleanly.
+`POST /record` (toggle), `POST /freq?hz=N` (set recording rate), `POST /zero` (tare toggle),
+`GET /calibration` (per-sensor calibration levels), `GET /axis-remap` (current mapping) and
+`POST /axis-remap` (apply `placement=P0..P7` or numeric `config`/`sign`). `Ctrl-C` stops cleanly.
 
 ## Configuration
 
@@ -99,41 +100,34 @@ web_port = 8000
 The bus→label table is the single source of truth — change it here to swap
 Left/Right assignment or rename the IMUs.
 
-## Orientation fusion & calibration (notes)
+## Orientation fusion & calibration
 
-**Default (current):** `imu_python` runs the BNO055 in **AMG mode** (raw accel/gyro/mag)
-and computes orientation itself with a software **Madgwick** filter. The **magnetometer
-is disabled** (no calibration file present), so:
+The BNO055 runs in **IMUPLUS** mode: the chip fuses **accelerometer + gyroscope** on-board to
+produce relative orientation. The **magnetometer is not used**, which deliberately avoids the
+magnetic-distortion problems of a thigh mount near motors/metal — the trade-off is that yaw
+(heading) is **relative** (no absolute north) and drifts slowly on the gyro. Euler, quaternion,
+acceleration and gyroscope are all read straight from the chip's fused output; there is no
+software filter on the host.
 
-- orientation is **relative**; yaw (heading) drifts slowly with no magnetic reference;
-- there is **no per-boot calibration** — the filter just converges over ~30 s.
+**Calibration** — open the **Calib** popup for live status:
 
-The true sensor rate (~100–115 Hz) is set by the sensor bandwidth + I2C, not by config;
-`freq_hz=100` in `imu_python` is only a Madgwick fallback constant.
+- **Gyro** — set the sensor down and keep it still for a few seconds → level reaches 3.
+- **Accel** — slowly tilt through a few stable positions (≈45°/90°) → level reaches 3.
+- **Mag** — unused in IMUPLUS; it stays at 0 by design (no figure-8 needed).
+- Calibration is not persisted across power cycles; the levels re-converge after each boot.
 
-Two optional upgrades (not enabled here):
+**Units:** Euler in degrees (`x`=roll, `y`=pitch, `z`=heading), acceleration in m/s²,
+gyroscope in rad/s, quaternion `(w, x, y, z)` unitless. If gyro readings look ~57× too large,
+the installed driver is reporting deg/s — set `_GYRO_TO_RADS = math.pi/180` in
+`src/jetson_imu_tui/imu_service.py`.
 
-**A) Magnetometer-aided (keep software fusion).** Run the upstream calibration **once** per
-sensor/environment, then restart:
-```bash
-python -m imu_python.calibration.calibration   # rotate each IMU through all orientations, Ctrl+C
-```
-It fits hard/soft-iron params and writes `calibration.json` under imu_python's data dir
-(e.g. `.venv/lib/pythonX.Y/data/calibration/`). On next start the log shows
-"Loaded magnetometer calibration …" and yaw becomes more stable. (Note: that path lives
-inside the venv and is lost on reinstall; a Pi calibration file is **not** reusable — params
-are per physical sensor + mounting + local field.)
+**Axis remap** — the **Axis** popup writes `AXIS_MAP_CONFIG`/`AXIS_MAP_SIGN` on the chip. These
+registers are **volatile** (lost on power cycle); the chosen mapping is saved to
+`<log_dir>/axis_remap.json` and re-applied automatically on connect.
 
-**B) Onboard NDOF fusion (chip does the fusion + per-boot figure-8).** Before connecting,
-override `imu_python.registry.IMU_DEVICES["BNO055"]` with a config that (1) ends `pre_config`
-in `NDOF_MODE`, (2) maps `IMUSensorTypes.quat: IMU0` (so `wrapper.get_imu_data` returns the
-chip quaternion directly, bypassing Madgwick), and (3) sets `scalar_first=True`. Then
-figure-8 each boot until `.calibration_status` reaches 3. Fusion is locked to 100 Hz.
-
-**⚠️ Magnetic-environment caveat:** both A and B rely on the magnetometer. Mounted on a thigh
-near motors/metal, the field is disturbed — NDOF calibration may never reach 3 and heading
-can be *worse* than gyro/accel-only. That is why the default is AMG + software fusion with
-the magnetometer off.
+> Absolute heading (9-DOF) would require **NDOF** mode + magnetometer + a per-boot figure-8.
+> That was deliberately *not* chosen here because of the thigh-mount magnetic environment; it
+> is a one-line change in `imu_service.py` (`FUSION_MODE`) if ever needed.
 
 ## Out of scope
 

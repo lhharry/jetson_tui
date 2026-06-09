@@ -7,16 +7,13 @@ requires-python = ">=3.11"
 license = { file = "LICENSE" }
 dependencies = [
     "flask>=3,<4",
-    "imu-python==0.1.1",
-    # imu-python's base modules import adafruit_extended_bus unconditionally
-    # even though it lives in its [hw] extra. Pull it in so plain `pip install .`
-    # works on dev hosts without the rest of the Jetson driver stack.
+    # Official Bosch BNO055 driver + CircuitPython compat layer (Blinka), reading the
+    # chip's onboard fusion directly. ExtendedI2C selects the I2C bus by number (1, 7).
+    "adafruit-circuitpython-bno055>=5.4.0",
     "adafruit-extended-bus>=1.0.2",
+    "Adafruit-Blinka>=8.0.0",
     "loguru>=0.7,<1",
 ]
-
-[project.optional-dependencies]
-hw = ["imu-python[hw]==0.1.1"]
 
 [project.scripts]
 jetson-imu-tui = "jetson_imu_tui.__main__:main"
