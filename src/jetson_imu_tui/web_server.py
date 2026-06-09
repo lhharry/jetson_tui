@@ -20,7 +20,6 @@ from loguru import logger
 from jetson_imu_tui.config import AppConfig
 from jetson_imu_tui.imu_service import PLACEMENTS, ImuService
 from jetson_imu_tui.recorder import Recorder
-from jetson_imu_tui.ring_buffer import RAD_TO_DEG
 
 
 def get_local_ip() -> str | None:
@@ -58,6 +57,9 @@ class ServerState:
         self.record_hz = record_hz
         self.recorder: Recorder | None = None
         self._lock = threading.Lock()
+
+    def toggle_zero(self) -> bool:
+        return self.service.zero_toggle()
 
     def toggle_record(self) -> bool:
         with self._lock:
@@ -104,31 +106,19 @@ class ServerState:
 
 
 def _payload(state: ServerState) -> dict:
-    snap = state.service.snapshot()
     out: dict = {
         "t": time.monotonic(),
         "recording": state.recording,
+        "zeroed": state.service.is_zeroed,
         "hz": state.record_hz,
         "euler": {},
         "accel": {},
         "gyro": {},
         "quat": {},
     }
-    for label, data in snap.items():
-        if data is None:
-            out["euler"][label] = None
-            out["accel"][label] = None
-            out["gyro"][label] = None
-            out["quat"][label] = None
-            continue
-        e = data.quat.to_euler("ZYX")
-        out["euler"][label] = [e.x * RAD_TO_DEG, e.y * RAD_TO_DEG, e.z * RAD_TO_DEG]
-        a = data.device_data.accel
-        out["accel"][label] = [a.x, a.y, a.z]
-        g = data.device_data.gyro
-        out["gyro"][label] = [g.x, g.y, g.z]
-        q = data.quat
-        out["quat"][label] = [q.w, q.x, q.y, q.z]
+    for label, sig in state.service.signals().items():
+        for key in ("euler", "accel", "gyro", "quat"):
+            out[key][label] = sig[key] if sig is not None else None
     return out
 
 
@@ -147,6 +137,10 @@ def create_app(state: ServerState, window_s: float, poll_ms: int) -> Flask:
     @app.route("/record", methods=["POST"])
     def record() -> Response:
         return jsonify({"recording": state.toggle_record()})
+
+    @app.route("/zero", methods=["POST"])
+    def zero() -> Response:
+        return jsonify({"zeroed": state.toggle_zero()})
 
     @app.route("/freq", methods=["POST"])
     def freq() -> Response:
@@ -330,6 +324,7 @@ _HTML = """<!DOCTYPE html>
       </span>
       <span class="grow"></span>
       <button id="themeBtn" class="btn" onclick="toggleTheme()">Light</button>
+      <button id="zeroBtn" class="btn" onclick="toggleZero()" title="Zero out current Euler/Accel/Gyro readings (tare)">Zero</button>
       <button id="recBtn" class="btn" onclick="toggleRecord()">Record</button>
       <label class="reclabel" title="Recording rate — only affects logging to disk, not the plot">
         Rec Hz <input id="freq" class="num" type="number" min="1" max="200" step="1"></label>
@@ -495,6 +490,7 @@ function togglePause(){
   b.classList.toggle('pause-on', paused);
 }
 async function toggleRecord(){ try { await fetch('/record', {method:'POST'}); } catch(e) {} }
+async function toggleZero(){ try { await fetch('/zero', {method:'POST'}); } catch(e) {} }
 
 function toggleView(){
   view = (view === 'plot') ? 'numbers' : 'plot';
@@ -673,6 +669,9 @@ async function tick(){
       const rb = document.getElementById('recBtn');
       rb.textContent = d.recording ? 'Recording' : 'Record';
       rb.classList.toggle('rec-on', !!d.recording);
+      const zb = document.getElementById('zeroBtn');
+      zb.textContent = d.zeroed ? 'Zeroed' : 'Zero';
+      zb.classList.toggle('rec-on', !!d.zeroed);
       const f = document.getElementById('freq');
       if(document.activeElement !== f) f.value = d.hz;
 
