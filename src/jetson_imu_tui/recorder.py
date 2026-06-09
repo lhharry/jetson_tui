@@ -9,7 +9,6 @@ from io import TextIOWrapper
 from pathlib import Path
 
 from jetson_imu_tui.imu_service import ImuService
-from jetson_imu_tui.ring_buffer import RAD_TO_DEG
 
 
 def _hdr(labels: list[str], axes: tuple[str, ...]) -> str:
@@ -77,28 +76,20 @@ class Recorder:
                 next_tick = time.monotonic()
 
     def _write_row(self) -> None:
-        snap = self._service.snapshot()
+        sigs = self._service.signals()
         ts = datetime.now().strftime("%H:%M:%S.%f")
         rows: dict[str, list[str]] = {fname: [ts] for fname in self._layout}
         for label in self._labels:
-            data = snap.get(label)
+            sig = sigs.get(label)
             quat_vals: list[str] = ["", "", "", ""]
             accel_vals: list[str] = ["", "", ""]
             gyro_vals: list[str] = ["", "", ""]
             euler_vals: list[str] = ["", "", ""]
-            if data is not None:
-                q = data.quat
-                quat_vals = [f"{q.w:.6f}", f"{q.x:.6f}", f"{q.y:.6f}", f"{q.z:.6f}"]
-                a = data.device_data.accel
-                accel_vals = [f"{a.x:.6f}", f"{a.y:.6f}", f"{a.z:.6f}"]
-                g = data.device_data.gyro
-                gyro_vals = [f"{g.x:.6f}", f"{g.y:.6f}", f"{g.z:.6f}"]
-                e = data.quat.to_euler("ZYX")
-                euler_vals = [
-                    f"{e.x * RAD_TO_DEG:.6f}",
-                    f"{e.y * RAD_TO_DEG:.6f}",
-                    f"{e.z * RAD_TO_DEG:.6f}",
-                ]
+            if sig is not None:
+                quat_vals = [f"{v:.6f}" for v in sig["quat"]]
+                accel_vals = [f"{v:.6f}" for v in sig["accel"]]
+                gyro_vals = [f"{v:.6f}" for v in sig["gyro"]]
+                euler_vals = [f"{v:.6f}" for v in sig["euler"]]
             rows["quaternions.csv"].extend(quat_vals)
             rows["accelerometers.csv"].extend(accel_vals)
             rows["gyroscopes.csv"].extend(gyro_vals)
