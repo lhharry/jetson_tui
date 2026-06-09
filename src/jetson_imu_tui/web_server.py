@@ -18,7 +18,7 @@ from flask import Flask, Response, jsonify, request
 from loguru import logger
 
 from jetson_imu_tui.config import AppConfig
-from jetson_imu_tui.imu_service import ImuService
+from jetson_imu_tui.imu_service import PLACEMENTS, ImuService
 from jetson_imu_tui.recorder import Recorder
 from jetson_imu_tui.ring_buffer import RAD_TO_DEG
 
@@ -153,6 +153,35 @@ def create_app(state: ServerState, window_s: float, poll_ms: int) -> Flask:
         hz = request.args.get("hz") or (request.get_json(silent=True) or {}).get("hz")
         return jsonify({"hz": state.set_record_hz(hz)})
 
+    @app.route("/axis-remap", methods=["GET"])
+    def axis_remap_get() -> Response:
+        return jsonify(state.service.get_axis_remap())
+
+    @app.route("/axis-remap", methods=["POST"])
+    def axis_remap_post():
+        body = request.get_json(silent=True) or {}
+        placement = request.args.get("placement") or body.get("placement")
+        if placement and str(placement).upper() in PLACEMENTS:
+            cfg_b, sgn_b = PLACEMENTS[str(placement).upper()]
+        else:
+            raw_cfg = request.args.get("config", body.get("config"))
+            raw_sgn = request.args.get("sign", body.get("sign"))
+            try:
+                cfg_b = int(raw_cfg, 0) if isinstance(raw_cfg, str) else int(raw_cfg)
+                sgn_b = int(raw_sgn, 0) if isinstance(raw_sgn, str) else int(raw_sgn)
+            except (TypeError, ValueError):
+                return (
+                    jsonify(
+                        {
+                            "ok": False,
+                            "valid": False,
+                            "message": "provide 'placement' (P0-P7) or numeric 'config' and 'sign'",
+                        }
+                    ),
+                    400,
+                )
+        return jsonify(state.service.set_axis_remap(cfg_b, sgn_b))
+
     return app
 
 
@@ -164,7 +193,7 @@ def run_server(cfg: AppConfig, host: str | None = None, port: int | None = None)
     logger.remove()
     logging.getLogger("werkzeug").setLevel(logging.ERROR)
 
-    service = ImuService(cfg.bus_labels)
+    service = ImuService(cfg.bus_labels, state_path=Path(cfg.log_dir) / "axis_remap.json")
     print("Connecting to IMUs...")
     try:
         info = service.connect()
@@ -212,6 +241,7 @@ _HTML = """<!DOCTYPE html>
 <title>Jetson IMU Live</title>
 <link rel="stylesheet" href="https://cdn.jsdelivr.net/npm/uplot@1.6.31/dist/uPlot.min.css">
 <script src="https://cdn.jsdelivr.net/npm/uplot@1.6.31/dist/uPlot.iife.min.js"></script>
+<script src="https://cdn.jsdelivr.net/npm/three@0.149.0/build/three.min.js"></script>
 <style>
   :root{--bg:#0e1014;--panel:#161922;--panel2:#1d212c;--border:#2a2f3a;--fg:#e5e7eb;--muted:#9aa4b2;--accent:#3b82f6}
   :root.light{--bg:#f5f7fa;--panel:#ffffff;--panel2:#eef1f6;--border:#d6dce6;--fg:#1b1f27;--muted:#5b6472;--accent:#2563eb}
@@ -252,6 +282,32 @@ _HTML = """<!DOCTYPE html>
   .rax{display:inline-flex;gap:7px;align-items:baseline}
   .rax i{font-style:normal;font-weight:700;width:11px}
   .rax b{font-size:19px;color:var(--fg);min-width:90px;text-align:right;display:inline-block}
+  /* ---- axis-remap modal ---- */
+  .overlay{position:fixed;inset:0;background:rgba(0,0,0,.55);display:none;align-items:center;justify-content:center;z-index:50}
+  .overlay.open{display:flex}
+  .modal{background:var(--panel);border:1px solid var(--border);border-radius:14px;width:min(820px,94vw);max-height:92vh;overflow:auto;box-shadow:0 18px 50px rgba(0,0,0,.45)}
+  .mhead{display:flex;align-items:center;gap:12px;padding:13px 16px;border-bottom:1px solid var(--border)}
+  .mtitle{font-weight:700;font-size:15px}
+  .mhead .grow{flex:1}
+  .mbody{display:flex;gap:18px;padding:16px;flex-wrap:wrap}
+  .mcol{flex:1;min-width:300px;display:flex;flex-direction:column;gap:10px}
+  .mlabel{font-size:11px;text-transform:uppercase;letter-spacing:.05em;color:var(--muted);display:flex;align-items:center;gap:10px}
+  .presets{display:grid;grid-template-columns:repeat(4,1fr);gap:7px}
+  .presets button{border:1px solid var(--border);background:var(--panel2);color:var(--fg);padding:8px 0;border-radius:8px;font-size:13px;cursor:pointer}
+  .presets button:hover{filter:brightness(1.1)}
+  .presets button.active{background:var(--accent);border-color:var(--accent);color:#fff}
+  .axisrow{display:flex;align-items:center;gap:10px}
+  .axisrow>span.albl{width:74px;color:var(--muted);font-size:12px}
+  .axisrow select{flex:1;background:var(--panel2);color:var(--fg);border:1px solid var(--border);border-radius:6px;padding:7px}
+  .signbtn{width:42px;border:1px solid var(--border);background:var(--panel2);color:var(--fg);border-radius:6px;padding:7px 0;font-weight:700;cursor:pointer}
+  .signbtn.neg{background:#ef4444;border-color:#ef4444;color:#fff}
+  .warn{color:#f87171;font-size:12px;font-weight:600}
+  .mfoot{display:flex;align-items:center;gap:10px;padding-top:4px}
+  .mfoot .grow{flex:1}
+  #axisApply[disabled]{opacity:.45;cursor:not-allowed}
+  .muted{color:var(--muted);font-size:12px;font-variant-numeric:tabular-nums}
+  #cubeWrap{height:240px;background:var(--panel2);border:1px solid var(--border);border-radius:10px;overflow:hidden}
+  #cube{display:block;width:100%;height:100%}
 </style>
 </head>
 <body>
@@ -265,6 +321,7 @@ _HTML = """<!DOCTYPE html>
       </div>
       <button id="viewBtn" class="btn" onclick="toggleView()">Numbers</button>
       <button id="pauseBtn" class="btn" onclick="togglePause()">Pause</button>
+      <button id="axisBtn" class="btn" onclick="openAxis()">Axis</button>
       <button id="yBtn" class="btn" onclick="toggleYMode()">Y: Auto</button>
       <span id="yman" style="display:none">
         <input id="ymin" class="num" type="number" step="any" title="Y min">
@@ -280,6 +337,40 @@ _HTML = """<!DOCTYPE html>
     </div>
     <div id="charts"></div>
     <div id="readout"></div>
+  </div>
+
+  <div id="axisOverlay" class="overlay" onclick="if(event.target===this)closeAxis()">
+    <div class="modal" role="dialog" aria-modal="true" aria-label="Axis remap">
+      <div class="mhead">
+        <span class="mtitle">Axis Remap &nbsp;<span class="muted">BNO055 §3.4 · shared by all sensors</span></span>
+        <span class="grow"></span>
+        <button class="btn" onclick="closeAxis()">Close</button>
+      </div>
+      <div class="mbody">
+        <div class="mcol">
+          <div class="mlabel">Mounting presets</div>
+          <div class="presets" id="presets"></div>
+          <div class="mlabel">Manual mapping &nbsp;<span class="muted">output ← source · sign</span></div>
+          <div class="axisrow"><span class="albl">X out</span><select id="ax-x"></select><button class="signbtn" id="sg-x" data-axis="x" onclick="toggleSign('x')">+</button></div>
+          <div class="axisrow"><span class="albl">Y out</span><select id="ax-y"></select><button class="signbtn" id="sg-y" data-axis="y" onclick="toggleSign('y')">+</button></div>
+          <div class="axisrow"><span class="albl">Z out</span><select id="ax-z"></select><button class="signbtn" id="sg-z" data-axis="z" onclick="toggleSign('z')">+</button></div>
+          <div id="axisWarn" class="warn" style="display:none">Each output must map to a distinct source axis (invalid mapping is rejected by the chip).</div>
+          <div class="mfoot">
+            <span id="axisBytes" class="muted">CONFIG 0x24 · SIGN 0x00</span>
+            <span class="grow"></span>
+            <button id="axisApply" class="btn" onclick="applyAxis()">Apply</button>
+          </div>
+          <div id="axisMsg" class="muted"></div>
+        </div>
+        <div class="mcol">
+          <div class="mlabel">Live orientation
+            <select id="cubeSensor" class="num" style="width:auto" onchange="cubeLabel=this.value"></select>
+          </div>
+          <div id="cubeWrap"><canvas id="cube"></canvas></div>
+          <div class="muted" style="font-size:11px">Rotate the physical sensor — the cube follows the (remapped) reported orientation.</div>
+        </div>
+      </div>
+    </div>
   </div>
 <script>
 const WINDOW_S = __WINDOW_S__;
@@ -456,6 +547,114 @@ function applyTheme(light){
 }
 function toggleTheme(){ applyTheme(!document.documentElement.classList.contains('light')); }
 
+// ---- axis remap modal -----------------------------------------------------
+const AXIS_PRESETS = {
+  P0:[0x21,0x04], P1:[0x24,0x00], P2:[0x24,0x06], P3:[0x21,0x02],
+  P4:[0x24,0x03], P5:[0x21,0x01], P6:[0x21,0x07], P7:[0x24,0x05],
+};
+const AXIS_NAMES = ['X','Y','Z'];
+let axisSign = { x:0, y:0, z:0 };   // 0 = +, 1 = -
+let cubeLabel = null;
+
+function buildAxisControls(){
+  document.getElementById('presets').innerHTML = Object.keys(AXIS_PRESETS).map(p =>
+    '<button data-p="' + p + '" onclick="applyPreset(\\'' + p + '\\')">' + p + (p==='P1'?' •':'') + '</button>').join('');
+  ['x','y','z'].forEach(out => {
+    const sel = document.getElementById('ax-' + out);
+    sel.innerHTML = AXIS_NAMES.map((n,i)=>'<option value="' + i + '">' + n + '</option>').join('');
+    sel.onchange = recomputeAxis;
+  });
+}
+const hx = b => '0x' + b.toString(16).toUpperCase().padStart(2,'0');
+const configByte = () => (+document.getElementById('ax-x').value)
+  | ((+document.getElementById('ax-y').value)<<2) | ((+document.getElementById('ax-z').value)<<4);
+const signByte = () => (axisSign.x<<2)|(axisSign.y<<1)|(axisSign.z);
+function axisValid(c){ const f=[c&3,(c>>2)&3,(c>>4)&3].sort(); return f[0]===0&&f[1]===1&&f[2]===2; }
+function updateSignBtn(out){
+  const b=document.getElementById('sg-'+out);
+  b.textContent = axisSign[out] ? '−' : '+';
+  b.classList.toggle('neg', !!axisSign[out]);
+}
+function toggleSign(out){ axisSign[out]=axisSign[out]?0:1; updateSignBtn(out); recomputeAxis(); }
+function applyPreset(p){ const v=AXIS_PRESETS[p]; setControls(v[0],v[1]); }
+function setControls(cfg, sgn){
+  document.getElementById('ax-x').value = cfg & 3;
+  document.getElementById('ax-y').value = (cfg>>2)&3;
+  document.getElementById('ax-z').value = (cfg>>4)&3;
+  axisSign = { x:(sgn>>2)&1, y:(sgn>>1)&1, z:sgn&1 };
+  ['x','y','z'].forEach(updateSignBtn);
+  recomputeAxis();
+}
+function recomputeAxis(){
+  const c=configByte(), s=signByte(), ok=axisValid(c);
+  document.getElementById('axisBytes').textContent='CONFIG '+hx(c)+' · SIGN '+hx(s);
+  document.getElementById('axisWarn').style.display = ok ? 'none' : 'block';
+  document.getElementById('axisApply').disabled = !ok;
+  let match=null;
+  for(const p in AXIS_PRESETS){ const v=AXIS_PRESETS[p]; if(v[0]===c&&v[1]===s) match=p; }
+  document.querySelectorAll('#presets button').forEach(b=>b.classList.toggle('active', b.dataset.p===match));
+}
+async function applyAxis(){
+  const c=configByte(), s=signByte();
+  const msg=document.getElementById('axisMsg');
+  msg.textContent='Applying…';
+  try{
+    const r=await fetch('/axis-remap',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({config:c,sign:s})});
+    const d=await r.json();
+    if(d.ok && d.hardware) msg.textContent='✓ '+(d.message||'Applied')+' ('+hx(d.config)+'/'+hx(d.sign)+')';
+    else if(d.ok) msg.textContent='✓ '+(d.message||'Stored');
+    else msg.textContent='✗ '+(d.message||'Failed');
+  }catch(e){ msg.textContent='✗ request failed'; }
+}
+async function openAxis(){
+  document.getElementById('axisOverlay').classList.add('open');
+  const sel=document.getElementById('cubeSensor');
+  sel.innerHTML=labels.map(l=>'<option>'+l+'</option>').join('');
+  if(!cubeLabel || labels.indexOf(cubeLabel)<0) cubeLabel=labels[0];
+  sel.value=cubeLabel;
+  try{ const d=await (await fetch('/axis-remap')).json(); setControls(d.config,d.sign); }
+  catch(e){ setControls(0x24,0x00); }
+  startCube();
+}
+function closeAxis(){ document.getElementById('axisOverlay').classList.remove('open'); stopCube(); }
+
+// ---- three.js live cube ---------------------------------------------------
+let cube={ on:false, renderer:null, scene:null, camera:null, mesh:null, raf:0, q:null };
+function startCube(){
+  const wrap=document.getElementById('cubeWrap'), canvas=document.getElementById('cube');
+  if(typeof THREE==='undefined'){ wrap.innerHTML='<div class="muted" style="padding:14px">3D library unavailable (the browser needs internet for the CDN).</div>'; return; }
+  if(!cube.renderer){
+    cube.renderer=new THREE.WebGLRenderer({canvas, antialias:true, alpha:true});
+    cube.scene=new THREE.Scene();
+    cube.camera=new THREE.PerspectiveCamera(45,1,0.1,100);
+    cube.camera.position.set(3.2,2.4,3.2); cube.camera.lookAt(0,0,0);
+    const g=new THREE.Group();
+    g.add(new THREE.Mesh(new THREE.BoxGeometry(1.6,0.35,1.1), new THREE.MeshNormalMaterial()));
+    g.add(new THREE.AxesHelper(1.6));
+    cube.scene.add(g); cube.mesh=g; cube.q=new THREE.Quaternion();
+  }
+  resizeCube(); cube.on=true; renderCube();
+}
+function resizeCube(){
+  if(!cube.renderer) return;
+  const wrap=document.getElementById('cubeWrap');
+  const w=wrap.clientWidth||300, h=wrap.clientHeight||240;
+  cube.renderer.setPixelRatio(window.devicePixelRatio||1);
+  cube.renderer.setSize(w,h,false);
+  cube.camera.aspect=w/h; cube.camera.updateProjectionMatrix();
+}
+function renderCube(){
+  if(!cube.on) return;
+  const last=samples[samples.length-1];
+  const q=last && last.quat && last.quat[cubeLabel];
+  if(q && cube.q){ cube.q.set(q[1],q[2],q[3],q[0]); cube.mesh.quaternion.copy(cube.q); }  // [w,x,y,z] -> (x,y,z,w)
+  cube.renderer.render(cube.scene,cube.camera);
+  cube.raf=requestAnimationFrame(renderCube);
+}
+function stopCube(){ cube.on=false; if(cube.raf) cancelAnimationFrame(cube.raf); cube.raf=0; }
+window.addEventListener('resize', ()=>{ if(cube.on) resizeCube(); });
+window.addEventListener('keydown', e=>{ if(e.key==='Escape') closeAxis(); });
+
 async function tick(){
   if(!paused){
     try {
@@ -493,6 +692,7 @@ window.addEventListener('DOMContentLoaded', () => {
   });
   document.getElementById('ymin').addEventListener('change', applyYInput);
   document.getElementById('ymax').addEventListener('change', applyYInput);
+  buildAxisControls();
   rebuildCharts();
   syncYControls();
   tick();

@@ -4,7 +4,7 @@
 
 [defaults]
 log_dir = "./logs"
-plot_fps = 15             # browser poll rate (samples/sec fetched by the page)
+plot_fps = 50             # browser poll rate (samples/sec fetched by the page)
 plot_window_seconds = 10  # rolling time window shown in the plots
 record_hz = 100           # TSV recording rate
 web_host = "::"           # bind host: "::" = IPv6+IPv4 dual-stack; "0.0.0.0" = IPv4 only
