@@ -189,6 +189,16 @@ class ImuService:
             out[label] = sig
         return out
 
+    def read_raw(self, label: str) -> dict[str, list[float]] | None:
+        """Raw fused outputs for one sensor with the zero/tare offset NOT applied.
+
+        The CLS classifier needs gravity-inclusive accel, so it must bypass the tare that
+        ``signals()`` applies. Returns None if the label is unknown or the read is bad."""
+        sensor = self.sensors.get(label)
+        if sensor is None:
+            return None
+        return self._read(label, sensor)
+
     # --- zero / tare -------------------------------------------------------
     @property
     def is_zeroed(self) -> bool:

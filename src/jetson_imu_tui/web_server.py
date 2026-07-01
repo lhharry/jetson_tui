@@ -17,6 +17,7 @@ from pathlib import Path
 from flask import Flask, Response, jsonify, request
 from loguru import logger
 
+from jetson_imu_tui.cls.service import ClsService
 from jetson_imu_tui.config import AppConfig
 from jetson_imu_tui.imu_service import PLACEMENTS, ImuService
 from jetson_imu_tui.recorder import Recorder
@@ -56,6 +57,7 @@ class ServerState:
         self.log_dir = log_dir
         self.record_hz = record_hz
         self.recorder: Recorder | None = None
+        self.cls: "ClsService | None" = None
         self._lock = threading.Lock()
 
     def toggle_zero(self) -> bool:
@@ -93,6 +95,12 @@ class ServerState:
         return self.recorder is not None
 
     def shutdown(self) -> None:
+        if self.cls is not None:
+            try:
+                self.cls.stop()
+            except Exception:
+                pass
+            self.cls = None
         if self.recorder is not None:
             try:
                 self.recorder.__exit__(None, None, None)
@@ -151,6 +159,16 @@ def create_app(state: ServerState, window_s: float, poll_ms: int) -> Flask:
     def calibration() -> Response:
         return jsonify(state.service.calibration_status())
 
+    @app.route("/cls", methods=["GET"])
+    def cls() -> Response:
+        if state.cls is None:
+            return jsonify({"enabled": False, "reason": "not configured", "current": None, "entries": []})
+        try:
+            since = int(request.args.get("since", 0))
+        except (TypeError, ValueError):
+            since = 0
+        return jsonify(state.cls.snapshot(since))
+
     @app.route("/axis-remap", methods=["GET"])
     def axis_remap_get() -> Response:
         return jsonify(state.service.get_axis_remap())
@@ -204,6 +222,16 @@ def run_server(cfg: AppConfig, host: str | None = None, port: int | None = None)
         print("No IMUs detected — serving anyway (values will be null).")
 
     state = ServerState(service, cfg.log_dir, cfg.record_hz)
+    if cfg.cls_enabled and cfg.cls_model_path:
+        state.cls = ClsService(
+            service,
+            cfg.cls_model_path,
+            sensor=cfg.cls_sensor,
+            target_hz=cfg.cls_target_hz,
+            window=cfg.cls_window,
+            stride=cfg.cls_stride,
+        )
+        state.cls.start()
     poll_ms = max(20, int(1000 / max(1, cfg.plot_fps)))
     app = create_app(state, cfg.plot_window_seconds, poll_ms)
 
@@ -312,6 +340,26 @@ _HTML = """<!DOCTYPE html>
   .calseg{width:30px;height:12px;border-radius:3px;background:var(--panel2);border:1px solid var(--border)}
   .calseg.on{background:#22c55e;border-color:#22c55e}
   .calready{font-size:12px;font-weight:700;margin-left:8px}
+  /* ---- CLS page ---- */
+  #clsview{display:none;flex:1;min-height:0;flex-direction:column;padding:12px;gap:10px}
+  .clsbanner{display:flex;align-items:center;justify-content:center;gap:18px;min-height:96px;
+             background:var(--panel);border:1px solid var(--border);border-radius:12px}
+  .clsbanner.on{border-color:var(--accent)}
+  .clscls{font-size:40px;font-weight:800;letter-spacing:.04em;text-transform:uppercase}
+  .clsconf{font-size:22px;font-weight:700;color:var(--muted);font-variant-numeric:tabular-nums}
+  .clshead{display:flex;gap:12px;padding:0 12px;font-size:11px;text-transform:uppercase;
+           letter-spacing:.05em;color:var(--muted)}
+  .clshcol{width:78px}.clshcol.grow{flex:1;width:auto}
+  #clsLog{flex:1;min-height:0;overflow:auto;background:var(--panel);border:1px solid var(--border);
+          border-radius:12px;padding:4px 0}
+  .clsrow{display:flex;align-items:center;gap:12px;padding:7px 12px;border-top:1px solid var(--border);
+          font-variant-numeric:tabular-nums}
+  .clsrow:first-child{border-top:0}
+  .clstime{width:78px;color:var(--muted);font-size:12px}
+  .clsname{flex:1;font-weight:700;text-transform:capitalize}
+  .clsbar{width:120px;height:8px;background:var(--panel2);border-radius:4px;overflow:hidden}
+  .clsbar i{display:block;height:100%}
+  .clspct{width:44px;text-align:right;color:var(--muted);font-size:12px}
 </style>
 </head>
 <body>
@@ -322,6 +370,7 @@ _HTML = """<!DOCTYPE html>
         <button class="sigbtn" data-sig="accel" onclick="setSignal('accel')">Accel</button>
         <button class="sigbtn" data-sig="gyro" onclick="setSignal('gyro')">Gyro</button>
         <button class="sigbtn" data-sig="quat" onclick="setSignal('quat')">Quat</button>
+        <button class="sigbtn" data-sig="cls" onclick="setSignal('cls')">CLS</button>
       </div>
       <button id="viewBtn" class="btn" onclick="toggleView()">Numbers</button>
       <button id="pauseBtn" class="btn" onclick="togglePause()">Pause</button>
@@ -343,6 +392,13 @@ _HTML = """<!DOCTYPE html>
     </div>
     <div id="charts"></div>
     <div id="readout"></div>
+    <div id="clsview">
+      <div id="clsBanner" class="clsbanner"><span class="muted">connecting…</span></div>
+      <div class="clshead">
+        <span class="clshcol">time</span><span class="clshcol grow">activity</span><span class="clshcol">conf</span>
+      </div>
+      <div id="clsLog"></div>
+    </div>
   </div>
 
   <div id="axisOverlay" class="overlay" onclick="if(event.target===this)closeAxis()">
@@ -419,6 +475,12 @@ let samples = [];
 let charts = [], heads = [], ro = null;
 let latestT = 0;
 let yBySignal = {};               // signal -> {auto:true} | {auto:false, min, max}
+let clsMode = false;              // CLS page active (a pseudo-signal, not a plot)
+let clsSince = 0;                 // highest CLS entry id already shown
+let clsTimer = null;
+const CLS_COLORS = { stand:'#9aa4b2', walk:'#22c55e', turn:'#eab308', jog:'#ef4444',
+                     rampascent:'#3b82f6', stairascent:'#a855f7', stairdescent:'#ec4899' };
+const clsColor = c => CLS_COLORS[c] || '#60a5fa';
 
 const fmt = (sig, v) => v == null ? '--' : v.toFixed(sig === 'quat' ? 3 : 2);
 
@@ -511,6 +573,8 @@ function updateReadout(d){
 }
 
 function setSignal(s){
+  if(s === 'cls'){ enterCls(); return; }
+  if(clsMode) exitCls();
   signal = s;
   document.querySelectorAll('.sigbtn').forEach(b => b.classList.toggle('active', b.dataset.sig === s));
   if(view === 'plot') rebuildCharts();
@@ -526,6 +590,7 @@ async function toggleRecord(){ try { await fetch('/record', {method:'POST'}); } 
 async function toggleZero(){ try { await fetch('/zero', {method:'POST'}); } catch(e) {} }
 
 function toggleView(){
+  if(clsMode) return;   // CLS is its own page; Numbers/Plots toggle doesn't apply
   view = (view === 'plot') ? 'numbers' : 'plot';
   document.getElementById('viewBtn').textContent = (view === 'plot') ? 'Numbers' : 'Plots';
   document.getElementById('charts').style.display = (view === 'plot') ? 'flex' : 'none';
@@ -736,6 +801,53 @@ async function pollCalib(){
 }
 window.addEventListener('keydown', e=>{ if(e.key==='Escape'){ closeAxis(); closeCalib(); } });
 
+// ---- CLS (activity classification) page -----------------------------------
+function enterCls(){
+  clsMode = true;
+  document.querySelectorAll('.sigbtn').forEach(b => b.classList.toggle('active', b.dataset.sig === 'cls'));
+  document.getElementById('charts').style.display = 'none';
+  document.getElementById('readout').style.display = 'none';
+  document.getElementById('clsview').style.display = 'flex';
+  if(!clsTimer){ pollCls(); clsTimer = setInterval(pollCls, 1000); }
+}
+function exitCls(){
+  clsMode = false;
+  document.getElementById('clsview').style.display = 'none';
+  if(clsTimer){ clearInterval(clsTimer); clsTimer = null; }
+  document.getElementById('charts').style.display = (view === 'plot') ? 'flex' : 'none';
+  document.getElementById('readout').style.display = (view === 'plot') ? 'none' : 'grid';
+}
+async function pollCls(){
+  let d;
+  try { d = await (await fetch('/cls?since=' + clsSince)).json(); } catch(e) { return; }
+  const banner = document.getElementById('clsBanner');
+  if(!d.enabled){
+    banner.className = 'clsbanner';
+    banner.innerHTML = '<span class="muted">CLS disabled — ' + (d.reason || 'model not loaded') + '</span>';
+    return;
+  }
+  if(d.current){
+    banner.className = 'clsbanner on';
+    banner.innerHTML = '<span class="clscls" style="color:' + clsColor(d.current.cls) + '">'
+        + d.current.cls + '</span><span class="clsconf">' + (d.current.conf * 100).toFixed(0) + '%</span>';
+  } else {
+    banner.className = 'clsbanner';
+    banner.innerHTML = '<span class="muted">waiting for data (' + (d.sensor || '') + ')…</span>';
+  }
+  const log = document.getElementById('clsLog');
+  for(const e of (d.entries || [])){
+    clsSince = Math.max(clsSince, e.id);
+    const pct = (e.conf * 100).toFixed(0);
+    const row = document.createElement('div'); row.className = 'clsrow';
+    row.innerHTML = '<span class="clstime">' + e.clock + '</span>'
+      + '<span class="clsname" style="color:' + clsColor(e.cls) + '">' + e.cls + '</span>'
+      + '<span class="clsbar"><i style="width:' + pct + '%;background:' + clsColor(e.cls) + '"></i></span>'
+      + '<span class="clspct">' + pct + '%</span>';
+    log.insertBefore(row, log.firstChild);
+  }
+  while(log.childNodes.length > 500) log.removeChild(log.lastChild);
+}
+
 async function tick(){
   if(!paused){
     try {
@@ -767,8 +879,8 @@ async function tick(){
 }
 
 window.addEventListener('DOMContentLoaded', () => {
-  let saved = 'dark';
-  try { saved = localStorage.getItem('theme') || 'dark'; } catch(_) {}
+  let saved = 'light';
+  try { saved = localStorage.getItem('theme') || 'light'; } catch(_) {}
   applyTheme(saved === 'light');
   document.getElementById('freq').addEventListener('change', async (e) => {
     const v = parseInt(e.target.value, 10);

@@ -9,3 +9,11 @@ plot_window_seconds = 10  # rolling time window shown in the plots
 record_hz = 100           # TSV recording rate
 web_host = "::"           # bind host: "::" = IPv6+IPv4 dual-stack; "0.0.0.0" = IPv4 only
 web_port = 8000           # server port
+
+[cls]                     # real-time activity classification (CLS page)
+enabled = true            # master switch; CLS also self-disables if torch/checkpoint missing
+model_path = ""           # path to the BERT-finetune jetson_leg .pt (e.g. src/jetson_imu_tui/cls/model/<name>.pt)
+sensor = "Left"           # which IMU label to classify (single-IMU model)
+target_hz = 10            # sampling rate feeding the model (matches training 10 Hz)
+window = 20               # samples per inference window (2 s @ 10 Hz)
+stride = 10               # emit a new prediction every N samples (10 = every 1 s, sliding)
