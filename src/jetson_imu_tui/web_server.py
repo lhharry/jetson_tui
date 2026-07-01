@@ -649,6 +649,18 @@ function closeAxis(){ document.getElementById('axisOverlay').classList.remove('o
 
 // ---- three.js live cube ---------------------------------------------------
 let cube={ on:false, renderer:null, scene:null, camera:null, mesh:null, raf:0, q:null };
+// A camera-facing text label (canvas texture on a sprite) placed at an axis tip.
+function makeAxisLabel(text,color,pos){
+  const c=document.createElement('canvas'); c.width=c.height=64;
+  const ctx=c.getContext('2d');
+  ctx.font='bold 48px system-ui,-apple-system,sans-serif';
+  ctx.textAlign='center'; ctx.textBaseline='middle';
+  ctx.fillStyle=color; ctx.fillText(text,32,34);
+  const tex=new THREE.CanvasTexture(c); tex.minFilter=THREE.LinearFilter;
+  const spr=new THREE.Sprite(new THREE.SpriteMaterial({map:tex,transparent:true,depthTest:false}));
+  spr.position.copy(pos); spr.scale.set(0.6,0.6,0.6);
+  return spr;
+}
 function startCube(){
   const wrap=document.getElementById('cubeWrap'), canvas=document.getElementById('cube');
   if(typeof THREE==='undefined'){ wrap.innerHTML='<div class="muted" style="padding:14px">3D library unavailable (the browser needs internet for the CDN).</div>'; return; }
@@ -660,6 +672,10 @@ function startCube(){
     const g=new THREE.Group();
     g.add(new THREE.Mesh(new THREE.BoxGeometry(1.6,0.35,1.1), new THREE.MeshNormalMaterial()));
     g.add(new THREE.AxesHelper(1.6));
+    // X/Y/Z tip labels, colour-matched to the AxesHelper lines (red/green/blue).
+    g.add(makeAxisLabel('X','#ff4d4d',new THREE.Vector3(1.95,0,0)));
+    g.add(makeAxisLabel('Y','#4ade80',new THREE.Vector3(0,1.95,0)));
+    g.add(makeAxisLabel('Z','#60a5fa',new THREE.Vector3(0,0,1.95)));
     cube.scene.add(g); cube.mesh=g; cube.q=new THREE.Quaternion();
   }
   resizeCube(); cube.on=true; renderCube();
