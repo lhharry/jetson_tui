@@ -1,15 +1,19 @@
-"""Headless web server: serve latest IMU values for a browser uPlot frontend.
+"""Headless web server: serve IMU samples for a browser uPlot frontend.
 
-Deliberately minimal (mirrors a proven Raspberry-Pi design): Flask + a few routes
-(`GET /`, `GET /data`, `POST /record`, `POST /freq`). No websocket, no ring buffer,
-no async — the browser polls `/data`, accumulates points, and draws with uPlot. All
-rendering happens in the browser on the laptop, so the Jetson spends ~zero CPU on the UI.
+Flask + a few routes (`GET /`, `GET /data`, `POST /record`, `POST /freq`). Acquisition is
+decoupled from serving: ``ImuService.start_sampling`` fills one ring buffer per sensor at
+``sample_hz``, and every consumer (this server, the recorder, CLS) reads the buffers — a
+`/data` request costs no I2C. The browser polls `/data?since=<t>` at a modest rate and
+receives the full batch of samples since its last poll, so the plots show the complete
+``sample_hz`` stream while staying robust on lossy networks (a dropped poll self-heals on
+the next one). No websocket, no async; rendering happens in the browser on the laptop.
 """
 
 from __future__ import annotations
 
 import logging
 import socket
+import sys
 import threading
 import time
 from pathlib import Path
@@ -77,7 +81,7 @@ class ServerState:
     def set_record_hz(self, hz) -> int:
         """Set the recording rate (1–200 Hz); restart an active recorder to apply it."""
         try:
-            hz = max(1, min(200, int(hz)))
+            hz = max(1, min(100, int(hz)))
         except (TypeError, ValueError):
             return self.record_hz
         with self._lock:
@@ -113,7 +117,7 @@ class ServerState:
             pass
 
 
-def _payload(state: ServerState) -> dict:
+def _payload(state: ServerState, since: float | None = None) -> dict:
     out: dict = {
         "t": time.monotonic(),
         "recording": state.recording,
@@ -127,11 +131,14 @@ def _payload(state: ServerState) -> dict:
     for label, sig in state.service.signals().items():
         for key in ("euler", "accel", "gyro", "quat"):
             out[key][label] = sig[key] if sig is not None else None
+    if since is not None:
+        # Batch of buffered samples newer than the client's cursor (memory read, no I2C).
+        out["samples"] = state.service.samples_since(since)
     return out
 
 
 def create_app(state: ServerState, window_s: float, poll_ms: int) -> Flask:
-    app = Flask(__name__)
+    app = Flask(__name__, static_folder="static")
     html = _HTML.replace("__WINDOW_S__", str(float(window_s))).replace("__POLL_MS__", str(int(poll_ms)))
 
     @app.route("/")
@@ -140,7 +147,11 @@ def create_app(state: ServerState, window_s: float, poll_ms: int) -> Flask:
 
     @app.route("/data")
     def data() -> Response:
-        return jsonify(_payload(state))
+        try:
+            since = float(request.args["since"])
+        except (KeyError, TypeError, ValueError):
+            since = None
+        return jsonify(_payload(state, since))
 
     @app.route("/record", methods=["POST"])
     def record() -> Response:
@@ -205,8 +216,10 @@ def run_server(cfg: AppConfig, host: str | None = None, port: int | None = None)
     host = host or cfg.web_host
     port = int(port or cfg.web_port)
 
-    # Quiet down imu_python (loguru) and werkzeug so stdout stays clean.
+    # Quiet werkzeug; keep loguru at INFO on stderr for rate/overrun telemetry
+    # (sampler threads, recorder) — stdout stays reserved for the startup banner.
     logger.remove()
+    logger.add(sys.stderr, level="INFO", format="{time:HH:mm:ss} | {level:<7} | {message}")
     logging.getLogger("werkzeug").setLevel(logging.ERROR)
 
     service = ImuService(cfg.bus_labels, state_path=Path(cfg.log_dir) / "axis_remap.json")
@@ -218,6 +231,7 @@ def run_server(cfg: AppConfig, host: str | None = None, port: int | None = None)
         info = []
     if info:
         print("Connected: " + ", ".join(f"{i.label}={i.sensor_name}" for i in info))
+        service.start_sampling(cfg.sample_hz)
     else:
         print("No IMUs detected — serving anyway (values will be null).")
 
@@ -265,9 +279,9 @@ _HTML = """<!DOCTYPE html>
 <meta charset="utf-8"/>
 <meta name="viewport" content="width=device-width, initial-scale=1"/>
 <title>Jetson IMU Live</title>
-<link rel="stylesheet" href="https://cdn.jsdelivr.net/npm/uplot@1.6.31/dist/uPlot.min.css">
-<script src="https://cdn.jsdelivr.net/npm/uplot@1.6.31/dist/uPlot.iife.min.js"></script>
-<script src="https://cdn.jsdelivr.net/npm/three@0.149.0/build/three.min.js"></script>
+<link rel="stylesheet" href="/static/uPlot.min.css">
+<script src="/static/uPlot.iife.min.js"></script>
+<script src="/static/three.min.js"></script>
 <style>
   :root{--bg:#0e1014;--panel:#161922;--panel2:#1d212c;--border:#2a2f3a;--fg:#e5e7eb;--muted:#9aa4b2;--accent:#3b82f6}
   :root.light{--bg:#f5f7fa;--panel:#ffffff;--panel2:#eef1f6;--border:#d6dce6;--fg:#1b1f27;--muted:#5b6472;--accent:#2563eb}
@@ -387,7 +401,7 @@ _HTML = """<!DOCTYPE html>
       <button id="zeroBtn" class="btn" onclick="toggleZero()" title="Zero out current Euler/Accel/Gyro readings (tare)">Zero</button>
       <button id="recBtn" class="btn" onclick="toggleRecord()">Record</button>
       <label class="reclabel" title="Recording rate — only affects logging to disk, not the plot">
-        Rec Hz <input id="freq" class="num" type="number" min="1" max="200" step="1"></label>
+        Rec Hz <input id="freq" class="num" type="number" min="1" max="100" step="1"></label>
       <span id="status"><span id="dot"></span>connecting…</span>
     </div>
     <div id="charts"></div>
@@ -510,6 +524,10 @@ function rebuildCharts(){
   charts = []; heads = [];
   const wrap = document.getElementById('charts');
   wrap.innerHTML = '';
+  if(typeof uPlot === 'undefined'){
+    wrap.innerHTML = '<div class="muted" style="padding:14px">uPlot failed to load — Plots unavailable; the Numbers view still works.</div>';
+    return;
+  }
   const T = theme();
   ro = new ResizeObserver(entries => {
     for(const e of entries){
@@ -735,13 +753,21 @@ function startCube(){
     cube.camera=new THREE.PerspectiveCamera(45,1,0.1,100);
     cube.camera.position.set(3.2,2.4,3.2); cube.camera.lookAt(0,0,0);
     const g=new THREE.Group();
-    g.add(new THREE.Mesh(new THREE.BoxGeometry(1.6,0.35,1.1), new THREE.MeshNormalMaterial()));
+    // Object space = sensor body frame: the board is thin along sensor Z, so the slab's
+    // small dimension is the group's Z.
+    g.add(new THREE.Mesh(new THREE.BoxGeometry(1.6,1.1,0.35), new THREE.MeshNormalMaterial()));
     g.add(new THREE.AxesHelper(1.6));
     // X/Y/Z tip labels, colour-matched to the AxesHelper lines (red/green/blue).
     g.add(makeAxisLabel('X','#ff4d4d',new THREE.Vector3(1.95,0,0)));
     g.add(makeAxisLabel('Y','#4ade80',new THREE.Vector3(0,1.95,0)));
     g.add(makeAxisLabel('Z','#60a5fa',new THREE.Vector3(0,0,1.95)));
-    cube.scene.add(g); cube.mesh=g; cube.q=new THREE.Quaternion();
+    // Basis change BNO055 Z-up -> three.js Y-up: R_x(-90°) maps (x,y,z) to (x,z,-y).
+    // The sensor quaternion is applied verbatim to `g`, so its labelled axes stay the
+    // sensor's body axes; the parent tilts that whole world so sensor "up" renders up.
+    const world=new THREE.Group();
+    world.rotation.x=-Math.PI/2;
+    world.add(g);
+    cube.scene.add(world); cube.mesh=g; cube.q=new THREE.Quaternion();
   }
   resizeCube(); cube.on=true; renderCube();
 }
@@ -848,21 +874,34 @@ async function pollCls(){
   while(log.childNodes.length > 500) log.removeChild(log.lastChild);
 }
 
+let sinceT = 0;                        // cursor: newest buffered-sample t already fetched
+let statPolls = 0, statSamples = 0, statStart = performance.now(), rateStr = '';
+
 async function tick(){
   if(!paused){
     try {
-      const d = await (await fetch('/data')).json();
+      const d = await (await fetch('/data?since=' + sinceT)).json();
+      if(d.t < sinceT){ sinceT = 0; samples = []; }   // server restarted (monotonic reset)
       latestT = d.t;
       const ks = Object.keys(d.euler || {});
       if(ks.length && JSON.stringify(ks) !== JSON.stringify(labels)){
         labels = ks;
         if(view === 'plot') rebuildCharts(); else buildReadout();
       }
-      samples.push(d);
+      const batch = (d.samples && d.samples.length) ? d.samples : [d];
+      if(d.samples && d.samples.length) sinceT = d.samples[d.samples.length - 1].t;
+      for(const s of batch) samples.push(s);
       const cutoff = latestT - WINDOW_S;
       while(samples.length && samples[0].t < cutoff) samples.shift();
 
-      document.getElementById('status').innerHTML = '<span id="dot"></span>live · t=' + d.t.toFixed(1) + 's';
+      statPolls++; statSamples += (d.samples ? d.samples.length : 0);
+      const elapsed = performance.now() - statStart;
+      if(elapsed >= 2000){
+        rateStr = ' · poll ' + (statPolls * 1000 / elapsed).toFixed(0)
+                + ' Hz · data ' + (statSamples * 1000 / elapsed).toFixed(0) + ' Hz';
+        statPolls = 0; statSamples = 0; statStart = performance.now();
+      }
+      document.getElementById('status').innerHTML = '<span id="dot"></span>live · t=' + d.t.toFixed(1) + 's' + rateStr;
       const rb = document.getElementById('recBtn');
       rb.textContent = d.recording ? 'Recording' : 'Record';
       rb.classList.toggle('rec-on', !!d.recording);
@@ -884,7 +923,7 @@ window.addEventListener('DOMContentLoaded', () => {
   applyTheme(saved === 'light');
   document.getElementById('freq').addEventListener('change', async (e) => {
     const v = parseInt(e.target.value, 10);
-    if(v >= 1 && v <= 200){ try { await fetch('/freq?hz=' + v, {method:'POST'}); } catch(_) {} }
+    if(v >= 1 && v <= 100){ try { await fetch('/freq?hz=' + v, {method:'POST'}); } catch(_) {} }
   });
   document.getElementById('ymin').addEventListener('change', applyYInput);
   document.getElementById('ymax').addEventListener('change', applyYInput);

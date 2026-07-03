@@ -8,6 +8,8 @@ from datetime import datetime
 from io import TextIOWrapper
 from pathlib import Path
 
+from loguru import logger
+
 from jetson_imu_tui.imu_service import ImuService
 
 
@@ -64,8 +66,18 @@ class Recorder:
     def _loop(self) -> None:
         period = 1.0 / self._hz
         next_tick = time.monotonic()
+        stat_start = next_tick
+        rows = overruns = 0
         while not self._stop.is_set():
             self._write_row()
+            rows += 1
+            now = time.monotonic()
+            if now - stat_start >= 5.0:
+                logger.info(
+                    f"recorder: {rows / (now - stat_start):.1f} Hz (target {self._hz:.0f}) · overruns={overruns}"
+                )
+                stat_start = now
+                rows = overruns = 0
             next_tick += period
             sleep_for = next_tick - time.monotonic()
             if sleep_for > 0:
@@ -73,6 +85,7 @@ class Recorder:
                     break
             else:
                 # Falling behind — resync rather than spin
+                overruns += 1
                 next_tick = time.monotonic()
 
     def _write_row(self) -> None:

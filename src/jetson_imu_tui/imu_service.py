@@ -15,6 +15,7 @@ from __future__ import annotations
 
 import json
 import threading
+import time
 from dataclasses import dataclass
 from pathlib import Path
 
@@ -22,6 +23,8 @@ from loguru import logger
 
 import adafruit_bno055
 from adafruit_extended_bus import ExtendedI2C
+
+from jetson_imu_tui.ring_buffer import RingBuffer
 
 # --- BNO055 specifics ------------------------------------------------------
 BNO055_ADDRESS = 0x28  # both buses use the default address
@@ -102,6 +105,11 @@ class ImuService:
         # Per-label zero offset for euler/accel/gyro (tare). None = no offset.
         self._offset: dict[str, dict[str, list[float]]] | None = None
         self._offset_lock = threading.Lock()
+        # Background sampling: one thread per sensor fills a ring buffer; consumers
+        # (web, recorder, CLS) read the buffers so I2C is polled once per period total.
+        self._buffers: dict[str, RingBuffer] = {}
+        self._sample_threads: dict[str, threading.Thread] = {}
+        self._sampling_stop = threading.Event()
 
     @property
     def labels(self) -> list[str]:
@@ -119,6 +127,7 @@ class ImuService:
                 self._buses[label] = i2c
                 self.sensors[label] = sensor
                 self._locks[label] = threading.Lock()
+                self._buffers[label] = RingBuffer()
             except Exception as err:  # pragma: no cover - hardware dependent
                 logger.warning(f"{label} (bus {bus_id}): no BNO055 ({err})")
         # Axis remap is volatile (lost on power-cycle): re-apply a persisted non-default map.
@@ -130,6 +139,7 @@ class ImuService:
         return self.info()
 
     def disconnect(self) -> None:
+        self.stop_sampling()
         for i2c in self._buses.values():
             try:
                 i2c.deinit()
@@ -138,6 +148,7 @@ class ImuService:
         self.sensors.clear()
         self._buses.clear()
         self._locks.clear()
+        self._buffers.clear()
 
     def info(self) -> list[ImuInfo]:
         out: list[ImuInfo] = []
@@ -148,6 +159,76 @@ class ImuService:
 
     def is_connected(self) -> bool:
         return bool(self.sensors)
+
+    # --- background sampling -------------------------------------------------
+    @property
+    def sampling(self) -> bool:
+        return bool(self._sample_threads)
+
+    def start_sampling(self, hz: float = 100.0) -> None:
+        """Start one sampler thread per connected sensor, filling its ring buffer at ``hz``.
+
+        The two I2C buses run in parallel (one thread each) instead of the old serial
+        read in ``signals()``. Once running, ``signals``/``read_raw``/``samples_since``
+        are memory reads — the sensors see exactly one poll per period regardless of how
+        many consumers (web tabs, recorder, CLS) are attached."""
+        if self._sample_threads or not self.sensors:
+            return
+        self._sampling_stop.clear()
+        for label in self.sensors:
+            th = threading.Thread(
+                target=self._sample_loop,
+                args=(label, float(hz)),
+                daemon=True,
+                name=f"imu-sampler-{label}",
+            )
+            self._sample_threads[label] = th
+            th.start()
+
+    def stop_sampling(self) -> None:
+        self._sampling_stop.set()
+        for th in self._sample_threads.values():
+            th.join(timeout=2.0)
+        self._sample_threads.clear()
+
+    def _sample_loop(self, label: str, hz: float) -> None:
+        period = 1.0 / hz
+        buf = self._buffers[label]
+        sensor = self.sensors[label]
+        next_tick = time.monotonic()
+        stat_start = next_tick
+        samples = overruns = bad_reads = 0
+        durations: list[float] = []
+        while not self._sampling_stop.is_set():
+            t0 = time.perf_counter()
+            sig = self._read(label, sensor)
+            durations.append(time.perf_counter() - t0)
+            if sig is not None:
+                sig["t"] = time.monotonic()
+                buf.append(sig)
+                samples += 1
+            else:
+                bad_reads += 1
+            now = time.monotonic()
+            if now - stat_start >= 5.0:
+                durations.sort()
+                p50 = durations[len(durations) // 2] * 1e3
+                p95 = durations[int(len(durations) * 0.95)] * 1e3
+                logger.info(
+                    f"sampler[{label}]: {samples / (now - stat_start):.1f} Hz (target {hz:.0f}) · "
+                    f"read p50={p50:.1f}ms p95={p95:.1f}ms · overruns={overruns} bad_reads={bad_reads}"
+                )
+                stat_start = now
+                samples = overruns = bad_reads = 0
+                durations.clear()
+            next_tick += period
+            sleep_for = next_tick - time.monotonic()
+            if sleep_for > 0:
+                if self._sampling_stop.wait(sleep_for):
+                    break
+            else:
+                overruns += 1
+                next_tick = time.monotonic()  # fell behind — resync rather than spin
 
     # --- data --------------------------------------------------------------
     def _read(self, label: str, sensor: adafruit_bno055.BNO055_I2C) -> dict[str, list[float]] | None:
@@ -176,28 +257,83 @@ class ImuService:
             "quat": [float(quat[0]), float(quat[1]), float(quat[2]), float(quat[3])],
         }
 
+    def _latest_raw(self, label: str) -> dict | None:
+        """Newest raw sample for ``label`` — from the ring buffer while the sampler runs,
+        falling back to a direct I2C read otherwise (library use without start_sampling)."""
+        if self._sample_threads:
+            buf = self._buffers.get(label)
+            return buf.latest() if buf is not None else None
+        sensor = self.sensors.get(label)
+        return self._read(label, sensor) if sensor is not None else None
+
+    @staticmethod
+    def _with_offset(sig: dict | None, o: dict[str, list[float]] | None) -> dict | None:
+        """Copy of ``sig``'s four signal keys with the tare offset applied. Copies always —
+        buffer samples are shared with other consumers and must never be mutated."""
+        if sig is None:
+            return None
+        out: dict[str, list[float]] = {"quat": list(sig["quat"])}
+        for key in ("euler", "accel", "gyro"):
+            vals = sig[key]
+            out[key] = [v - ov for v, ov in zip(vals, o[key])] if o else list(vals)
+        return out
+
     def signals(self) -> dict[str, dict[str, list[float]] | None]:
         """Latest derived signals per label, with the zero offset applied when active."""
         off = self._offset
         out: dict[str, dict[str, list[float]] | None] = {}
-        for label, sensor in self.sensors.items():
-            sig = self._read(label, sensor)
-            if sig is not None and off is not None and label in off:
-                o = off[label]
-                for key in ("euler", "accel", "gyro"):
-                    sig[key] = [v - ov for v, ov in zip(sig[key], o[key])]
-            out[label] = sig
+        for label in self.sensors:
+            sig = self._latest_raw(label)
+            out[label] = self._with_offset(sig, off.get(label) if off else None)
         return out
 
     def read_raw(self, label: str) -> dict[str, list[float]] | None:
         """Raw fused outputs for one sensor with the zero/tare offset NOT applied.
 
         The CLS classifier needs gravity-inclusive accel, so it must bypass the tare that
-        ``signals()`` applies. Returns None if the label is unknown or the read is bad."""
-        sensor = self.sensors.get(label)
-        if sensor is None:
+        ``signals()`` applies. Returns None if the label is unknown or no data is available."""
+        if label not in self.sensors:
             return None
-        return self._read(label, sensor)
+        sig = self._latest_raw(label)
+        if sig is None:
+            return None
+        return {key: list(sig[key]) for key in ("euler", "accel", "gyro", "quat")}
+
+    def samples_since(self, t: float, limit: int = 300) -> list[dict]:
+        """Payload-shaped samples newer than monotonic time ``t``, oldest first.
+
+        The first label is the time master; for each of its samples the other labels
+        contribute their nearest-in-time sample (the sub-period misalignment between the
+        independent sampler threads is invisible at plot scale). Tare is applied to
+        euler/accel/gyro per sample; quaternions are never offset."""
+        labels = [lab for lab in self.labels if lab in self._buffers]
+        if not labels or not self._sample_threads:
+            return []
+        master = labels[0]
+        master_samples = self._buffers[master].since(t, limit=limit)
+        if not master_samples:
+            return []
+        others: dict[str, list[dict]] = {
+            lab: self._buffers[lab].since(master_samples[0]["t"] - 0.05) for lab in labels[1:]
+        }
+        off = self._offset
+        idx = {lab: 0 for lab in others}
+        out: list[dict] = []
+        for sm in master_samples:
+            row: dict = {"t": sm["t"], "euler": {}, "accel": {}, "gyro": {}, "quat": {}}
+            per_label: dict[str, dict | None] = {master: sm}
+            for lab, arr in others.items():
+                i = idx[lab]
+                while i + 1 < len(arr) and abs(arr[i + 1]["t"] - sm["t"]) <= abs(arr[i]["t"] - sm["t"]):
+                    i += 1
+                idx[lab] = i
+                per_label[lab] = arr[i] if arr else None
+            for lab in labels:
+                sig = self._with_offset(per_label.get(lab), off.get(lab) if off else None)
+                for key in ("euler", "accel", "gyro", "quat"):
+                    row[key][lab] = sig[key] if sig is not None else None
+            out.append(row)
+        return out
 
     # --- zero / tare -------------------------------------------------------
     @property
@@ -210,8 +346,8 @@ class ImuService:
         with self._offset_lock:
             if self._offset is None:
                 captured: dict[str, dict[str, list[float]]] = {}
-                for label, sensor in self.sensors.items():
-                    sig = self._read(label, sensor)
+                for label in self.sensors:
+                    sig = self._latest_raw(label)
                     if sig is not None:
                         captured[label] = {
                             "euler": list(sig["euler"]),

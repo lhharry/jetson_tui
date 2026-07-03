@@ -2,7 +2,10 @@
 
 from __future__ import annotations
 
-import tomllib
+try:
+    import tomllib
+except ModuleNotFoundError:  # Python 3.10: tomllib is stdlib only since 3.11
+    import tomli as tomllib
 from dataclasses import dataclass, field
 from pathlib import Path
 
@@ -13,6 +16,7 @@ DEFAULT_CONFIG = Path(__file__).resolve().parents[2] / "config" / "default.toml"
 class AppConfig:
     bus_labels: dict[int, str] = field(default_factory=lambda: {1: "Left", 7: "Right"})
     log_dir: Path = Path("./logs")
+    sample_hz: int = 100
     plot_fps: int = 15
     plot_window_seconds: float = 10.0
     record_hz: int = 100
@@ -42,6 +46,7 @@ def load_config(path: Path | None = None) -> AppConfig:
     return AppConfig(
         bus_labels=bus_labels or {1: "Left", 7: "Right"},
         log_dir=Path(defaults.get("log_dir", "./logs")).expanduser(),
+        sample_hz=int(defaults.get("sample_hz", 100)),
         plot_fps=int(defaults.get("plot_fps", 15)),
         plot_window_seconds=float(defaults.get("plot_window_seconds", 10.0)),
         record_hz=int(defaults.get("record_hz", 100)),
