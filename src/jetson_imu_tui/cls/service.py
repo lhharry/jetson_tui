@@ -22,6 +22,7 @@ from loguru import logger
 
 from jetson_imu_tui.cls.model import CLASSES
 from jetson_imu_tui.imu_service import ImuService
+from jetson_imu_tui.ring_buffer import RingBuffer
 
 
 class ClsService:
@@ -48,6 +49,9 @@ class ClsService:
         self._reason = "not started"
 
         self._buf: deque[list[float]] = deque(maxlen=self._window)
+        # Every 6-channel vector fed to the model, timestamped (monotonic). The recorder
+        # drains this into model_input.csv so a recording captures the exact model input.
+        self._input_buf = RingBuffer()
         self._since_pred = 0
         self._log: deque[dict] = deque(maxlen=int(log_size))
         self._current: dict | None = None
@@ -92,6 +96,9 @@ class ClsService:
             if raw is not None:
                 acc, gyr = raw["accel"], raw["gyro"]
                 self._buf.append([acc[0], acc[1], acc[2], gyr[0], gyr[1], gyr[2]])
+                self._input_buf.append(
+                    {"t": time.monotonic(), "acc": list(acc[:3]), "gyr": list(gyr[:3])}
+                )
                 self._since_pred += 1
                 if self._since_pred >= self._stride and len(self._buf) >= self._window:
                     self._since_pred = 0
@@ -140,6 +147,13 @@ class ClsService:
         The recorder polls this per drain to persist the held prediction at 100 Hz."""
         with self._log_lock:
             return dict(self._current) if self._current else None
+
+    def inputs_since(self, t: float, limit: int | None = None) -> list[dict]:
+        """Model-input samples ``{"t","acc","gyr"}`` newer than monotonic ``t``, oldest first.
+
+        These are the exact 6-channel vectors fed to the model (raw accel+gyro of the CLS
+        sensor at the model's ``target_hz``); the recorder drains them into model_input.csv."""
+        return self._input_buf.since(t, limit=limit)
 
     # --- web accessor ------------------------------------------------------
     def snapshot(self, since: int = 0) -> dict:
