@@ -1,9 +1,15 @@
-"""ClsService — background 10 Hz sampler + sliding-window activity inference.
+"""ClsService — background 10 Hz block-averaging sampler + sliding-window inference.
 
-Samples one IMU (the ``sensor`` label) at a fixed 10 Hz via ``ImuService.read_raw`` (raw,
-gravity-inclusive), keeps a rolling window of the last ``window`` samples, and every
-``stride`` new samples runs the vendored BERT classifier, appending a timestamped result
-to a capped log the web layer polls through ``GET /cls``.
+Every ~1/``target_hz`` s it pulls *all* raw (gravity-inclusive, tare-bypassed) 100 Hz
+samples that arrived since the last tick via ``ImuService.raw_samples_since`` and
+block-averages them into one 10 Hz vector. This mirrors training's anti-aliasing
+downsample (``dataset/jetson_leg.down_sample``): plain decimation (one instantaneous
+sample per tick) would alias >5 Hz energy and feed the model out-of-distribution input,
+hurting the dynamic classes (jog / stairs) most. It keeps a rolling window of the last
+``window`` averaged vectors and, every ``stride`` new vectors, runs the vendored BERT
+classifier, appending a timestamped result to a capped log the web layer polls via
+``GET /cls``. A time gap between consecutive averaged vectors (sensor stall / reconnect)
+clears the window so inference never runs across a discontinuity.
 
 Fails safe: if ``torch`` or the checkpoint is missing, the service stays ``enabled=False``
 and never touches the sensor, so the rest of the TUI is unaffected.
@@ -16,19 +22,22 @@ import time
 from collections import deque
 from datetime import datetime
 from pathlib import Path
+from typing import TYPE_CHECKING
 
 import numpy as np
 from loguru import logger
 
 from jetson_imu_tui.cls.model import CLASSES
-from jetson_imu_tui.imu_service import ImuService
 from jetson_imu_tui.ring_buffer import RingBuffer
+
+if TYPE_CHECKING:  # ImuService pulls in the Linux-only hardware stack; only needed for hints.
+    from jetson_imu_tui.imu_service import ImuService
 
 
 class ClsService:
     def __init__(
         self,
-        service: ImuService,
+        service: "ImuService",
         model_path: Path | str,
         *,
         sensor: str = "Left",
@@ -43,6 +52,9 @@ class ClsService:
         self._period = 1.0 / float(target_hz)
         self._window = int(window)
         self._stride = int(stride)
+        # Clear the rolling window if consecutive averaged vectors are more than this far
+        # apart (a stalled/reconnecting sensor) so a window never spans a discontinuity.
+        self._gap_reset = 2.5 * self._period
 
         self._clf = None
         self._enabled = False
@@ -91,13 +103,22 @@ class ClsService:
     # --- sampling + inference ---------------------------------------------
     def _loop(self) -> None:
         next_tick = time.monotonic()
+        cursor = time.monotonic()  # only consume raw samples newer than this
+        last_t: float | None = None  # monotonic time of the last accepted averaged vector
         while not self._stop.is_set():
-            raw = self._service.read_raw(self._sensor)
-            if raw is not None:
-                acc, gyr = raw["accel"], raw["gyro"]
+            batch = self._service.raw_samples_since(self._sensor, cursor)
+            if batch:
+                cursor = batch[-1]["t"]
+                # Block-average the batch → one 10 Hz vector (matches down_sample).
+                acc = np.mean([s["accel"] for s in batch], axis=0)
+                gyr = np.mean([s["gyro"] for s in batch], axis=0)
+                sample_t = batch[-1]["t"]
+                if last_t is not None and (sample_t - last_t) > self._gap_reset:
+                    self._buf.clear()  # discontinuity — never window across a stall
+                last_t = sample_t
                 self._buf.append([acc[0], acc[1], acc[2], gyr[0], gyr[1], gyr[2]])
                 self._input_buf.append(
-                    {"t": time.monotonic(), "acc": list(acc[:3]), "gyr": list(gyr[:3])}
+                    {"t": sample_t, "acc": [float(v) for v in acc], "gyr": [float(v) for v in gyr]}
                 )
                 self._since_pred += 1
                 if self._since_pred >= self._stride and len(self._buf) >= self._window:

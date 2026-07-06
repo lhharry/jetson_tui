@@ -129,6 +129,46 @@ registers are **volatile** (lost on power cycle); the chosen mapping is saved to
 > That was deliberately *not* chosen here because of the thigh-mount magnetic environment; it
 > is a one-line change in `imu_service.py` (`FUSION_MODE`) if ever needed.
 
+## Real-time activity classification (CLS)
+
+An optional page runs a vendored LIMU-BERT + GRU classifier on the live IMU stream (7
+classes: stand / walk / turn / jog / rampascent / stairascent / stairdescent). It samples
+one IMU, **block-averages** the 100 Hz stream down to 10 Hz (matching the training
+`down_sample`, not plain decimation), keeps a 20-sample (2 s) sliding window, and emits a
+prediction every ~1 s. It self-disables if `torch` or the checkpoint is missing.
+
+Enable it in `config/default.toml`:
+
+```toml
+[cls]
+enabled = true
+model_path = "src/jetson_imu_tui/cls/model/<checkpoint>.pt"  # a BERT-finetune jetson_leg .pt
+sensor = "Left"           # which IMU to classify (leg source is robust to both mounts)
+target_hz = 10            # must match the training sampling rate
+window = 20               # 2 s @ 10 Hz
+stride = 10               # a new prediction every ~1 s
+```
+
+> **Checkpoint.** Use the winning finetune-high-lr jetson_leg checkpoint from
+> LIMU-BERT-Public (`bench_run45`, `finetune-high-lr__lr0.3__seed42.pt`). Copy the `.pt`
+> into `src/jetson_imu_tui/cls/model/` and point `model_path` at it.
+
+**Training↔deployment contract — verify on the device or accuracy silently degrades:**
+
+1. **Gyro units.** The model was trained on rad/s. If this driver build reports deg/s
+   (readings ~57× too large), set `_GYRO_TO_RADS = math.pi/180` in `imu_service.py`.
+   Pin the `adafruit-circuitpython-bno055` version to the one used during data capture.
+2. **Axis remap.** The persisted `<log_dir>/axis_remap.json` mapping must match the
+   mapping used when the training data was collected (default P1 identity unless changed).
+3. **Tare / gravity.** CLS bypasses the tare and feeds **gravity-inclusive** accel (the
+   model needs it). Confirm the training data was captured with tare OFF too.
+4. **Model I/O.** Accel is normalized ÷9.8 (in `cls/preprocess.py`); the 7-class order in
+   `cls/model/__init__.py` matches `dataset/jetson_leg/label_map.json`. Don't reorder.
+
+Offline model-math parity is proven by `others/tools/parity_check_cls.py` (run from the
+LIMU-BERT-Public repo); the 100 Hz→10 Hz block-average is covered by
+`others/tests/test_cls_downsample.py`.
+
 ## Out of scope
 
 CAN bus, joint-angle math, ML gait phase, calibration UI.

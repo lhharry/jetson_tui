@@ -7,10 +7,12 @@ import time
 from datetime import datetime, timedelta
 from io import TextIOWrapper
 from pathlib import Path
+from typing import TYPE_CHECKING
 
 from loguru import logger
 
-from jetson_imu_tui.imu_service import ImuService
+if TYPE_CHECKING:  # ImuService pulls in the Linux-only hardware stack; only needed for hints.
+    from jetson_imu_tui.imu_service import ImuService
 
 
 def _hdr(labels: list[str], axes: tuple[str, ...]) -> str:
@@ -21,7 +23,7 @@ def _hdr(labels: list[str], axes: tuple[str, ...]) -> str:
 
 
 class Recorder:
-    def __init__(self, service: ImuService, log_dir: Path, hz: float, cls=None) -> None:
+    def __init__(self, service: "ImuService", log_dir: Path, hz: float, cls=None) -> None:
         self._service = service
         self._labels = service.labels
         self._hz = float(hz)

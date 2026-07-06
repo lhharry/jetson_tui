@@ -299,6 +299,25 @@ class ImuService:
             return None
         return {key: list(sig[key]) for key in ("euler", "accel", "gyro", "quat")}
 
+    def raw_samples_since(self, label: str, t: float, limit: int | None = None) -> list[dict]:
+        """Raw (tare-NOT-applied) ring-buffer samples ``{"t","euler","accel","gyro","quat"}``
+        for one sensor with ``sample["t"] > t``, oldest first. Copies so callers never mutate
+        buffer state shared with other consumers.
+
+        CLS block-averages the full 100 Hz batch since its last tick to match training's
+        anti-aliasing downsample, so it needs every raw sample — not just ``read_raw``'s
+        latest one. Requires the sampler to be running (returns [] otherwise, since without
+        the buffer there is nothing to average over)."""
+        if label not in self.sensors:
+            return []
+        buf = self._buffers.get(label)
+        if buf is None:
+            return []
+        return [
+            {"t": s["t"], **{key: list(s[key]) for key in ("euler", "accel", "gyro", "quat")}}
+            for s in buf.since(t, limit=limit)
+        ]
+
     def samples_since(self, t: float, limit: int = 300) -> list[dict]:
         """Payload-shaped samples newer than monotonic time ``t``, oldest first.
 
