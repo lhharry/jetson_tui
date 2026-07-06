@@ -7,7 +7,7 @@ log_dir = "./logs"
 sample_hz = 100           # sampler-thread rate per sensor (BNO055 fusion is fixed at 100 Hz)
 plot_fps = 15             # browser poll rate; each poll now fetches the full sample batch
 plot_window_seconds = 10  # rolling time window shown in the plots
-record_hz = 100           # CSV recording rate (capped at 100 — the fusion output rate)
+record_hz = 100           # buffer drain cadence; CSV data rate follows sample_hz (no dup/skip)
 web_host = "::"           # bind host: "::" = IPv6+IPv4 dual-stack; "0.0.0.0" = IPv4 only
 web_port = 8000           # server port
 

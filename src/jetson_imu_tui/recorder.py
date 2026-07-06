@@ -4,7 +4,7 @@ from __future__ import annotations
 
 import threading
 import time
-from datetime import datetime
+from datetime import datetime, timedelta
 from io import TextIOWrapper
 from pathlib import Path
 
@@ -21,10 +21,13 @@ def _hdr(labels: list[str], axes: tuple[str, ...]) -> str:
 
 
 class Recorder:
-    def __init__(self, service: ImuService, log_dir: Path, hz: float) -> None:
+    def __init__(self, service: ImuService, log_dir: Path, hz: float, cls=None) -> None:
         self._service = service
         self._labels = service.labels
         self._hz = float(hz)
+        # Optional ClsService: when enabled, the held activity prediction is written to
+        # cls.csv in lockstep with the IMU rows (one row per drained sample, 100 Hz).
+        self._cls = cls
         now = datetime.now()
         self.folder: Path = (
             Path(log_dir).expanduser()
@@ -34,6 +37,7 @@ class Recorder:
         self._stop = threading.Event()
         self._thread: threading.Thread | None = None
         self._files: dict[str, TextIOWrapper] = {}
+        self._cls_file: TextIOWrapper | None = None
 
     def __enter__(self) -> "Recorder":
         self.folder.mkdir(parents=True, exist_ok=True)
@@ -48,6 +52,17 @@ class Recorder:
             fh.write(_hdr(self._labels, axes))
             self._files[fname] = fh
         self._layout = layout
+        # cls.csv: Time, cls, conf, <one column per class prob>. Only when CLS is active.
+        if self._cls is not None and self._cls.enabled:
+            fh = open(self.folder / "cls.csv", "w", encoding="utf-8", newline="")
+            fh.write(",".join(["Time", "cls", "conf", *self._cls.classes]) + "\n")
+            self._cls_file = fh
+        # Drain cursor + a monotonic->wall-clock reference. The ring buffer only stores
+        # monotonic timestamps, so batched samples get their own wall-clock time from this
+        # reference rather than all sharing datetime.now() at write time.
+        self._t0_mono = time.monotonic()
+        self._t0_wall = datetime.now()
+        self._cursor = self._t0_mono
         self._thread = threading.Thread(target=self._loop, daemon=True)
         self._thread.start()
         return self
@@ -62,6 +77,12 @@ class Recorder:
             except Exception:
                 pass
         self._files.clear()
+        if self._cls_file is not None:
+            try:
+                self._cls_file.close()
+            except Exception:
+                pass
+            self._cls_file = None
 
     def _loop(self) -> None:
         period = 1.0 / self._hz
@@ -69,8 +90,7 @@ class Recorder:
         stat_start = next_tick
         rows = overruns = 0
         while not self._stop.is_set():
-            self._write_row()
-            rows += 1
+            rows += self._drain()
             now = time.monotonic()
             if now - stat_start >= 5.0:
                 logger.info(
@@ -88,27 +108,47 @@ class Recorder:
                 overruns += 1
                 next_tick = time.monotonic()
 
-    def _write_row(self) -> None:
-        sigs = self._service.signals()
-        ts = datetime.now().strftime("%H:%M:%S.%f")
-        rows: dict[str, list[str]] = {fname: [ts] for fname in self._layout}
-        for label in self._labels:
-            sig = sigs.get(label)
-            quat_vals: list[str] = ["", "", "", ""]
-            accel_vals: list[str] = ["", "", ""]
-            gyro_vals: list[str] = ["", "", ""]
-            euler_vals: list[str] = ["", "", ""]
-            if sig is not None:
-                quat_vals = [f"{v:.6f}" for v in sig["quat"]]
-                accel_vals = [f"{v:.6f}" for v in sig["accel"]]
-                gyro_vals = [f"{v:.6f}" for v in sig["gyro"]]
-                euler_vals = [f"{v:.6f}" for v in sig["euler"]]
-            rows["quaternions.csv"].extend(quat_vals)
-            rows["accelerometers.csv"].extend(accel_vals)
-            rows["gyroscopes.csv"].extend(gyro_vals)
-            rows["euler_angles.csv"].extend(euler_vals)
-        for fname, cells in rows.items():
-            fh = self._files.get(fname)
-            if fh is None:
-                continue
-            fh.write(",".join(cells) + "\n")
+    def _drain(self) -> int:
+        """Write every buffered sample newer than the cursor — the exact aligned samples the
+        plot draws — then advance the cursor past them. Returns the number of rows written.
+
+        Reuses ``ImuService.samples_since`` (the plot's data source), so CSV row == plot point
+        == sampler sample by construction: no duplicated or dropped rows. ``limit=None`` means a
+        late tick never drops data; the cursor advancing past written samples means no dup."""
+        samples = self._service.samples_since(self._cursor, limit=None)
+        if not samples:
+            return 0
+        # Snapshot the held CLS prediction once per drain: it can't change mid-drain, so every
+        # sample in this batch shares it — the step-hold between the sparse ~1 s inferences.
+        cls_cells = self._cls_row_cells() if self._cls_file is not None else None
+        for sample in samples:
+            ts = (self._t0_wall + timedelta(seconds=sample["t"] - self._t0_mono)).strftime(
+                "%H:%M:%S.%f"
+            )
+            for fname, (signal, axes) in self._layout.items():
+                cells = [ts]
+                for label in self._labels:
+                    vals = sample[signal].get(label)
+                    if vals is None:
+                        cells.extend("" for _ in axes)
+                    else:
+                        cells.extend(f"{v:.6f}" for v in vals)
+                fh = self._files.get(fname)
+                if fh is not None:
+                    fh.write(",".join(cells) + "\n")
+            if self._cls_file is not None:
+                self._cls_file.write(",".join([ts, *cls_cells]) + "\n")
+        self._cursor = samples[-1]["t"]
+        return len(samples)
+
+    def _cls_row_cells(self) -> list[str]:
+        """cls/conf/probs cells for one cls.csv row, or empty cells before the first
+        prediction. The number of prob columns always matches the header."""
+        n_probs = len(self._cls.classes)
+        pred = self._cls.current()
+        if pred is None:
+            return ["", ""] + ["" for _ in range(n_probs)]
+        probs = pred.get("probs") or []
+        prob_cells = [f"{p:.6f}" for p in probs]
+        prob_cells += ["" for _ in range(n_probs - len(prob_cells))]
+        return [str(pred.get("cls", "")), f"{pred.get('conf', 0.0):.6f}", *prob_cells[:n_probs]]

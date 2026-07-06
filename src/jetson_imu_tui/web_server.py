@@ -70,7 +70,9 @@ class ServerState:
     def toggle_record(self) -> bool:
         with self._lock:
             if self.recorder is None:
-                self.recorder = Recorder(self.service, self.log_dir, self.record_hz).__enter__()
+                self.recorder = Recorder(
+                    self.service, self.log_dir, self.record_hz, cls=self.cls
+                ).__enter__()
                 return True
             try:
                 self.recorder.__exit__(None, None, None)
@@ -91,7 +93,9 @@ class ServerState:
                     self.recorder.__exit__(None, None, None)
                 except Exception:
                     pass
-                self.recorder = Recorder(self.service, self.log_dir, self.record_hz).__enter__()
+                self.recorder = Recorder(
+                    self.service, self.log_dir, self.record_hz, cls=self.cls
+                ).__enter__()
         return self.record_hz
 
     @property

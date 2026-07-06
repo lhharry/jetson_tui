@@ -20,6 +20,7 @@ from pathlib import Path
 import numpy as np
 from loguru import logger
 
+from jetson_imu_tui.cls.model import CLASSES
 from jetson_imu_tui.imu_service import ImuService
 
 
@@ -106,7 +107,7 @@ class ClsService:
     def _infer(self) -> None:
         window = np.asarray(self._buf, dtype=np.float32)  # (window, 6)
         try:
-            cls_name, conf, _probs = self._clf.predict(window)
+            cls_name, conf, probs = self._clf.predict(window)
         except Exception as err:  # pragma: no cover - runtime safety
             logger.warning(f"CLS inference error: {err}")
             return
@@ -116,11 +117,29 @@ class ClsService:
             "clock": datetime.now().strftime("%H:%M:%S"),
             "cls": cls_name,
             "conf": conf,
+            "probs": [float(p) for p in probs],
         }
         with self._log_lock:
             self._next_id += 1
             self._log.append(entry)
             self._current = entry
+
+    # --- accessors ---------------------------------------------------------
+    @property
+    def enabled(self) -> bool:
+        return self._enabled
+
+    @property
+    def classes(self) -> list[str]:
+        """Label order the model emits probabilities in (matches ``predict`` / CLASSES)."""
+        return list(CLASSES)
+
+    def current(self) -> dict | None:
+        """Thread-safe copy of the latest prediction (``cls``/``conf``/``probs``), or None.
+
+        The recorder polls this per drain to persist the held prediction at 100 Hz."""
+        with self._log_lock:
+            return dict(self._current) if self._current else None
 
     # --- web accessor ------------------------------------------------------
     def snapshot(self, since: int = 0) -> dict:

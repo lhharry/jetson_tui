@@ -214,10 +214,10 @@ class ImuService:
                 durations.sort()
                 p50 = durations[len(durations) // 2] * 1e3
                 p95 = durations[int(len(durations) * 0.95)] * 1e3
-                logger.info(
-                    f"sampler[{label}]: {samples / (now - stat_start):.1f} Hz (target {hz:.0f}) · "
-                    f"read p50={p50:.1f}ms p95={p95:.1f}ms · overruns={overruns} bad_reads={bad_reads}"
-                )
+                # logger.info(
+                #     f"sampler[{label}]: {samples / (now - stat_start):.1f} Hz (target {hz:.0f}) · "
+                #     f"read p50={p50:.1f}ms p95={p95:.1f}ms · overruns={overruns} bad_reads={bad_reads}"
+                # )
                 stat_start = now
                 samples = overruns = bad_reads = 0
                 durations.clear()
