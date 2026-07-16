@@ -11,6 +11,10 @@ classifier, appending a timestamped result to a capped log the web layer polls v
 ``GET /cls``. A time gap between consecutive averaged vectors (sensor stall / reconnect)
 clears the window so inference never runs across a discontinuity.
 
+The web UI can ``pause()``/``resume()`` the service at runtime (``POST /cls/toggle``):
+while paused the loop idles without pulling samples or running the model, so inference
+stops competing with the sampler threads; the checkpoint stays loaded for instant resume.
+
 Fails safe: if ``torch`` or the checkpoint is missing, the service stays ``enabled=False``
 and never touches the sensor, so the rest of the TUI is unaffected.
 """
@@ -60,6 +64,11 @@ class ClsService:
         self._enabled = False
         self._reason = "not started"
 
+        # Runtime switch (web UI): while paused the loop idles — no raw-sample pulls, no
+        # inference — so CLS stops competing with the sampler threads for CPU.
+        self._paused = False
+        self._cursor_reset = threading.Event()  # tells the loop to skip the paused backlog
+
         self._buf: deque[list[float]] = deque(maxlen=self._window)
         # Every 6-channel vector fed to the model, timestamped (monotonic). The recorder
         # drains this into model_input.csv so a recording captures the exact model input.
@@ -106,7 +115,16 @@ class ClsService:
         cursor = time.monotonic()  # only consume raw samples newer than this
         last_t: float | None = None  # monotonic time of the last accepted averaged vector
         while not self._stop.is_set():
-            batch = self._service.raw_samples_since(self._sensor, cursor)
+            if self._cursor_reset.is_set():
+                self._cursor_reset.clear()
+                cursor = time.monotonic()
+                last_t = None
+                self._buf.clear()  # a tick racing pause() may have appended one vector
+                self._since_pred = 0
+            if self._paused:
+                batch = []
+            else:
+                batch = self._service.raw_samples_since(self._sensor, cursor)
             if batch:
                 cursor = batch[-1]["t"]
                 # Block-average the batch → one 10 Hz vector (matches down_sample).
@@ -152,6 +170,33 @@ class ClsService:
             self._log.append(entry)
             self._current = entry
 
+    # --- runtime switch ------------------------------------------------------
+    def pause(self) -> None:
+        """Suspend sampling + inference (model stays loaded). Idempotent."""
+        with self._log_lock:
+            self._paused = True
+            self._current = None  # don't show / record a stale prediction
+        self._buf.clear()
+        self._since_pred = 0
+
+    def resume(self) -> None:
+        """Resume sampling + inference, skipping everything buffered while paused."""
+        self._cursor_reset.set()
+        with self._log_lock:
+            self._paused = False
+
+    def toggle_running(self) -> bool:
+        """Flip paused/running; returns True if now running."""
+        if self._paused:
+            self.resume()
+        else:
+            self.pause()
+        return not self._paused
+
+    @property
+    def running(self) -> bool:
+        return self._enabled and not self._paused
+
     # --- accessors ---------------------------------------------------------
     @property
     def enabled(self) -> bool:
@@ -184,4 +229,11 @@ class ClsService:
         with self._log_lock:
             entries = [e for e in self._log if e["id"] > since]
             current = dict(self._current) if self._current else None
-        return {"enabled": True, "sensor": self._sensor, "current": current, "entries": entries}
+            running = not self._paused
+        return {
+            "enabled": True,
+            "running": running,
+            "sensor": self._sensor,
+            "current": current,
+            "entries": entries,
+        }

@@ -184,6 +184,12 @@ def create_app(state: ServerState, window_s: float, poll_ms: int) -> Flask:
             since = 0
         return jsonify(state.cls.snapshot(since))
 
+    @app.route("/cls/toggle", methods=["POST"])
+    def cls_toggle() -> Response:
+        if state.cls is None or not state.cls.enabled:
+            return jsonify({"running": False, "reason": "not configured"})
+        return jsonify({"running": state.cls.toggle_running()})
+
     @app.route("/axis-remap", methods=["GET"])
     def axis_remap_get() -> Response:
         return jsonify(state.service.get_axis_remap())
@@ -360,6 +366,7 @@ _HTML = """<!DOCTYPE html>
   .calready{font-size:12px;font-weight:700;margin-left:8px}
   /* ---- CLS page ---- */
   #clsview{display:none;flex:1;min-height:0;flex-direction:column;padding:12px;gap:10px}
+  .clstools{display:flex;justify-content:flex-end}
   .clsbanner{display:flex;align-items:center;justify-content:center;gap:18px;min-height:96px;
              background:var(--panel);border:1px solid var(--border);border-radius:12px}
   .clsbanner.on{border-color:var(--accent)}
@@ -411,6 +418,10 @@ _HTML = """<!DOCTYPE html>
     <div id="charts"></div>
     <div id="readout"></div>
     <div id="clsview">
+      <div class="clstools">
+        <button id="clsRunBtn" class="btn" onclick="toggleCls()" style="display:none"
+                title="Stop/start online inference (pausing frees CPU for sampling)">Stop</button>
+      </div>
       <div id="clsBanner" class="clsbanner"><span class="muted">connecting…</span></div>
       <div class="clshead">
         <span class="clshcol">time</span><span class="clshcol grow">activity</span><span class="clshcol">conf</span>
@@ -497,7 +508,9 @@ let clsMode = false;              // CLS page active (a pseudo-signal, not a plo
 let clsSince = 0;                 // highest CLS entry id already shown
 let clsTimer = null;
 const CLS_COLORS = { stand:'#9aa4b2', walk:'#22c55e', turn:'#eab308', jog:'#ef4444',
-                     rampascent:'#3b82f6', stairascent:'#a855f7', stairdescent:'#ec4899' };
+                     rampascent:'#3b82f6', stairascent:'#a855f7', stairdescent:'#ec4899',
+                     sit:'#14b8a6', 'sit-to-stand':'#f97316', 'stand-to-sit':'#8b5cf6',
+                     rampdescent:'#06b6d4' };
 const clsColor = c => CLS_COLORS[c] || '#60a5fa';
 
 const fmt = (sig, v) => v == null ? '--' : v.toFixed(sig === 'quat' ? 3 : 2);
@@ -610,6 +623,7 @@ function togglePause(){
 }
 async function toggleRecord(){ try { await fetch('/record', {method:'POST'}); } catch(e) {} }
 async function toggleZero(){ try { await fetch('/zero', {method:'POST'}); } catch(e) {} }
+async function toggleCls(){ try { await fetch('/cls/toggle', {method:'POST'}); pollCls(); } catch(e) {} }
 
 function toggleView(){
   if(clsMode) return;   // CLS is its own page; Numbers/Plots toggle doesn't apply
@@ -851,12 +865,21 @@ async function pollCls(){
   let d;
   try { d = await (await fetch('/cls?since=' + clsSince)).json(); } catch(e) { return; }
   const banner = document.getElementById('clsBanner');
+  const runBtn = document.getElementById('clsRunBtn');
   if(!d.enabled){
     banner.className = 'clsbanner';
     banner.innerHTML = '<span class="muted">CLS disabled — ' + (d.reason || 'model not loaded') + '</span>';
+    runBtn.style.display = 'none';
     return;
   }
-  if(d.current){
+  const running = d.running !== false;
+  runBtn.style.display = '';
+  runBtn.textContent = running ? 'Stop' : 'Start';
+  runBtn.classList.toggle('rec-on', running);
+  if(!running){
+    banner.className = 'clsbanner';
+    banner.innerHTML = '<span class="muted">inference stopped — press Start to resume</span>';
+  } else if(d.current){
     banner.className = 'clsbanner on';
     banner.innerHTML = '<span class="clscls" style="color:' + clsColor(d.current.cls) + '">'
         + d.current.cls + '</span><span class="clsconf">' + (d.current.conf * 100).toFixed(0) + '%</span>';
