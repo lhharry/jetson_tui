@@ -12,6 +12,8 @@ the next one). No websocket, no async; rendering happens in the browser on the l
 from __future__ import annotations
 
 import logging
+import os
+import signal
 import socket
 import sys
 import threading
@@ -51,6 +53,74 @@ def get_local_ip6() -> str | None:
         return None
     finally:
         sock.close()
+
+
+def _pids_listening_on(port: int) -> list[int]:
+    """PIDs holding a LISTEN socket on TCP ``port``, found via ``/proc`` (Linux only, no
+    external tools). Returns [] on non-Linux, or when nothing is found / not permitted."""
+    if not Path("/proc/net/tcp").exists():
+        return []  # not Linux (e.g. the Windows dev box) — nothing to reclaim
+    want = f"{port:04X}"  # /proc encodes the local port as uppercase hex
+    inodes: set[str] = set()
+    for name in ("/proc/net/tcp", "/proc/net/tcp6"):
+        try:
+            lines = Path(name).read_text().splitlines()[1:]  # drop the header row
+        except OSError:
+            continue
+        for line in lines:
+            parts = line.split()
+            # cols: sl local_address rem_address st ... inode; st 0A == TCP_LISTEN
+            if len(parts) < 10 or parts[3] != "0A":
+                continue
+            if parts[1].rsplit(":", 1)[-1].upper() == want:  # "IPHEX:PORTHEX" -> PORTHEX
+                inodes.add(parts[9])
+    if not inodes:
+        return []
+    pids: set[int] = set()
+    for pid_dir in Path("/proc").iterdir():
+        if not pid_dir.name.isdigit():
+            continue
+        try:
+            fds = list((pid_dir / "fd").iterdir())
+        except OSError:
+            continue  # process vanished, or another user's fds we cannot read
+        for fd in fds:
+            try:
+                target = os.readlink(fd)
+            except OSError:
+                continue
+            if target.startswith("socket:[") and target[8:-1] in inodes:
+                pids.add(int(pid_dir.name))
+                break
+    return sorted(pids)
+
+
+def _free_port(host: str, port: int, *, timeout: float = 5.0) -> None:
+    """Reclaim ``port`` if a process is already listening on it, so ``make_server`` can bind.
+
+    A stale instance of this server also holds the I2C buses and CUDA, so callers free the
+    port *before* connecting hardware. SIGINT first (the server catches KeyboardInterrupt and
+    shuts down gracefully), escalating to SIGKILL if it does not release within ``timeout``."""
+    pids = _pids_listening_on(port)
+    if not pids:
+        return
+    print(f"Port {port} in use by PID {', '.join(map(str, pids))} — terminating to reclaim it")
+    for pid in pids:
+        try:
+            os.kill(pid, signal.SIGINT)
+        except OSError:
+            pass
+    deadline = time.monotonic() + timeout
+    while time.monotonic() < deadline:
+        if not _pids_listening_on(port):
+            return
+        time.sleep(0.1)
+    for pid in _pids_listening_on(port):  # graceful stop timed out — force it
+        try:
+            os.kill(pid, signal.SIGKILL)
+        except OSError:
+            pass
+    time.sleep(0.2)
 
 
 class ServerState:
@@ -231,6 +301,10 @@ def run_server(cfg: AppConfig, host: str | None = None, port: int | None = None)
     logger.remove()
     logger.add(sys.stderr, level="INFO", format="{time:HH:mm:ss} | {level:<7} | {message}")
     logging.getLogger("werkzeug").setLevel(logging.ERROR)
+
+    # Reclaim the port before touching hardware: a stale server instance would still hold
+    # this port *and* the I2C buses + CUDA, so killing it first lets us grab everything cleanly.
+    _free_port(host, port)
 
     service = ImuService(cfg.bus_labels, state_path=Path(cfg.log_dir) / "axis_remap.json")
     print("Connecting to IMUs...")
