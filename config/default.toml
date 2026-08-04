@@ -17,4 +17,4 @@ model_path = "src/jetson_imu_tui/cls/model/model.pt"           # BERT-finetune j
 sensor = "Left"           # which IMU label to classify (single-IMU model)
 target_hz = 10            # sampling rate feeding the model (matches training 10 Hz)
 window = 20               # samples per inference window (2 s @ 10 Hz)
-stride = 10               # emit a new prediction every N samples (10 = every 1 s, sliding)
+stride = 1                # emit a new prediction every N samples (1 = every 100 ms, sliding)

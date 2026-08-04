@@ -47,7 +47,7 @@ class ClsService:
         sensor: str = "Left",
         target_hz: float = 10.0,
         window: int = 20,
-        stride: int = 10,
+        stride: int = 1,
         log_size: int = 500,
     ) -> None:
         self._service = service

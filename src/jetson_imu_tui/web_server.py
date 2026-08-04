@@ -926,7 +926,7 @@ function enterCls(){
   document.getElementById('charts').style.display = 'none';
   document.getElementById('readout').style.display = 'none';
   document.getElementById('clsview').style.display = 'flex';
-  if(!clsTimer){ pollCls(); clsTimer = setInterval(pollCls, 1000); }
+  if(!clsTimer){ pollCls(); clsTimer = setInterval(pollCls, 100); }
 }
 function exitCls(){
   clsMode = false;

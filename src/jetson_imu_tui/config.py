@@ -28,7 +28,7 @@ class AppConfig:
     cls_sensor: str = "Left"
     cls_target_hz: float = 10.0
     cls_window: int = 20
-    cls_stride: int = 10
+    cls_stride: int = 1
 
     @property
     def labels(self) -> list[str]:
@@ -57,5 +57,5 @@ def load_config(path: Path | None = None) -> AppConfig:
         cls_sensor=str(cls.get("sensor", "Left")),
         cls_target_hz=float(cls.get("target_hz", 10.0)),
         cls_window=int(cls.get("window", 20)),
-        cls_stride=int(cls.get("stride", 10)),
+        cls_stride=int(cls.get("stride", 1)),
     )

@@ -105,9 +105,9 @@ class Recorder:
             rows += self._drain()
             now = time.monotonic()
             if now - stat_start >= 5.0:
-                logger.info(
-                    f"recorder: {rows / (now - stat_start):.1f} Hz (target {self._hz:.0f}) · overruns={overruns}"
-                )
+                # logger.info(
+                #     f"recorder: {rows / (now - stat_start):.1f} Hz (target {self._hz:.0f}) · overruns={overruns}"
+                # )
                 stat_start = now
                 rows = overruns = 0
             next_tick += period
@@ -134,7 +134,7 @@ class Recorder:
         if not samples:
             return 0
         # Snapshot the held CLS prediction once per drain: it can't change mid-drain, so every
-        # sample in this batch shares it — the step-hold between the sparse ~1 s inferences.
+        # sample in this batch shares it — the step-hold between consecutive inferences.
         cls_cells = self._cls_row_cells() if self._cls_file is not None else None
         for sample in samples:
             ts = (self._t0_wall + timedelta(seconds=sample["t"] - self._t0_mono)).strftime(

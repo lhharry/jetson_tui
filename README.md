@@ -146,7 +146,7 @@ model_path = "src/jetson_imu_tui/cls/model/<checkpoint>.pt"  # a BERT-finetune j
 sensor = "Left"           # which IMU to classify (leg source is robust to both mounts)
 target_hz = 10            # must match the training sampling rate
 window = 20               # 2 s @ 10 Hz
-stride = 10               # a new prediction every ~1 s
+stride = 1                # a new prediction every ~100 ms
 ```
 
 > **Checkpoint.** Use the winning finetune-high-lr jetson_leg checkpoint from
