@@ -31,7 +31,8 @@ workloads (e.g. an AI model) on the same board.
 ## Install
 
 ```bash
-pip install -e .   # flask + adafruit-circuitpython-bno055 + Adafruit-Blinka + adafruit-extended-bus
+pip install -e .            # flask + adafruit-circuitpython-bno055 + Adafruit-Blinka + adafruit-extended-bus
+pip install -e ".[serial]"  # add pyserial if the IMU arrives over serial (see below)
 ```
 
 Make sure the user is in the `i2c` group and both buses are exposed:
@@ -100,6 +101,40 @@ web_port = 8000
 The bus→label table is the single source of truth — change it here to swap
 Left/Right assignment or rename the IMUs.
 
+## Serial source (Arduino / Simulink instead of I2C)
+
+The same app can run off **one IMU streaming binary frames over a serial port** — an Arduino (or
+a Simulink model) reading the BNO055 and forwarding it — instead of the Jetson reading the chips
+over I2C. Plots, recording and CLS all work; the source is chosen in the config:
+
+```toml
+[source]
+kind = "serial"           # "i2c" (default) | "serial"
+port = "/dev/ttyACM0"     # "COM5" on Windows
+baud = 115200
+label = "Left"            # label the IMU appears under; must match [cls] sensor
+magic = ""                # frame header in hex (e.g. "5aa5"); empty = align on the timestamp
+gyro_units = "deg"        # units the device sends; "deg" is scaled to rad/s, "rad" passes through
+```
+
+**Wire format** (`read_serial.py`): 7 little-endian float32 per frame — `ax ay az gx gy gz t`,
+28 bytes, accel in m/s² **including gravity**, `t` in seconds. A frame header is optional: with
+none, byte alignment is recovered from the timestamp increasing monotonically, and a stream that
+loses bytes re-aligns by itself. `sample_hz` in `[defaults]` must equal the rate the device sends
+(it drives the CLS decimation).
+
+**Gyro units are the trap.** BNO055 firmware commonly reports **deg/s** (values quantized to
+1/16, peaking in the hundreds) while the classifier was trained on rad/s — leaving `gyro_units`
+wrong feeds the model input ~57× too large and predictions become meaningless without any error.
+Verify on the device: hold it still (gyro ≈ 0, |accel| ≈ 9.8), then rotate ~90° in one second and
+watch `/data` — the peak should read ≈ 1.5, not ≈ 90.
+
+**Not available over serial**, because the stream carries only accelerometer and gyroscope:
+Euler and Quaternion plots, the 3D cube, `euler_angles.csv` / `quaternions.csv` (written with
+empty cells), and the calibration popup. The axis remap is *reported* but not writable — that
+mapping is configured on the transmitting device, and it must match the one used to collect the
+training data (see the contract below).
+
 ## Orientation fusion & calibration
 
 The BNO055 runs in **IMUPLUS** mode: the chip fuses **accelerometer + gyroscope** on-board to
@@ -144,7 +179,7 @@ Enable it in `config/default.toml`:
 enabled = true
 model_path = "src/jetson_imu_tui/cls/model/<checkpoint>.pt"  # a BERT-finetune jetson_leg .pt
 sensor = "Left"           # which IMU to classify (leg source is robust to both mounts)
-target_hz = 10            # must match the training sampling rate
+target_hz = 10            # must match the training sampling rate; sample_hz must be an integer multiple, or CLS self-disables
 window = 20               # 2 s @ 10 Hz
 stride = 1                # a new prediction every ~100 ms
 ```
@@ -158,6 +193,7 @@ stride = 1                # a new prediction every ~100 ms
 1. **Gyro units.** The model was trained on rad/s. If this driver build reports deg/s
    (readings ~57× too large), set `_GYRO_TO_RADS = math.pi/180` in `imu_service.py`.
    Pin the `adafruit-circuitpython-bno055` version to the one used during data capture.
+   On the serial source the equivalent knob is `[source] gyro_units`.
 2. **Axis remap.** The persisted `<log_dir>/axis_remap.json` mapping must match the
    mapping used when the training data was collected (default P1 identity unless changed).
 3. **Tare / gravity.** CLS bypasses the tare and feeds **gravity-inclusive** accel (the
@@ -167,7 +203,11 @@ stride = 1                # a new prediction every ~100 ms
 
 Offline model-math parity is proven by `others/tools/parity_check_cls.py` (run from the
 LIMU-BERT-Public repo); the 100 Hz→10 Hz block-average is covered by
-`others/tests/test_cls_downsample.py`.
+`others/tests/test_cls_downsample.py`, and serial decoding + unit conversion by
+`others/tests/test_read_serial.py`.
+
+> The checkpoint's output width must match `CLASSES` in `cls/model/__init__.py`. A 7-class `.pt`
+> against the 11-label list fails to load and CLS self-disables with a `size mismatch` warning.
 
 ## Out of scope
 

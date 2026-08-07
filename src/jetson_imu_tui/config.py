@@ -22,6 +22,14 @@ class AppConfig:
     record_hz: int = 100
     web_host: str = "::"
     web_port: int = 8000
+    # Sample source: the two I2C BNO055s, or one IMU streaming binary frames over serial.
+    # ``sample_hz`` is the wire rate in both cases (it drives the CLS decimation).
+    source_kind: str = "i2c"
+    serial_port: str = "/dev/ttyACM0"
+    serial_baud: int = 115200
+    serial_label: str = "Left"
+    serial_magic: str = ""
+    serial_gyro_units: str = "deg"
     # Real-time activity classification (CLS page). Disabled unless a checkpoint is present.
     cls_enabled: bool = True
     cls_model_path: str = ""
@@ -43,6 +51,7 @@ def load_config(path: Path | None = None) -> AppConfig:
     bus_labels = {int(k): str(v) for k, v in buses_raw.items()}
     defaults = raw.get("defaults", {})
     cls = raw.get("cls", {})
+    source = raw.get("source", {})
     return AppConfig(
         bus_labels=bus_labels or {1: "Left", 7: "Right"},
         log_dir=Path(defaults.get("log_dir", "./logs")).expanduser(),
@@ -52,6 +61,12 @@ def load_config(path: Path | None = None) -> AppConfig:
         record_hz=int(defaults.get("record_hz", 100)),
         web_host=str(defaults.get("web_host", "::")),
         web_port=int(defaults.get("web_port", 8000)),
+        source_kind=str(source.get("kind", "i2c")).lower(),
+        serial_port=str(source.get("port", "/dev/ttyACM0")),
+        serial_baud=int(source.get("baud", 115200)),
+        serial_label=str(source.get("label", "Left")),
+        serial_magic=str(source.get("magic", "")),
+        serial_gyro_units=str(source.get("gyro_units", "deg")).lower(),
         cls_enabled=bool(cls.get("enabled", True)),
         cls_model_path=str(cls.get("model_path", "")),
         cls_sensor=str(cls.get("sensor", "Left")),

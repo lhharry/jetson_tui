@@ -16,7 +16,6 @@ from __future__ import annotations
 import json
 import threading
 import time
-from dataclasses import dataclass
 from pathlib import Path
 
 from loguru import logger
@@ -24,7 +23,21 @@ from loguru import logger
 import adafruit_bno055
 from adafruit_extended_bus import ExtendedI2C
 
+from jetson_imu_tui.imu_common import (
+    DEFAULT_CONFIG,
+    DEFAULT_SIGN,
+    PLACEMENTS,
+    ImuInfo,
+    apply_offset,
+    decode_axis_remap,
+    is_valid_config,
+    placement_for,
+)
 from jetson_imu_tui.ring_buffer import RingBuffer
+
+# Re-exported so ``from jetson_imu_tui.imu_service import PLACEMENTS, ImuInfo`` keeps working;
+# the definitions live in imu_common because the serial source needs them without Blinka.
+__all__ = ["PLACEMENTS", "ImuInfo", "ImuService"]
 
 # --- BNO055 specifics ------------------------------------------------------
 BNO055_ADDRESS = 0x28  # both buses use the default address
@@ -41,54 +54,6 @@ CONFIG_MODE = adafruit_bno055.CONFIG_MODE
 # known rate; if values are ~57x too large the lib is returning deg/s, so set this to
 # math.pi / 180. Leave at 1.0 if the lib already returns rad/s.
 _GYRO_TO_RADS = 1.0
-
-# Default mapping = P1 (identity: X->X, Y->Y, Z->Z, all positive).
-DEFAULT_CONFIG = 0x24
-DEFAULT_SIGN = 0x00
-
-# Datasheet §3.4 (p.27) mounting placements: name -> (config_byte, sign_byte).
-PLACEMENTS: dict[str, tuple[int, int]] = {
-    "P0": (0x21, 0x04),
-    "P1": (0x24, 0x00),
-    "P2": (0x24, 0x06),
-    "P3": (0x21, 0x02),
-    "P4": (0x24, 0x03),
-    "P5": (0x21, 0x01),
-    "P6": (0x21, 0x07),
-    "P7": (0x24, 0x05),
-}
-
-_AXIS_LETTERS = {0: "X", 1: "Y", 2: "Z", 3: "INVALID"}
-
-
-def _is_valid_config(config: int) -> bool:
-    """Each output axis must map to a *distinct* source axis (no duplicates / no 0b11)."""
-    fields = [config & 0b11, (config >> 2) & 0b11, (config >> 4) & 0b11]
-    return sorted(fields) == [0, 1, 2]
-
-
-def _decode_axis_remap(config: int, sign: int) -> dict:
-    """Human-readable mapping for the three outputs: which source axis + sign each takes."""
-    srcs = {"x": config & 0b11, "y": (config >> 2) & 0b11, "z": (config >> 4) & 0b11}
-    signs = {"x": (sign >> 2) & 0b1, "y": (sign >> 1) & 0b1, "z": sign & 0b1}
-    return {
-        out: {"axis": _AXIS_LETTERS.get(srcs[out], "INVALID"), "sign": "-" if signs[out] else "+"}
-        for out in ("x", "y", "z")
-    }
-
-
-def _placement_for(config: int, sign: int) -> str | None:
-    for name, (cc, ss) in PLACEMENTS.items():
-        if cc == config and ss == sign:
-            return name
-    return None
-
-
-@dataclass
-class ImuInfo:
-    label: str
-    bus_id: int
-    sensor_name: str
 
 
 class ImuService:
@@ -266,25 +231,13 @@ class ImuService:
         sensor = self.sensors.get(label)
         return self._read(label, sensor) if sensor is not None else None
 
-    @staticmethod
-    def _with_offset(sig: dict | None, o: dict[str, list[float]] | None) -> dict | None:
-        """Copy of ``sig``'s four signal keys with the tare offset applied. Copies always —
-        buffer samples are shared with other consumers and must never be mutated."""
-        if sig is None:
-            return None
-        out: dict[str, list[float]] = {"quat": list(sig["quat"])}
-        for key in ("euler", "accel", "gyro"):
-            vals = sig[key]
-            out[key] = [v - ov for v, ov in zip(vals, o[key])] if o else list(vals)
-        return out
-
     def signals(self) -> dict[str, dict[str, list[float]] | None]:
         """Latest derived signals per label, with the zero offset applied when active."""
         off = self._offset
         out: dict[str, dict[str, list[float]] | None] = {}
         for label in self.sensors:
             sig = self._latest_raw(label)
-            out[label] = self._with_offset(sig, off.get(label) if off else None)
+            out[label] = apply_offset(sig, off.get(label) if off else None)
         return out
 
     def read_raw(self, label: str) -> dict[str, list[float]] | None:
@@ -348,7 +301,7 @@ class ImuService:
                 idx[lab] = i
                 per_label[lab] = arr[i] if arr else None
             for lab in labels:
-                sig = self._with_offset(per_label.get(lab), off.get(lab) if off else None)
+                sig = apply_offset(per_label.get(lab), off.get(lab) if off else None)
                 for key in ("euler", "accel", "gyro", "quat"):
                     row[key][lab] = sig[key] if sig is not None else None
             out.append(row)
@@ -410,23 +363,23 @@ class ImuService:
             "sign": s,
             "config_hex": f"0x{c:02X}",
             "sign_hex": f"0x{s:02X}",
-            "mapping": _decode_axis_remap(c, s),
-            "placement": _placement_for(c, s),
-            "valid": _is_valid_config(c),
+            "mapping": decode_axis_remap(c, s),
+            "placement": placement_for(c, s),
+            "valid": is_valid_config(c),
         }
 
     def set_axis_remap(self, config_byte: int, sign_byte: int, *, persist: bool = True) -> dict:
         config_byte &= 0xFF
         sign_byte &= 0xFF
         with self._axis_lock:
-            valid = _is_valid_config(config_byte)
+            valid = is_valid_config(config_byte)
             result: dict = {
                 "config": config_byte,
                 "sign": sign_byte,
                 "config_hex": f"0x{config_byte:02X}",
                 "sign_hex": f"0x{sign_byte:02X}",
-                "mapping": _decode_axis_remap(config_byte, sign_byte),
-                "placement": _placement_for(config_byte, sign_byte),
+                "mapping": decode_axis_remap(config_byte, sign_byte),
+                "placement": placement_for(config_byte, sign_byte),
                 "valid": valid,
                 "ok": False,
                 "hardware": False,

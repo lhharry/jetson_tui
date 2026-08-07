@@ -22,6 +22,8 @@ dependencies = [
 # Real-time CLS inference. On the Jetson, torch is installed from NVIDIA's wheels rather
 # than PyPI, so it is an optional extra, not a hard dependency. CLS self-disables if absent.
 cls = ["torch>=2"]
+# read_serial: BNO055 frames over a serial link (Simulink) instead of the I2C sensors.
+serial = ["pyserial>=3.5"]
 
 [project.scripts]
 jetson-imu-tui = "jetson_imu_tui.__main__:main"

@@ -1,6 +1,14 @@
-[buses]
+[buses]                   # only used when [source] kind = "i2c"
 1 = "Right"
 7 = "Left"
+
+[source]                  # where samples come from
+kind = "i2c"              # "i2c" = BNO055 over I2C (see [buses]) | "serial" = binary frames from an Arduino/Simulink
+port = "/dev/ttyACM0"     # serial only; on Windows something like "COM5"
+baud = 115200
+label = "Left"            # label the serial IMU appears under; must match [cls] sensor
+magic = ""                # optional frame header in hex (e.g. "5aa5"); empty = align on the timestamp
+gyro_units = "deg"        # units the device sends: "deg" is scaled to rad/s, "rad" passes through
 
 [defaults]
 log_dir = "./logs"
@@ -15,6 +23,6 @@ web_port = 8000           # server port
 enabled = true            # master switch; CLS also self-disables if torch/checkpoint missing
 model_path = "src/jetson_imu_tui/cls/model/model.pt"           # BERT-finetune jetson_leg .pt, 11-class label map ids 0..10 (see README → CLS and cls/model/__init__.py CLASSES)
 sensor = "Left"           # which IMU label to classify (single-IMU model)
-target_hz = 10            # sampling rate feeding the model (matches training 10 Hz)
+target_hz = 10            # sampling rate feeding the model (matches training 10 Hz); sample_hz must be an integer multiple, or CLS self-disables
 window = 20               # samples per inference window (2 s @ 10 Hz)
 stride = 1                # emit a new prediction every N samples (1 = every 100 ms, sliding)

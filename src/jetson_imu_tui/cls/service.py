@@ -1,22 +1,28 @@
-"""ClsService — background 10 Hz block-averaging sampler + sliding-window inference.
+"""ClsService — background block-averaging sampler + sliding-window inference.
 
-Every ~1/``target_hz`` s it pulls *all* raw (gravity-inclusive, tare-bypassed) 100 Hz
-samples that arrived since the last tick via ``ImuService.raw_samples_since`` and
-block-averages them into one 10 Hz vector. This mirrors training's anti-aliasing
-downsample (``dataset/jetson_leg.down_sample``): plain decimation (one instantaneous
-sample per tick) would alias >5 Hz energy and feed the model out-of-distribution input,
-hurting the dynamic classes (jog / stairs) most. It keeps a rolling window of the last
-``window`` averaged vectors and, every ``stride`` new vectors, runs the vendored BERT
-classifier, appending a timestamped result to a capped log the web layer polls via
-``GET /cls``. A time gap between consecutive averaged vectors (sensor stall / reconnect)
-clears the window so inference never runs across a discontinuity.
+Raw (gravity-inclusive, tare-bypassed) samples are pulled from ``raw_samples_since`` and
+block-averaged ``decim = sample_hz / target_hz`` at a time into one model-rate vector. That one
+method is the entire contract with the sensor source (``imu_common.SensorSource``), so either
+source works unchanged: ``ImuService`` over I2C or ``SerialImuService`` over a serial link.
+This mirrors training's anti-aliasing downsample (``dataset/jetson_leg.down_sample``): plain
+decimation (one instantaneous sample per tick) would alias >5 Hz energy and feed the model
+out-of-distribution input, hurting the dynamic classes (jog / stairs) most.
+
+Grouping is driven by *raw sample count*, not by tick timing: the CLS tick and the sampler
+thread drift independently, so a tick can deliver 9, 11 or (after a stall) ~20 samples. Only
+a full ``decim`` samples ever form a vector, so a late tick yields two correct vectors rather
+than one over-wide one. A raw-resolution gap check drops the whole window at a discontinuity
+so inference never runs across a stall.
 
 The web UI can ``pause()``/``resume()`` the service at runtime (``POST /cls/toggle``):
 while paused the loop idles without pulling samples or running the model, so inference
 stops competing with the sampler threads; the checkpoint stays loaded for instant resume.
+All buffer mutation happens on the loop thread (``pause``/``resume`` only signal via
+``_cursor_reset``), so the window can never be cleared mid-inference by a web request.
 
-Fails safe: if ``torch`` or the checkpoint is missing, the service stays ``enabled=False``
-and never touches the sensor, so the rest of the TUI is unaffected.
+Fails safe: if ``torch`` or the checkpoint is missing, or ``sample_hz`` is not an integer
+multiple of ``target_hz``, the service stays ``enabled=False`` and never touches the
+sensor, so the rest of the TUI is unaffected.
 """
 
 from __future__ import annotations
@@ -34,31 +40,41 @@ from loguru import logger
 from jetson_imu_tui.cls.model import CLASSES
 from jetson_imu_tui.ring_buffer import RingBuffer
 
-if TYPE_CHECKING:  # ImuService pulls in the Linux-only hardware stack; only needed for hints.
-    from jetson_imu_tui.imu_service import ImuService
+if TYPE_CHECKING:  # hint only — importing a concrete source here would drag in its deps.
+    from jetson_imu_tui.imu_common import SensorSource
+
+# Clear the rolling window if consecutive *raw* samples are further apart than this.
+# Count-based grouping already keeps every group at exactly ``decim`` samples, so this
+# guard only needs to catch true discontinuities (sensor stall / reconnect / resume —
+# hundreds of ms and up), not I2C jitter (tens of ms), which merely stretches a group
+# by a sample or two. 100 ms sits between the two regimes.
+MAX_RAW_GAP_S = 0.1
 
 
 class ClsService:
     def __init__(
         self,
-        service: "ImuService",
+        service: "SensorSource",
         model_path: Path | str,
         *,
         sensor: str = "Left",
+        sample_hz: float = 100.0,
         target_hz: float = 10.0,
         window: int = 20,
         stride: int = 1,
-        log_size: int = 500,
+        log_size: int = 3000,
     ) -> None:
         self._service = service
         self._model_path = Path(model_path)
         self._sensor = sensor
-        self._period = 1.0 / float(target_hz)
+        self._sample_hz = float(sample_hz)
+        self._target_hz = float(target_hz)
+        self._period = 1.0 / self._target_hz
         self._window = int(window)
         self._stride = int(stride)
-        # Clear the rolling window if consecutive averaged vectors are more than this far
-        # apart (a stalled/reconnecting sensor) so a window never spans a discontinuity.
-        self._gap_reset = 2.5 * self._period
+        # Raw samples per model-rate vector (100 Hz / 10 Hz = 10). ``start()`` refuses to run
+        # unless the ratio is an exact integer — the reshape in ``_infer`` relies on it.
+        self._decim = max(1, int(round(self._sample_hz / self._target_hz)))
 
         self._clf = None
         self._enabled = False
@@ -67,13 +83,18 @@ class ClsService:
         # Runtime switch (web UI): while paused the loop idles — no raw-sample pulls, no
         # inference — so CLS stops competing with the sampler threads for CPU.
         self._paused = False
-        self._cursor_reset = threading.Event()  # tells the loop to skip the paused backlog
+        self._cursor_reset = threading.Event()  # tells the loop to drop cursor + window
 
-        self._buf: deque[list[float]] = deque(maxlen=self._window)
+        # Rolling *raw* window: exactly window*decim samples, i.e. the span one inference
+        # needs. Kept un-averaged so every window is rebuilt on a clean grid and can never
+        # inherit a malformed group. Only ever touched by the loop thread.
+        self._raw: deque[list[float]] = deque(maxlen=self._window * self._decim)
+        self._group: list[list[float]] = []  # raw samples accumulating into the next vector
+        self._last_raw_t: float | None = None
+        self._groups_since_pred = 0
         # Every 6-channel vector fed to the model, timestamped (monotonic). The recorder
         # drains this into model_input.csv so a recording captures the exact model input.
         self._input_buf = RingBuffer()
-        self._since_pred = 0
         self._log: deque[dict] = deque(maxlen=int(log_size))
         self._current: dict | None = None
         self._next_id = 1
@@ -85,6 +106,13 @@ class ClsService:
     # --- lifecycle ---------------------------------------------------------
     def start(self) -> None:
         """Load the model and start the sampler thread. Self-disables on any failure."""
+        if abs(self._sample_hz / self._target_hz - self._decim) > 1e-9:
+            self._reason = (
+                f"sample_hz ({self._sample_hz:g}) must be an integer multiple of "
+                f"target_hz ({self._target_hz:g})"
+            )
+            logger.warning(f"CLS disabled — {self._reason}")
+            return
         if not self._model_path.exists():
             self._reason = f"checkpoint not found: {self._model_path}"
             logger.warning(f"CLS disabled — {self._reason}")
@@ -113,35 +141,15 @@ class ClsService:
     def _loop(self) -> None:
         next_tick = time.monotonic()
         cursor = time.monotonic()  # only consume raw samples newer than this
-        last_t: float | None = None  # monotonic time of the last accepted averaged vector
         while not self._stop.is_set():
             if self._cursor_reset.is_set():
                 self._cursor_reset.clear()
                 cursor = time.monotonic()
-                last_t = None
-                self._buf.clear()  # a tick racing pause() may have appended one vector
-                self._since_pred = 0
-            if self._paused:
-                batch = []
-            else:
-                batch = self._service.raw_samples_since(self._sensor, cursor)
-            if batch:
-                cursor = batch[-1]["t"]
-                # Block-average the batch → one 10 Hz vector (matches down_sample).
-                acc = np.mean([s["accel"] for s in batch], axis=0)
-                gyr = np.mean([s["gyro"] for s in batch], axis=0)
-                sample_t = batch[-1]["t"]
-                if last_t is not None and (sample_t - last_t) > self._gap_reset:
-                    self._buf.clear()  # discontinuity — never window across a stall
-                last_t = sample_t
-                self._buf.append([acc[0], acc[1], acc[2], gyr[0], gyr[1], gyr[2]])
-                self._input_buf.append(
-                    {"t": sample_t, "acc": [float(v) for v in acc], "gyr": [float(v) for v in gyr]}
-                )
-                self._since_pred += 1
-                if self._since_pred >= self._stride and len(self._buf) >= self._window:
-                    self._since_pred = 0
-                    self._infer()
+                self._reset_window()  # runs even while paused, so pause() never races us
+            if not self._paused:
+                for sample in self._service.raw_samples_since(self._sensor, cursor):
+                    cursor = sample["t"]
+                    self._push_raw(sample)
             next_tick += self._period
             sleep_for = next_tick - time.monotonic()
             if sleep_for > 0:
@@ -150,11 +158,51 @@ class ClsService:
             else:
                 next_tick = time.monotonic()  # fell behind — resync
 
+    def _reset_window(self) -> None:
+        """Drop all buffered raw data so the next window starts on a clean grid.
+
+        Loop-thread only: web-thread callers signal via ``_cursor_reset`` instead."""
+        self._raw.clear()
+        self._group.clear()
+        self._last_raw_t = None
+        self._groups_since_pred = 0
+
+    def _push_raw(self, sample: dict) -> None:
+        """Feed one raw sample: emits a model-rate vector every ``decim`` samples and runs
+        inference every ``stride`` vectors. Group size is fixed by sample count, so batching
+        by the caller — 9, 11 or 20 samples in one tick — cannot change what the model sees."""
+        t = sample["t"]
+        if self._last_raw_t is not None and (t - self._last_raw_t) > MAX_RAW_GAP_S:
+            self._reset_window()  # discontinuity — never average or window across a stall
+        self._last_raw_t = t
+        vec = [*sample["accel"], *sample["gyro"]]
+        self._raw.append(vec)
+        self._group.append(vec)
+        if len(self._group) < self._decim:
+            return
+        # One full group -> one model-rate vector (== down_sample's integer branch).
+        avg = np.mean(self._group, axis=0)
+        self._group.clear()
+        self._input_buf.append(
+            {"t": t, "acc": [float(v) for v in avg[:3]], "gyr": [float(v) for v in avg[3:]]}
+        )
+        self._groups_since_pred += 1
+        if self._groups_since_pred >= self._stride and len(self._raw) == self._raw.maxlen:
+            self._groups_since_pred = 0
+            self._infer()
+
     def _infer(self) -> None:
-        window = np.asarray(self._buf, dtype=np.float32)  # (window, 6)
         try:
+            # Rebuild the window from raw: exactly ``decim`` samples per row, grid-aligned
+            # because we only get here on a group boundary. Bit-identical to
+            # ``down_sample(raw, sample_hz, target_hz)`` — see others/tests/test_cls_downsample.py.
+            window = (
+                np.asarray(self._raw, dtype=np.float32)
+                .reshape(self._window, self._decim, 6)
+                .mean(axis=1)
+            )
             cls_name, conf, probs = self._clf.predict(window)
-        except Exception as err:  # pragma: no cover - runtime safety
+        except Exception as err:  # pragma: no cover - runtime safety, never kill the thread
             logger.warning(f"CLS inference error: {err}")
             return
         entry = {
@@ -172,12 +220,14 @@ class ClsService:
 
     # --- runtime switch ------------------------------------------------------
     def pause(self) -> None:
-        """Suspend sampling + inference (model stays loaded). Idempotent."""
+        """Suspend sampling + inference (model stays loaded). Idempotent.
+
+        Buffers are cleared by the loop thread on its next tick (via ``_cursor_reset``);
+        touching them here would race an in-flight ``_infer``."""
         with self._log_lock:
             self._paused = True
             self._current = None  # don't show / record a stale prediction
-        self._buf.clear()
-        self._since_pred = 0
+        self._cursor_reset.set()
 
     def resume(self) -> None:
         """Resume sampling + inference, skipping everything buffered while paused."""

@@ -1,0 +1,284 @@
+"""SerialImuService — one IMU arriving as binary frames over a serial port.
+
+A drop-in alternative to ``ImuService`` for setups where the BNO055 is read by an Arduino (or a
+Simulink model) that streams ``read_serial``'s 7-float frames instead of the Jetson reading the
+chip over I2C. The web server picks between them from ``[source] kind`` in the config; everything
+downstream (``web_server._payload``, ``Recorder``, ``ClsService``) is unchanged because the
+method surface matches.
+
+What serial cannot provide, it reports as ``None`` rather than faking: the stream carries only
+accelerometer and gyroscope, so ``euler`` and ``quat`` are always None (Euler/Quaternion plots,
+the 3D cube and the two matching CSVs stay empty), calibration status is unavailable, and the
+axis remap is read-only — that mapping is configured on the Arduino, not writable from here.
+
+Two invariants keep the rest of the app working unchanged:
+
+* Buffered ``"t"`` is the host's ``time.monotonic()`` at decode, exactly like
+  ``ImuService._sample_loop``. The recorder's monotonic->wall-clock mapping, the browser's
+  ``since`` cursor and CLS's ``MAX_RAW_GAP_S`` gap check all assume that clock; the source's own
+  timestamp rides along as ``"t_src"``.
+* ``gyro_scale`` is applied once, in the reader thread before buffering, so the plots, the CSVs
+  and the model all see the same rad/s values. BNO055 firmware commonly emits deg/s (values
+  quantized to 1/16, peaking in the hundreds) while the classifier was trained on rad/s — feeding
+  deg/s through is the ~57x error the README's training/deployment contract warns about.
+"""
+
+from __future__ import annotations
+
+import math
+import threading
+import time
+
+import serial
+from loguru import logger
+
+from jetson_imu_tui.imu_common import (
+    DEFAULT_CONFIG,
+    DEFAULT_SIGN,
+    SIGNAL_KEYS,
+    ImuInfo,
+    apply_offset,
+    decode_axis_remap,
+    is_valid_config,
+    placement_for,
+)
+from jetson_imu_tui.read_serial import DEFAULT_BAUD, DEFAULT_PORT, read_frames
+from jetson_imu_tui.ring_buffer import RingBuffer
+
+# Wait this long before re-opening the port after a failed open or a dropped link. Long enough
+# not to spin on a missing device, short enough that re-plugging the Arduino recovers on its own.
+REOPEN_DELAY_S = 2.0
+
+GYRO_SCALE = {"rad": 1.0, "deg": math.pi / 180.0}
+
+
+class SerialImuService:
+    def __init__(
+        self,
+        port: str = DEFAULT_PORT,
+        baud: int = DEFAULT_BAUD,
+        *,
+        label: str = "Left",
+        magic: str = "",
+        gyro_units: str = "deg",
+    ) -> None:
+        self._port = port
+        self._baud = int(baud)
+        self._label = label
+        self._magic = magic
+        if gyro_units not in GYRO_SCALE:
+            logger.warning(f"unknown gyro_units '{gyro_units}' — assuming deg/s")
+        self._gyro_scale = GYRO_SCALE.get(gyro_units, GYRO_SCALE["deg"])
+
+        self._buf = RingBuffer()
+        self._offset: dict[str, dict[str, list[float]]] | None = None
+        self._offset_lock = threading.Lock()
+        # Axis remap is set on the Arduino; kept here only so the UI popup has something
+        # coherent to render and to report what this end believes is in effect.
+        self._axis_config = DEFAULT_CONFIG
+        self._axis_sign = DEFAULT_SIGN
+
+        self._stop = threading.Event()
+        self._thread: threading.Thread | None = None
+        self._connected = False
+        self.error: Exception | None = None  # last reader failure, for status reporting
+
+    # --- lifecycle ---------------------------------------------------------
+    @property
+    def labels(self) -> list[str]:
+        return [self._label]
+
+    def connect(self) -> list[ImuInfo]:
+        """Probe the port so startup can report a real result; the reader thread opens it again.
+
+        Returns [] if the port cannot be opened, mirroring ``ImuService.connect`` finding no
+        sensors — the server then serves nulls instead of refusing to start."""
+        if self._connected:
+            return self.info()
+        try:
+            serial.Serial(self._port, self._baud, timeout=1).close()
+        except Exception as err:
+            self.error = err
+            logger.warning(f"{self._label}: cannot open {self._port} ({err})")
+            return []
+        self._connected = True
+        return self.info()
+
+    def disconnect(self) -> None:
+        self.stop_sampling()
+        self._connected = False
+
+    def info(self) -> list[ImuInfo]:
+        if not self._connected:
+            return []
+        return [ImuInfo(label=self._label, bus_id=-1, sensor_name=f"BNO055 (serial {self._port})")]
+
+    def is_connected(self) -> bool:
+        return self._connected
+
+    # --- background sampling -----------------------------------------------
+    @property
+    def sampling(self) -> bool:
+        return self._thread is not None
+
+    def start_sampling(self, hz: float = 100.0) -> None:
+        """Start the reader thread. ``hz`` is accepted for interface parity and ignored — the
+        transmitting device sets the rate; ``sample_hz`` in the config must match what it sends,
+        since that is what CLS decimates by."""
+        if self._thread is not None:
+            return
+        self._stop.clear()
+        self._thread = threading.Thread(
+            target=self._read_loop, daemon=True, name=f"serial-imu-{self._label}"
+        )
+        self._thread.start()
+
+    def stop_sampling(self) -> None:
+        self._stop.set()
+        if self._thread is not None:
+            self._thread.join(timeout=3.0)
+            self._thread = None
+
+    def _read_loop(self) -> None:
+        """Decode frames into the ring buffer, re-opening the port until told to stop."""
+        while not self._stop.is_set():
+            frames = read_frames(self._port, self._baud, magic=self._magic, stop=self._stop)
+            try:
+                for f in frames:
+                    gx, gy, gz = f["gyro"]
+                    self._buf.append({
+                        "t": time.monotonic(),
+                        "t_src": f["t"],
+                        "accel": f["accel"],
+                        "gyro": [gx * self._gyro_scale, gy * self._gyro_scale, gz * self._gyro_scale],
+                    })
+                    self._connected = True
+            except Exception as err:  # port missing / unplugged mid-stream
+                self.error = err
+                self._connected = False
+                logger.warning(f"{self._label}: serial read failed ({err}) — retrying")
+            finally:
+                frames.close()
+            self._stop.wait(REOPEN_DELAY_S)
+
+    # --- data --------------------------------------------------------------
+    def _latest_raw(self) -> dict | None:
+        return self._buf.latest()
+
+    @staticmethod
+    def _as_signal(sample: dict | None) -> dict | None:
+        """Ring-buffer sample -> the four-key signal dict every consumer expects."""
+        if sample is None:
+            return None
+        return {
+            "euler": None,
+            "accel": list(sample["accel"]),
+            "gyro": list(sample["gyro"]),
+            "quat": None,
+        }
+
+    def signals(self) -> dict[str, dict | None]:
+        """Latest signals for the single label, with the zero offset applied when active."""
+        off = self._offset
+        sig = self._as_signal(self._latest_raw())
+        return {self._label: apply_offset(sig, off.get(self._label) if off else None)}
+
+    def read_raw(self, label: str) -> dict | None:
+        """Latest signals with the zero/tare offset NOT applied (what CLS needs: gravity in)."""
+        if label != self._label:
+            return None
+        return self._as_signal(self._latest_raw())
+
+    def raw_samples_since(self, label: str, t: float, limit: int | None = None) -> list[dict]:
+        """Raw (tare-NOT-applied) buffered samples with ``sample["t"] > t``, oldest first.
+
+        The one method ``ClsService`` calls. Copies, so callers never mutate buffer state."""
+        if label != self._label:
+            return []
+        return [
+            {"t": s["t"], "t_src": s["t_src"], "accel": list(s["accel"]), "gyro": list(s["gyro"])}
+            for s in self._buf.since(t, limit=limit)
+        ]
+
+    def samples_since(self, t: float, limit: int = 300) -> list[dict]:
+        """Payload-shaped samples newer than monotonic ``t``, oldest first — the plot's and the
+        recorder's data source. One sensor, so there is no cross-label alignment to do; euler and
+        quat are present as None so the browser still discovers the label."""
+        off = self._offset
+        o = off.get(self._label) if off else None
+        out: list[dict] = []
+        for s in self._buf.since(t, limit=limit):
+            sig = apply_offset(self._as_signal(s), o)
+            row: dict = {"t": s["t"]}
+            for key in SIGNAL_KEYS:
+                row[key] = {self._label: sig[key] if sig is not None else None}
+            out.append(row)
+        return out
+
+    # --- zero / tare -------------------------------------------------------
+    @property
+    def is_zeroed(self) -> bool:
+        return self._offset is not None
+
+    def zero_toggle(self) -> bool:
+        """Capture the current accel/gyro as the zero reference, or clear it. Returns True if
+        now zeroed. CLS bypasses this (it reads ``raw_samples_since``) and keeps seeing gravity."""
+        with self._offset_lock:
+            if self._offset is None:
+                sig = self._as_signal(self._latest_raw())
+                self._offset = (
+                    {self._label: {"accel": list(sig["accel"]), "gyro": list(sig["gyro"])}}
+                    if sig is not None
+                    else {}
+                )
+            else:
+                self._offset = None
+            return self._offset is not None
+
+    # --- calibration / axis remap (reported, not controllable) --------------
+    def calibration_status(self) -> dict[str, dict | None]:
+        """No calibration registers over serial — the transmitting device owns that."""
+        return {self._label: None}
+
+    def get_axis_remap(self) -> dict:
+        c, s = self._axis_config, self._axis_sign
+        return {
+            "config": c,
+            "sign": s,
+            "config_hex": f"0x{c:02X}",
+            "sign_hex": f"0x{s:02X}",
+            "mapping": decode_axis_remap(c, s),
+            "placement": placement_for(c, s),
+            "valid": is_valid_config(c),
+        }
+
+    def set_axis_remap(self, config_byte: int, sign_byte: int, *, persist: bool = True) -> dict:
+        """Record the mapping this end assumes; it cannot be written over the serial link.
+
+        The transmitting device applies its own AXIS_MAP_CONFIG/SIGN, and that mapping must match
+        the one used to collect the training data or the classifier degrades silently."""
+        config_byte &= 0xFF
+        sign_byte &= 0xFF
+        valid = is_valid_config(config_byte)
+        if valid:
+            self._axis_config = config_byte
+            self._axis_sign = sign_byte
+        result = self.get_axis_remap()
+        result.update({
+            "config": config_byte,
+            "sign": sign_byte,
+            "config_hex": f"0x{config_byte:02X}",
+            "sign_hex": f"0x{sign_byte:02X}",
+            "mapping": decode_axis_remap(config_byte, sign_byte),
+            "placement": placement_for(config_byte, sign_byte),
+            "valid": valid,
+            "ok": False,
+            "hardware": False,
+            "applied": {},
+            "message": (
+                "Invalid mapping: each output axis must map to a distinct source axis."
+                if not valid
+                else "Serial source — set the axis mapping on the transmitting device."
+            ),
+        })
+        return result

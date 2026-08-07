@@ -25,8 +25,24 @@ from loguru import logger
 
 from jetson_imu_tui.cls.service import ClsService
 from jetson_imu_tui.config import AppConfig
-from jetson_imu_tui.imu_service import PLACEMENTS, ImuService
+from jetson_imu_tui.imu_common import PLACEMENTS
 from jetson_imu_tui.recorder import Recorder
+
+# Both sources are optional *at import time*: the I2C stack (Blinka / adafruit-bno055) is
+# Linux-only and pyserial is an extra, so a machine set up for one source need not have the
+# other installed. The failure is only reported if that source is the one being asked for.
+try:
+    from jetson_imu_tui.imu_service import ImuService
+except Exception as err:  # pragma: no cover - depends on what is installed
+    ImuService, _I2C_IMPORT_ERR = None, err
+else:
+    _I2C_IMPORT_ERR = None
+try:
+    from jetson_imu_tui.serial_service import SerialImuService
+except Exception as err:  # pragma: no cover - depends on what is installed
+    SerialImuService, _SERIAL_IMPORT_ERR = None, err
+else:
+    _SERIAL_IMPORT_ERR = None
 
 
 def get_local_ip() -> str | None:
@@ -126,7 +142,7 @@ def _free_port(host: str, port: int, *, timeout: float = 5.0) -> None:
 class ServerState:
     """Holds the IMU service and the optional recorder; toggled from the web UI."""
 
-    def __init__(self, service: ImuService, log_dir: Path, record_hz: int) -> None:
+    def __init__(self, service: "ImuService | SerialImuService", log_dir: Path, record_hz: int) -> None:
         self.service = service
         self.log_dir = log_dir
         self.record_hz = record_hz
@@ -292,6 +308,34 @@ def create_app(state: ServerState, window_s: float, poll_ms: int) -> Flask:
     return app
 
 
+def _make_service(cfg: AppConfig) -> "ImuService | SerialImuService":
+    """Build the sample source named by ``[source] kind``.
+
+    Both kinds expose the same method surface, so nothing downstream (payload, recorder, CLS)
+    cares which one it gets. Exits with the import error if the requested source's dependency
+    is missing — a silent fallback to the other source would be worse than not starting."""
+    if cfg.source_kind == "serial":
+        if SerialImuService is None:
+            raise SystemExit(
+                f"[source] kind = \"serial\" needs pyserial: {_SERIAL_IMPORT_ERR}\n"
+                f"  install it with:  pip install -e \".[serial]\""
+            )
+        return SerialImuService(
+            cfg.serial_port,
+            cfg.serial_baud,
+            label=cfg.serial_label,
+            magic=cfg.serial_magic,
+            gyro_units=cfg.serial_gyro_units,
+        )
+    if cfg.source_kind != "i2c":
+        print(f'Unknown [source] kind "{cfg.source_kind}" — falling back to "i2c"')
+    if ImuService is None:
+        raise SystemExit(
+            f"[source] kind = \"i2c\" needs the Adafruit I2C stack: {_I2C_IMPORT_ERR}"
+        )
+    return ImuService(cfg.bus_labels, state_path=Path(cfg.log_dir) / "axis_remap.json")
+
+
 def run_server(cfg: AppConfig, host: str | None = None, port: int | None = None) -> None:
     host = host or cfg.web_host
     port = int(port or cfg.web_port)
@@ -306,8 +350,11 @@ def run_server(cfg: AppConfig, host: str | None = None, port: int | None = None)
     # this port *and* the I2C buses + CUDA, so killing it first lets us grab everything cleanly.
     _free_port(host, port)
 
-    service = ImuService(cfg.bus_labels, state_path=Path(cfg.log_dir) / "axis_remap.json")
-    print("Connecting to IMUs...")
+    service = _make_service(cfg)
+    if cfg.source_kind == "serial":
+        print(f"Opening serial IMU on {cfg.serial_port} @ {cfg.serial_baud}...")
+    else:
+        print("Connecting to IMUs...")
     try:
         info = service.connect()
     except Exception as err:  # pragma: no cover - hardware dependent
@@ -325,6 +372,7 @@ def run_server(cfg: AppConfig, host: str | None = None, port: int | None = None)
             service,
             cfg.cls_model_path,
             sensor=cfg.cls_sensor,
+            sample_hz=cfg.sample_hz,
             target_hz=cfg.cls_target_hz,
             window=cfg.cls_window,
             stride=cfg.cls_stride,
@@ -972,7 +1020,7 @@ async function pollCls(){
       + '<span class="clspct">' + pct + '%</span>';
     log.insertBefore(row, log.firstChild);
   }
-  while(log.childNodes.length > 500) log.removeChild(log.lastChild);
+  while(log.childNodes.length > 3000) log.removeChild(log.lastChild);
 }
 
 let sinceT = 0;                        // cursor: newest buffered-sample t already fetched
