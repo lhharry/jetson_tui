@@ -29,6 +29,9 @@ class AppConfig:
     serial_baud: int = 115200
     serial_label: str = "Left"
     serial_magic: str = ""
+    # Frame layout: float count, whether a source timestamp rides along, and channel order.
+    # See read_serial.LAYOUTS — the order is undetectable from the bytes, so it is declared.
+    serial_layout: str = "accel_gyro_t"
     serial_gyro_units: str = "deg"
     # Wire rate of the serial device. Defaults to ``sample_hz`` (the I2C rate); it exists
     # separately because the two sources can be swapped at runtime and the rate drives the
@@ -81,6 +84,7 @@ def load_config(path: Path | None = None) -> AppConfig:
         serial_baud=int(source.get("baud", 115200)),
         serial_label=str(source.get("label", "Left")),
         serial_magic=str(source.get("magic", "")),
+        serial_layout=str(source.get("layout", "accel_gyro_t")).lower(),
         serial_gyro_units=str(source.get("gyro_units", "deg")).lower(),
         serial_sample_hz=int(source.get("sample_hz", sample_hz)),
         cls_enabled=bool(cls.get("enabled", True)),

@@ -4,14 +4,22 @@
 
 [source]                  # boot default; the web UI can switch kinds at runtime (session only)
 kind = "i2c"              # "i2c" = BNO055 over I2C (see [buses]) | "serial" = binary frames from an Arduino/Simulink
-port = "/dev/ttyACM0"     # serial only; on Windows something like "COM5"
+port = "/dev/ttyACM0"     # serial only; on Windows something like "COM17"
 baud = 115200
 label = "Left"            # label the serial IMU appears under; must match [cls] sensor
-magic = ""                # optional frame header in hex (e.g. "5aa5"); empty = align on the timestamp
-gyro_units = "deg"        # units the device sends: "deg" is scaled to rad/s, "rad" passes through
-# sample_hz = 100         # rate the device sends at; omit to inherit [defaults] sample_hz.
-                          # Only needed if the serial device's rate differs from the I2C rate —
-                          # it drives the CLS decimation, so a wrong value mis-sizes the window.
+magic = "aa55"            # frame header in hex; required unless the layout carries a timestamp
+layout = "gyro_accel"     # frame contents, see read_serial.LAYOUTS:
+                          #   accel_gyro_t  ax ay az gx gy gz t   (7 floats, Simulink)
+                          #   gyro_accel_t  gx gy gz ax ay az t   (7 floats)
+                          #   accel_gyro    ax ay az gx gy gz     (6 floats, no clock)
+                          #   gyro_accel    gx gy gz ax ay az     (6 floats, no clock)
+                          # Channel order cannot be detected from the bytes: getting it wrong
+                          # puts gravity in the gyro channels and degrades CLS silently.
+gyro_units = "rad"        # units the device sends: "deg" is scaled to rad/s, "rad" passes through
+sample_hz = 80            # rate the device sends at (measured 79.7 Hz); omit to inherit
+                          # [defaults] sample_hz. Drives the CLS decimation, so it must divide
+                          # [cls] target_hz evenly — 80/10 = 8. The serial reader logs the
+                          # observed rate on connect, so check it against this value.
 
 [defaults]
 log_dir = "./logs"

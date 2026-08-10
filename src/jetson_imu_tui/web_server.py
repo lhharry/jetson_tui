@@ -432,6 +432,7 @@ def _make_source(cfg: AppConfig, kind: str) -> tuple["ImuService | SerialImuServ
             cfg.serial_baud,
             label=cfg.serial_label,
             magic=cfg.serial_magic,
+            layout=cfg.serial_layout,
             gyro_units=cfg.serial_gyro_units,
         ), None
     if kind != "i2c":

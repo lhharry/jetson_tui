@@ -49,12 +49,21 @@ from jetson_imu_tui.imu_common import (
     is_valid_config,
     placement_for,
 )
-from jetson_imu_tui.read_serial import DEFAULT_BAUD, DEFAULT_PORT, decode_frames
+from jetson_imu_tui.read_serial import (
+    DEFAULT_BAUD,
+    DEFAULT_LAYOUT,
+    DEFAULT_PORT,
+    LAYOUTS,
+    decode_frames,
+)
 from jetson_imu_tui.ring_buffer import RingBuffer
 
 # Wait this long before re-opening the port after a failed open or a dropped link. Long enough
 # not to spin on a missing device, short enough that re-plugging the Arduino recovers on its own.
 REOPEN_DELAY_S = 2.0
+
+# Measure the incoming frame rate over this long, then report it once per connection.
+RATE_REPORT_S = 3.0
 
 GYRO_SCALE = {"rad": 1.0, "deg": math.pi / 180.0}
 
@@ -67,12 +76,16 @@ class SerialImuService:
         *,
         label: str = "Left",
         magic: str = "",
+        layout: str = DEFAULT_LAYOUT,
         gyro_units: str = "deg",
     ) -> None:
         self._port = port
         self._baud = int(baud)
         self._label = label
         self._magic = magic
+        if layout not in LAYOUTS:
+            logger.warning(f"unknown layout '{layout}' — assuming {DEFAULT_LAYOUT}")
+        self._layout = layout if layout in LAYOUTS else DEFAULT_LAYOUT
         if gyro_units not in GYRO_SCALE:
             logger.warning(f"unknown gyro_units '{gyro_units}' — assuming deg/s")
         self._gyro_scale = GYRO_SCALE.get(gyro_units, GYRO_SCALE["deg"])
@@ -89,6 +102,7 @@ class SerialImuService:
         self._thread: threading.Thread | None = None
         self._connected = False
         self.error: Exception | None = None  # last reader failure, for status reporting
+        self.observed_hz: float | None = None  # measured wire rate, for checking sample_hz
 
         # The open port, shared between the reader thread and ``send_result``. ``_io_lock``
         # guards publishing/clearing it and the writes themselves; it is never held across a
@@ -177,16 +191,32 @@ class SerialImuService:
                 self._ser = ser
                 self._open_err_logged = False
                 self._tx_err_logged = False
+            n_frames, t_first, rate_logged = 0, None, False
             try:
-                for f in decode_frames(ser, magic=self._magic, stop=self._stop):
+                for f in decode_frames(
+                    ser, magic=self._magic, layout=self._layout, stop=self._stop
+                ):
                     gx, gy, gz = f["gyro"]
+                    now = time.monotonic()
                     self._buf.append({
-                        "t": time.monotonic(),
+                        "t": now,
                         "t_src": f["t"],
                         "accel": f["accel"],
                         "gyro": [gx * self._gyro_scale, gy * self._gyro_scale, gz * self._gyro_scale],
                     })
                     self._connected = True
+                    # Report the rate the device actually sends at, once per connection:
+                    # ``sample_hz`` has to match it, and it is otherwise invisible.
+                    n_frames += 1
+                    if t_first is None:
+                        t_first = now
+                    elif not rate_logged and now - t_first >= RATE_REPORT_S:
+                        self.observed_hz = n_frames / (now - t_first)
+                        logger.info(
+                            f"{self._label}: {self.observed_hz:.1f} Hz observed on {self._port} "
+                            f"— set sample_hz to match"
+                        )
+                        rate_logged = True
             except Exception as err:  # port missing / unplugged mid-stream
                 self.error = err
                 self._connected = False

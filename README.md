@@ -119,19 +119,40 @@ results going back to the Arduino (see below). The boot default is chosen in the
 ```toml
 [source]
 kind = "serial"           # "i2c" (default) | "serial" — boot default; switchable at runtime
-port = "/dev/ttyACM0"     # "COM5" on Windows
+port = "/dev/ttyACM0"     # "COM17" on Windows
 baud = 115200
 label = "Left"            # label the IMU appears under; must match [cls] sensor
-magic = ""                # frame header in hex (e.g. "5aa5"); empty = align on the timestamp
-gyro_units = "deg"        # units the device sends; "deg" is scaled to rad/s, "rad" passes through
-# sample_hz = 100         # rate the device sends at; omit to inherit [defaults] sample_hz
+magic = "aa55"            # frame header in hex; required unless the layout carries a timestamp
+layout = "gyro_accel"     # frame contents and channel order — see the table below
+gyro_units = "rad"        # units the device sends; "deg" is scaled to rad/s, "rad" passes through
+sample_hz = 80            # rate the device sends at; omit to inherit [defaults] sample_hz
 ```
 
-**Wire format** (`read_serial.py`): 7 little-endian float32 per frame — `ax ay az gx gy gz t`,
-28 bytes, accel in m/s² **including gravity**, `t` in seconds. A frame header is optional: with
-none, byte alignment is recovered from the timestamp increasing monotonically, and a stream that
-loses bytes re-aligns by itself. `sample_hz` in `[defaults]` must equal the rate the device sends
-(it drives the CLS decimation).
+**Wire format** (`read_serial.py`): an optional header followed by 6 or 7 little-endian float32.
+Accel is m/s² **including gravity**; `t`, where present, is the source's own clock in seconds.
+Pick the frame contents with `layout`:
+
+| `layout` | floats | frame | typical source |
+|---|---|---|---|
+| `accel_gyro_t` (default) | `ax ay az gx gy gz t` | 28 B + header | Simulink Serial Transmit, header `5aa5` |
+| `gyro_accel_t` | `gx gy gz ax ay az t` | 28 B + header | as above, channels swapped |
+| `accel_gyro` | `ax ay az gx gy gz` | 24 B + header | Arduino sketch, no clock |
+| `gyro_accel` | `gx gy gz ax ay az` | 24 B + header | Arduino sketch, no clock |
+
+**Alignment** needs a timestamp or a header, and the layout decides which. With a timestamp,
+byte alignment is recovered from it increasing monotonically, so the header is optional and a
+stream that loses bytes re-aligns by itself. Without one the header is the only anchor and is
+therefore **required** — `decode_frames` raises rather than emit misaligned junk — and re-sync
+works off the header alone.
+
+**Channel order is declared, not detected.** Nothing in the bytes distinguishes accel from gyro,
+and choosing wrong puts gravity into the gyro channels: the classifier then degrades with no
+error anywhere. Verify once on the device — hold it still and watch `/data`: one *accel* axis
+must read ≈ 9.8 and the gyro must read ≈ 0.
+
+`sample_hz` must equal the rate the device actually sends, since it drives the CLS decimation.
+The serial reader logs the measured rate a few seconds after connecting
+(`Left: 79.7 Hz observed on /dev/ttyACM0 — set sample_hz to match`), so check the two agree.
 
 **Gyro units are the trap.** BNO055 firmware commonly reports **deg/s** (values quantized to
 1/16, peaking in the hundreds) while the classifier was trained on rad/s — leaving `gyro_units`
