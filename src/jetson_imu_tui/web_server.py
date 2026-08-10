@@ -11,6 +11,7 @@ the next one). No websocket, no async; rendering happens in the browser on the l
 
 from __future__ import annotations
 
+import json
 import logging
 import os
 import signal
@@ -23,7 +24,9 @@ from pathlib import Path
 from flask import Flask, Response, jsonify, request
 from loguru import logger
 
+from jetson_imu_tui.cls.model import CLASSES
 from jetson_imu_tui.cls.service import ClsService
+from jetson_imu_tui.cls.vote import SoftVoter
 from jetson_imu_tui.config import AppConfig
 from jetson_imu_tui.imu_common import PLACEMENTS
 from jetson_imu_tui.recorder import Recorder
@@ -140,10 +143,21 @@ def _free_port(host: str, port: int, *, timeout: float = 5.0) -> None:
 
 
 class ServerState:
-    """Holds the IMU service and the optional recorder; toggled from the web UI."""
+    """Holds the active IMU service and the optional recorder; toggled from the web UI."""
 
-    def __init__(self, service: "ImuService | SerialImuService", log_dir: Path, record_hz: int) -> None:
+    def __init__(
+        self,
+        cfg: AppConfig,
+        service: "ImuService | SerialImuService",
+        log_dir: Path,
+        record_hz: int,
+    ) -> None:
+        self.cfg = cfg
         self.service = service
+        self.source_kind = cfg.source_kind
+        # Built sources are kept so switching back is instant and per-source state (tare
+        # offset, axis remap) survives a round trip.
+        self._sources: dict[str, "ImuService | SerialImuService"] = {cfg.source_kind: service}
         self.log_dir = log_dir
         self.record_hz = record_hz
         self.recorder: Recorder | None = None
@@ -153,6 +167,25 @@ class ServerState:
     def toggle_zero(self) -> bool:
         return self.service.zero_toggle()
 
+    def emit_cls_result(self, index: int) -> None:
+        """Sink for aggregated CLS decisions: hand the class index to the active source.
+
+        Duck-typed on purpose — only ``SerialImuService`` has ``send_result``, so this is
+        silently a no-op on I2C without ``cls/`` knowing that serial sources exist."""
+        send = getattr(self.service, "send_result", None)
+        if send is not None:
+            send(index)
+
+    def _stop_recorder_locked(self) -> bool:
+        """Stop an active recording. Caller must hold ``_lock`` (which is not reentrant)."""
+        if self.recorder is None:
+            return False
+        try:
+            self.recorder.__exit__(None, None, None)
+        finally:
+            self.recorder = None
+        return True
+
     def toggle_record(self) -> bool:
         with self._lock:
             if self.recorder is None:
@@ -160,11 +193,64 @@ class ServerState:
                     self.service, self.log_dir, self.record_hz, cls=self.cls
                 ).__enter__()
                 return True
-            try:
-                self.recorder.__exit__(None, None, None)
-            finally:
-                self.recorder = None
+            self._stop_recorder_locked()
             return False
+
+    def switch_source(self, kind: str) -> dict:
+        """Swap the live sample source. Returns ``{"ok", "kind", "message"}``.
+
+        The new source is connected and sampling *before* ``self.service`` is repointed and the
+        old one is torn down, so a concurrent ``/data`` poll never sees a dead source. An active
+        recording is stopped first: ``Recorder`` caches the label list and has already written
+        its CSV headers, and the label set changes between the two-sensor and one-sensor sources.
+        """
+        kind = str(kind).lower()
+        with self._lock:
+            if kind == self.source_kind:
+                return {"ok": True, "kind": kind, "message": f"already using {kind}"}
+            new = self._sources.get(kind)
+            if new is None:
+                new, err = _make_source(self.cfg, kind)
+                if err is not None:
+                    return {"ok": False, "kind": self.source_kind, "message": err}
+                self._sources[kind] = new
+
+            notes: list[str] = []
+            if self._stop_recorder_locked():
+                notes.append("recording stopped")
+
+            hz = self.cfg.sample_hz_for(kind)
+            try:
+                info = new.connect()
+            except Exception as err:  # pragma: no cover - hardware dependent
+                info = []
+                logger.warning(f"switch to {kind}: connect failed ({err})")
+            # Start sampling even when nothing was detected: switch anyway, matching startup's
+            # "serve nulls rather than refuse" behaviour. This is what makes recovery work —
+            # the serial reader thread retries the open on its own, so plugging the device in
+            # afterwards picks it up. (I2C's start_sampling is a no-op with no sensors.)
+            new.start_sampling(hz)
+            if not info:
+                notes.append("no sensor detected yet — will keep retrying")
+
+            old, self.service, self.source_kind = self.service, new, kind
+            if self.cls is not None:
+                # Re-points CLS without reloading the checkpoint; the loop thread clears the
+                # inference window and the vote buffer on its next tick.
+                err = self.cls.set_source(new, sample_hz=hz)
+                if err is not None:
+                    notes.append(f"CLS paused: {err}")
+            try:
+                old.stop_sampling()
+                old.disconnect()
+            except Exception as err:  # pragma: no cover - hardware dependent
+                logger.warning(f"switch to {kind}: releasing previous source failed ({err})")
+
+            msg = f"switched to {kind}"
+            if notes:
+                msg += " (" + "; ".join(notes) + ")"
+            logger.info(msg)
+            return {"ok": True, "kind": kind, "message": msg}
 
     def set_record_hz(self, hz) -> int:
         """Set the recording rate (1–200 Hz); restart an active recorder to apply it."""
@@ -213,6 +299,9 @@ def _payload(state: ServerState, since: float | None = None) -> dict:
         "recording": state.recording,
         "zeroed": state.service.is_zeroed,
         "hz": state.record_hz,
+        "source": state.source_kind,
+        "source_connected": state.service.is_connected(),
+        "sources": _source_available(),
         "euler": {},
         "accel": {},
         "gyro": {},
@@ -229,7 +318,12 @@ def _payload(state: ServerState, since: float | None = None) -> dict:
 
 def create_app(state: ServerState, window_s: float, poll_ms: int) -> Flask:
     app = Flask(__name__, static_folder="static")
-    html = _HTML.replace("__WINDOW_S__", str(float(window_s))).replace("__POLL_MS__", str(int(poll_ms)))
+    html = (
+        _HTML.replace("__WINDOW_S__", str(float(window_s)))
+        .replace("__POLL_MS__", str(int(poll_ms)))
+        # Index -> name for the decision markers; injected so it can never drift from CLASSES.
+        .replace("__CLASSES__", json.dumps(list(CLASSES)))
+    )
 
     @app.route("/")
     def index() -> Response:
@@ -255,6 +349,13 @@ def create_app(state: ServerState, window_s: float, poll_ms: int) -> Flask:
     def freq() -> Response:
         hz = request.args.get("hz") or (request.get_json(silent=True) or {}).get("hz")
         return jsonify({"hz": state.set_record_hz(hz)})
+
+    @app.route("/source", methods=["POST"])
+    def source() -> Response:
+        kind = request.args.get("kind") or (request.get_json(silent=True) or {}).get("kind")
+        if not kind:
+            return jsonify({"ok": False, "kind": state.source_kind, "message": "missing 'kind'"})
+        return jsonify(state.switch_source(kind))
 
     @app.route("/calibration", methods=["GET"])
     def calibration() -> Response:
@@ -308,17 +409,23 @@ def create_app(state: ServerState, window_s: float, poll_ms: int) -> Flask:
     return app
 
 
-def _make_service(cfg: AppConfig) -> "ImuService | SerialImuService":
-    """Build the sample source named by ``[source] kind``.
+def _source_available() -> dict[str, bool]:
+    """Which source kinds this install can actually build — the UI greys out the rest."""
+    return {"i2c": ImuService is not None, "serial": SerialImuService is not None}
+
+
+def _make_source(cfg: AppConfig, kind: str) -> tuple["ImuService | SerialImuService | None", str | None]:
+    """Build one sample source. Returns ``(service, None)`` or ``(None, error_message)``.
 
     Both kinds expose the same method surface, so nothing downstream (payload, recorder, CLS)
-    cares which one it gets. Exits with the import error if the requested source's dependency
-    is missing — a silent fallback to the other source would be worse than not starting."""
-    if cfg.source_kind == "serial":
+    cares which one it gets. A missing dependency is returned rather than raised: at startup the
+    caller turns it into a ``SystemExit`` (a silent fallback to the other source would be worse
+    than not starting), but a runtime switch just reports it and stays where it is."""
+    if kind == "serial":
         if SerialImuService is None:
-            raise SystemExit(
-                f"[source] kind = \"serial\" needs pyserial: {_SERIAL_IMPORT_ERR}\n"
-                f"  install it with:  pip install -e \".[serial]\""
+            return None, (
+                f'[source] kind = "serial" needs pyserial: {_SERIAL_IMPORT_ERR}\n'
+                f'  install it with:  pip install -e ".[serial]"'
             )
         return SerialImuService(
             cfg.serial_port,
@@ -326,14 +433,12 @@ def _make_service(cfg: AppConfig) -> "ImuService | SerialImuService":
             label=cfg.serial_label,
             magic=cfg.serial_magic,
             gyro_units=cfg.serial_gyro_units,
-        )
-    if cfg.source_kind != "i2c":
-        print(f'Unknown [source] kind "{cfg.source_kind}" — falling back to "i2c"')
+        ), None
+    if kind != "i2c":
+        return None, f'Unknown source kind "{kind}" — expected "i2c" or "serial"'
     if ImuService is None:
-        raise SystemExit(
-            f"[source] kind = \"i2c\" needs the Adafruit I2C stack: {_I2C_IMPORT_ERR}"
-        )
-    return ImuService(cfg.bus_labels, state_path=Path(cfg.log_dir) / "axis_remap.json")
+        return None, f'[source] kind = "i2c" needs the Adafruit I2C stack: {_I2C_IMPORT_ERR}'
+    return ImuService(cfg.bus_labels, state_path=Path(cfg.log_dir) / "axis_remap.json"), None
 
 
 def run_server(cfg: AppConfig, host: str | None = None, port: int | None = None) -> None:
@@ -350,7 +455,10 @@ def run_server(cfg: AppConfig, host: str | None = None, port: int | None = None)
     # this port *and* the I2C buses + CUDA, so killing it first lets us grab everything cleanly.
     _free_port(host, port)
 
-    service = _make_service(cfg)
+    service, err = _make_source(cfg, cfg.source_kind)
+    if err is not None:
+        # The *boot* source is a hard requirement; a runtime switch reports instead.
+        raise SystemExit(err)
     if cfg.source_kind == "serial":
         print(f"Opening serial IMU on {cfg.serial_port} @ {cfg.serial_baud}...")
     else:
@@ -362,20 +470,35 @@ def run_server(cfg: AppConfig, host: str | None = None, port: int | None = None)
         info = []
     if info:
         print("Connected: " + ", ".join(f"{i.label}={i.sensor_name}" for i in info))
-        service.start_sampling(cfg.sample_hz)
     else:
         print("No IMUs detected — serving anyway (values will be null).")
+    # Started either way: the serial reader retries the open on its own, so a device plugged in
+    # after startup is picked up. With no I2C sensors this is a no-op.
+    service.start_sampling(cfg.sample_hz_for(cfg.source_kind))
 
-    state = ServerState(service, cfg.log_dir, cfg.record_hz)
+    state = ServerState(cfg, service, cfg.log_dir, cfg.record_hz)
     if cfg.cls_enabled and cfg.cls_model_path:
+        # Aggregation is always present; disabling it is a window of 1, i.e. one decision per
+        # inference, which keeps ClsService to a single code path.
+        voter = (
+            SoftVoter(
+                window=cfg.vote_window,
+                emit_every=cfg.vote_emit_every,
+                hysteresis=cfg.vote_hysteresis,
+            )
+            if cfg.vote_enabled
+            else SoftVoter(window=1, emit_every=1)
+        )
         state.cls = ClsService(
             service,
             cfg.cls_model_path,
             sensor=cfg.cls_sensor,
-            sample_hz=cfg.sample_hz,
+            sample_hz=cfg.sample_hz_for(cfg.source_kind),
             target_hz=cfg.cls_target_hz,
             window=cfg.cls_window,
             stride=cfg.cls_stride,
+            aggregator=voter,
+            on_result=state.emit_cls_result,
         )
         state.cls.start()
     poll_ms = max(20, int(1000 / max(1, cfg.plot_fps)))
@@ -429,6 +552,10 @@ _HTML = """<!DOCTYPE html>
   .btn:hover{filter:brightness(1.08)}
   .btn.rec-on{background:#ef4444;border-color:#ef4444;color:#fff}
   .btn.pause-on{background:#f59e0b;border-color:#f59e0b;color:#111}
+  .btn.src-serial{background:#0ea5e9;border-color:#0ea5e9;color:#fff}
+  .btn.src-warn{background:#f59e0b;border-color:#f59e0b;color:#111}
+  .btn:disabled{opacity:.45;cursor:not-allowed}
+  .srcmsg{font-size:12px;color:var(--muted);max-width:340px;overflow:hidden;text-overflow:ellipsis;white-space:nowrap}
   .reclabel{display:flex;align-items:center;gap:6px;color:var(--muted);font-size:12px}
   .num{width:64px;background:var(--panel2);color:var(--fg);border:1px solid var(--border);border-radius:6px;padding:6px}
   #yman{align-items:center;gap:5px}
@@ -507,6 +634,9 @@ _HTML = """<!DOCTYPE html>
   .clsbar{width:120px;height:8px;background:var(--panel2);border-radius:4px;overflow:hidden}
   .clsbar i{display:block;height:100%}
   .clspct{width:44px;text-align:right;color:var(--muted);font-size:12px}
+  .clsvote{font-size:12px;color:var(--muted);text-transform:none;letter-spacing:0}
+  .clsdeccol{width:150px}
+  .clsdec{font-size:12px;font-weight:700;text-transform:capitalize}
 </style>
 </head>
 <body>
@@ -530,6 +660,9 @@ _HTML = """<!DOCTYPE html>
         <input id="ymax" class="num" type="number" step="any" title="Y max">
       </span>
       <span class="grow"></span>
+      <span id="srcMsg" class="srcmsg"></span>
+      <button id="srcBtn" class="btn" onclick="toggleSource()"
+              title="Switch between the onboard I2C IMUs and the serial (Arduino) IMU">IMU: —</button>
       <button id="themeBtn" class="btn" onclick="toggleTheme()">Light</button>
       <button id="zeroBtn" class="btn" onclick="toggleZero()" title="Zero out current Euler/Accel/Gyro readings (tare)">Zero</button>
       <button id="recBtn" class="btn" onclick="toggleRecord()">Record</button>
@@ -546,7 +679,8 @@ _HTML = """<!DOCTYPE html>
       </div>
       <div id="clsBanner" class="clsbanner"><span class="muted">connecting…</span></div>
       <div class="clshead">
-        <span class="clshcol">time</span><span class="clshcol grow">activity</span><span class="clshcol">conf</span>
+        <span class="clshcol">time</span><span class="clshcol grow">activity (frame)</span>
+        <span class="clshcol">conf</span><span class="clshcol" style="width:150px">decision</span>
       </div>
       <div id="clsLog"></div>
     </div>
@@ -629,6 +763,7 @@ let yBySignal = {};               // signal -> {auto:true} | {auto:false, min, m
 let clsMode = false;              // CLS page active (a pseudo-signal, not a plot)
 let clsSince = 0;                 // highest CLS entry id already shown
 let clsTimer = null;
+const CLS_NAMES = __CLASSES__;    // index -> label, injected from cls/model/__init__.py CLASSES
 const CLS_COLORS = { stand:'#9aa4b2', walk:'#22c55e', turn:'#eab308', jog:'#ef4444',
                      rampascent:'#3b82f6', stairascent:'#a855f7', stairdescent:'#ec4899',
                      sit:'#14b8a6', 'sit-to-stand':'#f97316', 'stand-to-sit':'#8b5cf6',
@@ -746,6 +881,54 @@ function togglePause(){
 async function toggleRecord(){ try { await fetch('/record', {method:'POST'}); } catch(e) {} }
 async function toggleZero(){ try { await fetch('/zero', {method:'POST'}); } catch(e) {} }
 async function toggleCls(){ try { await fetch('/cls/toggle', {method:'POST'}); pollCls(); } catch(e) {} }
+
+// ---- IMU source switch ----------------------------------------------------
+let srcKind = null, srcSources = null, srcBusy = false, srcMsgTimer = null;
+
+function showSrcMsg(text, ms){
+  const el = document.getElementById('srcMsg');
+  el.textContent = text || '';
+  if(srcMsgTimer) clearTimeout(srcMsgTimer);
+  if(text && ms) srcMsgTimer = setTimeout(() => { el.textContent = ''; }, ms);
+}
+
+async function toggleSource(){
+  if(srcBusy || !srcKind) return;
+  // Post the explicit target rather than a server-side toggle, so a double click can't
+  // ping-pong the source while the first switch is still connecting hardware.
+  const want = srcKind === 'serial' ? 'i2c' : 'serial';
+  srcBusy = true;
+  const btn = document.getElementById('srcBtn');
+  btn.disabled = true;
+  showSrcMsg('switching to ' + want + '…');
+  try {
+    const r = await (await fetch('/source?kind=' + want, {method:'POST'})).json();
+    showSrcMsg((r.ok ? '' : '✗ ') + (r.message || ''), r.ok ? 5000 : 12000);
+  } catch(e) {
+    showSrcMsg('✗ switch failed', 12000);
+  } finally {
+    srcBusy = false;
+    btn.disabled = false;
+  }
+}
+
+function syncSourceBtn(d){
+  srcKind = d.source || srcKind;
+  srcSources = d.sources || srcSources;
+  const btn = document.getElementById('srcBtn');
+  if(srcBusy) return;                       // don't fight an in-flight switch
+  const serial = srcKind === 'serial';
+  const linked = d.source_connected !== false;
+  btn.textContent = 'IMU: ' + (serial ? 'Serial' : 'I2C') + (linked ? '' : ' (no link)');
+  btn.classList.toggle('src-serial', serial && linked);
+  btn.classList.toggle('src-warn', !linked);
+  const other = serial ? 'i2c' : 'serial';
+  const canSwitch = !srcSources || srcSources[other] !== false;
+  btn.disabled = !canSwitch;
+  btn.title = canSwitch
+    ? 'Switch to the ' + (serial ? 'onboard I2C IMUs' : 'serial (Arduino) IMU')
+    : other + ' source unavailable on this install';
+}
 
 function toggleView(){
   if(clsMode) return;   // CLS is its own page; Numbers/Plots toggle doesn't apply
@@ -998,13 +1181,24 @@ async function pollCls(){
   runBtn.style.display = '';
   runBtn.textContent = running ? 'Stop' : 'Start';
   runBtn.classList.toggle('rec-on', running);
+  const v = d.vote || {};
+  // The banner shows the aggregated decision — the service's actual output, and the only thing
+  // sent back over serial. The raw 10 Hz stream stays visible in the log below.
+  const voteNote = v.window > 1
+      ? 'voted · ' + v.window + ' frames every ' + v.emit_every
+        + (v.hysteresis > 1 ? ' · hysteresis ' + v.hysteresis : '')
+      : 'per frame (voting off)';
+  banner.title = voteNote;
   if(!running){
     banner.className = 'clsbanner';
-    banner.innerHTML = '<span class="muted">inference stopped — press Start to resume</span>';
-  } else if(d.current){
+    const why = d.reason && d.reason !== 'ok' ? ' — ' + d.reason : ' — press Start to resume';
+    banner.innerHTML = '<span class="muted">inference stopped' + why + '</span>';
+  } else if(d.decision){
     banner.className = 'clsbanner on';
-    banner.innerHTML = '<span class="clscls" style="color:' + clsColor(d.current.cls) + '">'
-        + d.current.cls + '</span><span class="clsconf">' + (d.current.conf * 100).toFixed(0) + '%</span>';
+    banner.innerHTML = '<span class="clscls" style="color:' + clsColor(d.decision.cls) + '">'
+        + d.decision.cls + '</span>'
+        + '<span class="clsconf">' + (d.decision.conf * 100).toFixed(0) + '%</span>'
+        + '<span class="clsvote">' + voteNote + (d.decision.held ? ' · held' : '') + '</span>';
   } else {
     banner.className = 'clsbanner';
     banner.innerHTML = '<span class="muted">waiting for data (' + (d.sensor || '') + ')…</span>';
@@ -1014,10 +1208,15 @@ async function pollCls(){
     clsSince = Math.max(clsSince, e.id);
     const pct = (e.conf * 100).toFixed(0);
     const row = document.createElement('div'); row.className = 'clsrow';
+    // Mark the frame that closed a vote window, so an outvoted noisy frame is visible.
+    const dec = (e.decision === null || e.decision === undefined) ? '' :
+      '<span class="clsdec" style="color:' + clsColor(CLS_NAMES[e.decision]) + '">◀ '
+        + (CLS_NAMES[e.decision] || e.decision) + '</span>';
     row.innerHTML = '<span class="clstime">' + e.clock + '</span>'
       + '<span class="clsname" style="color:' + clsColor(e.cls) + '">' + e.cls + '</span>'
       + '<span class="clsbar"><i style="width:' + pct + '%;background:' + clsColor(e.cls) + '"></i></span>'
-      + '<span class="clspct">' + pct + '%</span>';
+      + '<span class="clspct">' + pct + '%</span>'
+      + '<span class="clsdeccol">' + dec + '</span>';
     log.insertBefore(row, log.firstChild);
   }
   while(log.childNodes.length > 3000) log.removeChild(log.lastChild);
@@ -1057,6 +1256,7 @@ async function tick(){
       const zb = document.getElementById('zeroBtn');
       zb.textContent = d.zeroed ? 'Zeroed' : 'Zero';
       zb.classList.toggle('rec-on', !!d.zeroed);
+      syncSourceBtn(d);
       const f = document.getElementById('freq');
       if(document.activeElement !== f) f.value = d.hz;
 

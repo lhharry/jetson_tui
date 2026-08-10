@@ -8,6 +8,11 @@ read is virtually never 8 consecutive plausible step sizes.
 This module is only the decoder: ``read_frames`` is a silent generator over
 ``{"t", "accel", "gyro"}`` — no files, no printing, no threads. ``serial_service.SerialImuService``
 is what turns it into a sensor source the web server, recorder and CLS can consume.
+
+Two entry points, differing only in who owns the port. ``read_frames`` opens and closes it, which
+is all a read-only consumer needs. ``decode_frames`` takes an already-open port and leaves it
+open, so a caller that also has to *write* to the device — sending inference results back to the
+Arduino — can hold the single handle and share it between its reader thread and its writer.
 """
 
 from __future__ import annotations
@@ -54,6 +59,61 @@ def _find_offset(b, magic: bytes, frame_len: int) -> int | None:
     return None
 
 
+def decode_frames(
+    ser: "serial.Serial",
+    *,
+    magic: str = "",
+    stop: threading.Event | None = None,
+) -> Iterator[dict]:
+    
+    """Yield one ``{"t", "accel": [ax,ay,az], "gyro": [gx,gy,gz]}`` per frame off an **already
+    open** port, ``t`` in seconds on the source's own clock.
+
+    The port belongs to the caller: it is never closed here, so the caller can keep writing to it
+    (or reopen on its own schedule). ``magic`` is the header as a hex string (e.g. "5aa5"); empty
+    means no header. Loss of sync (header mismatch or a timestamp jump) silently re-runs alignment
+    and keeps going, so the generator only ends when ``stop`` is set or the caller closes it.
+    """
+    magic_b = bytes.fromhex(magic) if magic else b""
+    frame_len = len(magic_b) + PAYLOAD
+    sync_bytes = frame_len * (SYNC_FRAMES + 1)
+
+    ser.reset_input_buffer()
+    buf = bytearray()
+    synced = False
+    last_t = None
+    while stop is None or not stop.is_set():
+        chunk = ser.read(max(1, ser.in_waiting))
+        if chunk:
+            buf += chunk
+
+        if not synced:
+            if len(buf) < sync_bytes:
+                continue
+            off = _find_offset(buf, magic_b, frame_len)
+            if off is None:
+                del buf[:len(buf) - sync_bytes + 1]   # every phase in here is ruled out
+                continue
+            del buf[:off]
+            synced = True
+            last_t = None
+
+        while len(buf) >= frame_len:
+            v = _frame_at(buf, 0, magic_b, frame_len)
+            if v is None:                     # only reachable with a header configured
+                synced = False
+                break
+            ax, ay, az, gx, gy, gz, t = v
+            # Timestamp sanity. Don't consume the frame — let _find_offset decide whether
+            # bytes were lost or the source's clock just restarted.
+            if last_t is not None and not (DT_MIN < t - last_t < DT_MAX):
+                synced = False
+                break
+            del buf[:frame_len]
+            last_t = t
+            yield {"t": t, "accel": [ax, ay, az], "gyro": [gx, gy, gz]}
+
+
 def read_frames(
     port: str = DEFAULT_PORT,
     baud: int = DEFAULT_BAUD,
@@ -61,56 +121,16 @@ def read_frames(
     magic: str = "",
     stop: threading.Event | None = None,
 ) -> Iterator[dict]:
-    """Yield one ``{"t", "accel": [ax,ay,az], "gyro": [gx,gy,gz]}`` per frame, ``t`` in seconds
-    on the source's own clock.
+    """``decode_frames`` on a port this function opens and closes.
 
-    ``magic`` is the header as a hex string (e.g. "5aa5"); empty means no header. Loss of sync
-    (header mismatch or a timestamp jump) silently re-runs alignment and keeps going, so the
-    generator only ends when ``stop`` is set or the caller closes it — the port is closed either
-    way. Opening is lazy (generator semantics): the port opens on the first item.
+    Opening is lazy (generator semantics): the port opens on the first item and is closed when the
+    generator ends — whether that is ``stop`` being set or the caller closing it.
 
         for f in read_frames("COM5", 115200):
             print(f["t"], f["accel"], f["gyro"])
     """
-    magic_b = bytes.fromhex(magic) if magic else b""
-    frame_len = len(magic_b) + PAYLOAD
-    sync_bytes = frame_len * (SYNC_FRAMES + 1)
-
     ser = serial.Serial(port, baud, timeout=1)
-    ser.reset_input_buffer()
-    buf = bytearray()
-    synced = False
-    last_t = None
     try:
-        while stop is None or not stop.is_set():
-            chunk = ser.read(max(1, ser.in_waiting))
-            if chunk:
-                buf += chunk
-
-            if not synced:
-                if len(buf) < sync_bytes:
-                    continue
-                off = _find_offset(buf, magic_b, frame_len)
-                if off is None:
-                    del buf[:len(buf) - sync_bytes + 1]   # every phase in here is ruled out
-                    continue
-                del buf[:off]
-                synced = True
-                last_t = None
-
-            while len(buf) >= frame_len:
-                v = _frame_at(buf, 0, magic_b, frame_len)
-                if v is None:                     # only reachable with a header configured
-                    synced = False
-                    break
-                ax, ay, az, gx, gy, gz, t = v
-                # Timestamp sanity. Don't consume the frame — let _find_offset decide whether
-                # bytes were lost or the source's clock just restarted.
-                if last_t is not None and not (DT_MIN < t - last_t < DT_MAX):
-                    synced = False
-                    break
-                del buf[:frame_len]
-                last_t = t
-                yield {"t": t, "accel": [ax, ay, az], "gyro": [gx, gy, gz]}
+        yield from decode_frames(ser, magic=magic, stop=stop)
     finally:
         ser.close()

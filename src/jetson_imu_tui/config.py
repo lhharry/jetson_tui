@@ -23,13 +23,17 @@ class AppConfig:
     web_host: str = "::"
     web_port: int = 8000
     # Sample source: the two I2C BNO055s, or one IMU streaming binary frames over serial.
-    # ``sample_hz`` is the wire rate in both cases (it drives the CLS decimation).
+    # ``source_kind`` is only the *boot* default — the web UI switches at runtime.
     source_kind: str = "i2c"
     serial_port: str = "/dev/ttyACM0"
     serial_baud: int = 115200
     serial_label: str = "Left"
     serial_magic: str = ""
     serial_gyro_units: str = "deg"
+    # Wire rate of the serial device. Defaults to ``sample_hz`` (the I2C rate); it exists
+    # separately because the two sources can be swapped at runtime and the rate drives the
+    # CLS decimation, so one global value cannot be right for both if they differ.
+    serial_sample_hz: int = 100
     # Real-time activity classification (CLS page). Disabled unless a checkpoint is present.
     cls_enabled: bool = True
     cls_model_path: str = ""
@@ -37,10 +41,19 @@ class AppConfig:
     cls_target_hz: float = 10.0
     cls_window: int = 20
     cls_stride: int = 1
+    # Temporal aggregation of frame predictions into one stable decision (see cls/vote.py).
+    vote_enabled: bool = True
+    vote_window: int = 5
+    vote_emit_every: int = 5
+    vote_hysteresis: int = 0
 
     @property
     def labels(self) -> list[str]:
         return [self.bus_labels[k] for k in sorted(self.bus_labels)]
+
+    def sample_hz_for(self, kind: str) -> int:
+        """Wire rate of one source kind — what ``start_sampling`` and CLS decimation need."""
+        return self.serial_sample_hz if kind == "serial" else self.sample_hz
 
 
 def load_config(path: Path | None = None) -> AppConfig:
@@ -51,11 +64,13 @@ def load_config(path: Path | None = None) -> AppConfig:
     bus_labels = {int(k): str(v) for k, v in buses_raw.items()}
     defaults = raw.get("defaults", {})
     cls = raw.get("cls", {})
+    vote = cls.get("vote", {})
     source = raw.get("source", {})
+    sample_hz = int(defaults.get("sample_hz", 100))
     return AppConfig(
         bus_labels=bus_labels or {1: "Left", 7: "Right"},
         log_dir=Path(defaults.get("log_dir", "./logs")).expanduser(),
-        sample_hz=int(defaults.get("sample_hz", 100)),
+        sample_hz=sample_hz,
         plot_fps=int(defaults.get("plot_fps", 15)),
         plot_window_seconds=float(defaults.get("plot_window_seconds", 10.0)),
         record_hz=int(defaults.get("record_hz", 100)),
@@ -67,10 +82,15 @@ def load_config(path: Path | None = None) -> AppConfig:
         serial_label=str(source.get("label", "Left")),
         serial_magic=str(source.get("magic", "")),
         serial_gyro_units=str(source.get("gyro_units", "deg")).lower(),
+        serial_sample_hz=int(source.get("sample_hz", sample_hz)),
         cls_enabled=bool(cls.get("enabled", True)),
         cls_model_path=str(cls.get("model_path", "")),
         cls_sensor=str(cls.get("sensor", "Left")),
         cls_target_hz=float(cls.get("target_hz", 10.0)),
         cls_window=int(cls.get("window", 20)),
         cls_stride=int(cls.get("stride", 1)),
+        vote_enabled=bool(vote.get("enabled", True)),
+        vote_window=int(vote.get("window", 5)),
+        vote_emit_every=int(vote.get("emit_every", 5)),
+        vote_hysteresis=int(vote.get("hysteresis", 0)),
     )

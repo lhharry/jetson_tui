@@ -41,7 +41,9 @@ class Recorder:
         self._files: dict[str, TextIOWrapper] = {}
         self._cls_file: TextIOWrapper | None = None
         self._model_file: TextIOWrapper | None = None
+        self._vote_file: TextIOWrapper | None = None
         self._model_cursor: float = 0.0
+        self._decision_cursor: float = 0.0
 
     def __enter__(self) -> "Recorder":
         self.folder.mkdir(parents=True, exist_ok=True)
@@ -59,6 +61,8 @@ class Recorder:
         # cls.csv: Time, cls, conf, <one column per class prob>. Only when CLS is active.
         # model_input.csv: the exact 6-channel vectors (raw accel+gyro of the CLS sensor)
         # fed to the model, at the model's own rate — enough to replay inference offline.
+        # cls_vote.csv: the aggregated decisions — the service's actual output. Pairing it with
+        # cls.csv is what lets frame-level and post-vote accuracy be evaluated separately.
         if self._cls is not None and self._cls.enabled:
             fh = open(self.folder / "cls.csv", "w", encoding="utf-8", newline="")
             fh.write(",".join(["Time", "cls", "conf", *self._cls.classes]) + "\n")
@@ -66,6 +70,11 @@ class Recorder:
             mf = open(self.folder / "model_input.csv", "w", encoding="utf-8", newline="")
             mf.write("Time,acc_x,acc_y,acc_z,gyro_x,gyro_y,gyro_z\n")
             self._model_file = mf
+            vf = open(self.folder / "cls_vote.csv", "w", encoding="utf-8", newline="")
+            vf.write(
+                ",".join(["Time", "vote_cls", "vote_conf", *self._cls.classes, "n_frames"]) + "\n"
+            )
+            self._vote_file = vf
         # Drain cursor + a monotonic->wall-clock reference. The ring buffer only stores
         # monotonic timestamps, so batched samples get their own wall-clock time from this
         # reference rather than all sharing datetime.now() at write time.
@@ -73,6 +82,7 @@ class Recorder:
         self._t0_wall = datetime.now()
         self._cursor = self._t0_mono
         self._model_cursor = self._t0_mono
+        self._decision_cursor = self._t0_mono
         self._thread = threading.Thread(target=self._loop, daemon=True)
         self._thread.start()
         return self
@@ -87,7 +97,7 @@ class Recorder:
             except Exception:
                 pass
         self._files.clear()
-        for attr in ("_cls_file", "_model_file"):
+        for attr in ("_cls_file", "_model_file", "_vote_file"):
             fh = getattr(self, attr)
             if fh is not None:
                 try:
@@ -127,9 +137,11 @@ class Recorder:
         Reuses ``ImuService.samples_since`` (the plot's data source), so CSV row == plot point
         == sampler sample by construction: no duplicated or dropped rows. ``limit=None`` means a
         late tick never drops data; the cursor advancing past written samples means no dup."""
-        # Model input runs at the CLS rate (~10 Hz), independent of the 100 Hz IMU drain, so
-        # pull it first — even on ticks with no new IMU sample — to capture the exact stream.
+        # Model input and decisions run at the CLS rates, independent of the 100 Hz IMU drain,
+        # so pull them first — even on ticks with no new IMU sample — to capture the exact
+        # streams rather than only what happens to coincide with a sample.
         self._drain_model_input()
+        self._drain_decisions()
         samples = self._service.samples_since(self._cursor, limit=None)
         if not samples:
             return 0
@@ -169,6 +181,36 @@ class Recorder:
             vals = (*inp["acc"], *inp["gyr"])
             self._model_file.write(",".join([ts, *(f"{v:.6f}" for v in vals)]) + "\n")
             self._model_cursor = inp["t"]
+
+    def _drain_decisions(self) -> None:
+        """Write every aggregated decision newer than the decision cursor to cls_vote.csv,
+        oldest first, then advance the cursor.
+
+        One row per decision at its own rate — deliberately *not* step-held to the IMU rate the
+        way cls.csv is, so the file is the decision stream with its real timestamps."""
+        if self._vote_file is None:
+            return
+        n_probs = len(self._cls.classes)
+        for d in self._cls.decisions_since(self._decision_cursor):
+            ts = (self._t0_wall + timedelta(seconds=d["t"] - self._t0_mono)).strftime(
+                "%H:%M:%S.%f"
+            )
+            probs = d.get("probs") or []
+            prob_cells = [f"{p:.6f}" for p in probs[:n_probs]]
+            prob_cells += ["" for _ in range(n_probs - len(prob_cells))]
+            self._vote_file.write(
+                ",".join(
+                    [
+                        ts,
+                        str(d.get("cls", "")),
+                        f"{d.get('conf', 0.0):.6f}",
+                        *prob_cells,
+                        str(d.get("n", "")),
+                    ]
+                )
+                + "\n"
+            )
+            self._decision_cursor = d["t"]
 
     def _cls_row_cells(self) -> list[str]:
         """cls/conf/probs cells for one cls.csv row, or empty cells before the first

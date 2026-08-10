@@ -11,6 +11,13 @@ accelerometer and gyroscope, so ``euler`` and ``quat`` are always None (Euler/Qu
 the 3D cube and the two matching CSVs stay empty), calibration status is unavailable, and the
 axis remap is read-only — that mapping is configured on the Arduino, not writable from here.
 
+The link is **bidirectional**: ``send_result`` writes one byte back per aggregated classification
+decision, so the Arduino that supplies the IMU is also the consumer of the model output over the
+same cable. This class owns the ``serial.Serial`` handle for that reason (``decode_frames`` takes
+an open port rather than opening its own) and guards it with ``_io_lock``, which the reader thread
+holds only to publish or clear the handle — never across a blocking read — so a writer waits
+microseconds at most and never sees a half-closed port.
+
 Two invariants keep the rest of the app working unchanged:
 
 * Buffered ``"t"`` is the host's ``time.monotonic()`` at decode, exactly like
@@ -42,7 +49,7 @@ from jetson_imu_tui.imu_common import (
     is_valid_config,
     placement_for,
 )
-from jetson_imu_tui.read_serial import DEFAULT_BAUD, DEFAULT_PORT, read_frames
+from jetson_imu_tui.read_serial import DEFAULT_BAUD, DEFAULT_PORT, decode_frames
 from jetson_imu_tui.ring_buffer import RingBuffer
 
 # Wait this long before re-opening the port after a failed open or a dropped link. Long enough
@@ -82,6 +89,16 @@ class SerialImuService:
         self._thread: threading.Thread | None = None
         self._connected = False
         self.error: Exception | None = None  # last reader failure, for status reporting
+
+        # The open port, shared between the reader thread and ``send_result``. ``_io_lock``
+        # guards publishing/clearing it and the writes themselves; it is never held across a
+        # read, so the CLS thread never blocks behind the reader's 1 s read timeout.
+        self._ser: serial.Serial | None = None
+        self._io_lock = threading.Lock()
+        # Rate limits: the reader retries every REOPEN_DELAY_S and results are written
+        # continuously, so both failures log once per episode rather than on every attempt.
+        self._open_err_logged = False
+        self._tx_err_logged = False
 
     # --- lifecycle ---------------------------------------------------------
     @property
@@ -140,11 +157,28 @@ class SerialImuService:
             self._thread = None
 
     def _read_loop(self) -> None:
-        """Decode frames into the ring buffer, re-opening the port until told to stop."""
+        """Decode frames into the ring buffer, re-opening the port until told to stop.
+
+        Owns the port so ``send_result`` can write to the same handle: it is published under
+        ``_io_lock`` while live and cleared *before* being closed, so a concurrent writer sees
+        either an open port or None."""
         while not self._stop.is_set():
-            frames = read_frames(self._port, self._baud, magic=self._magic, stop=self._stop)
             try:
-                for f in frames:
+                ser = serial.Serial(self._port, self._baud, timeout=1)
+            except Exception as err:  # device not plugged in (yet)
+                self.error = err
+                self._connected = False
+                if not self._open_err_logged:
+                    logger.warning(f"{self._label}: cannot open {self._port} ({err}) — retrying")
+                    self._open_err_logged = True
+                self._stop.wait(REOPEN_DELAY_S)
+                continue
+            with self._io_lock:
+                self._ser = ser
+                self._open_err_logged = False
+                self._tx_err_logged = False
+            try:
+                for f in decode_frames(ser, magic=self._magic, stop=self._stop):
                     gx, gy, gz = f["gyro"]
                     self._buf.append({
                         "t": time.monotonic(),
@@ -158,8 +192,40 @@ class SerialImuService:
                 self._connected = False
                 logger.warning(f"{self._label}: serial read failed ({err}) — retrying")
             finally:
-                frames.close()
+                with self._io_lock:
+                    self._ser = None
+                    try:
+                        ser.close()
+                    except Exception:
+                        pass
             self._stop.wait(REOPEN_DELAY_S)
+
+    # --- result return channel ----------------------------------------------
+    def send_result(self, index: int) -> bool:
+        """Write one classification-result byte back to the device. Returns True if written.
+
+        Called from the CLS inference thread once per aggregated decision (2 Hz at the shipped
+        settings), so it must never raise and never block: a closed port is simply silence — the
+        reader thread is already retrying, and the agreed protocol has no 'no result' sentinel.
+        One byte at 115200 baud needs no ``flush()``; the write reaches the OS buffer directly."""
+        if not isinstance(index, int) or not 0 <= index <= 255:
+            logger.warning(f"{self._label}: refusing to send out-of-range result {index!r}")
+            return False
+        with self._io_lock:
+            ser = self._ser
+            if ser is None:
+                return False
+            try:
+                ser.write(bytes([index]))
+            except Exception as err:
+                # Results stream continuously; log the first failure and stay quiet until one
+                # succeeds again, so an unplugged Arduino cannot flood the log.
+                if not self._tx_err_logged:
+                    logger.warning(f"{self._label}: result write failed ({err})")
+                    self._tx_err_logged = True
+                return False
+            self._tx_err_logged = False
+            return True
 
     # --- data --------------------------------------------------------------
     def _latest_raw(self) -> dict | None:

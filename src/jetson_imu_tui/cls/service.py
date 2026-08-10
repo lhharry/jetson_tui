@@ -14,11 +14,20 @@ a full ``decim`` samples ever form a vector, so a late tick yields two correct v
 than one over-wide one. A raw-resolution gap check drops the whole window at a discontinuity
 so inference never runs across a stall.
 
+Per-frame predictions are not the service's output. They are pushed through an injected
+``aggregator`` (``cls.vote.SoftVoter``) which averages several frames into one stable
+**decision** — frame-level predictions are too noisy for a downstream controller to act on
+directly. Only decisions reach ``on_result``, the sink that writes the class index back to the
+device. The aggregator is only ever asked to ``push`` and ``reset``, so this module knows nothing
+about how it aggregates, and nothing about where the result goes.
+
 The web UI can ``pause()``/``resume()`` the service at runtime (``POST /cls/toggle``):
 while paused the loop idles without pulling samples or running the model, so inference
 stops competing with the sampler threads; the checkpoint stays loaded for instant resume.
-All buffer mutation happens on the loop thread (``pause``/``resume`` only signal via
-``_cursor_reset``), so the window can never be cleared mid-inference by a web request.
+``set_source`` likewise re-points the service at a different sensor source (the web UI switching
+between the I2C IMUs and a serial one) without reloading the checkpoint.
+All buffer mutation happens on the loop thread (``pause``/``resume``/``set_source`` only signal
+via ``_cursor_reset``), so the window can never be cleared mid-inference by a web request.
 
 Fails safe: if ``torch`` or the checkpoint is missing, or ``sample_hz`` is not an integer
 multiple of ``target_hz``, the service stays ``enabled=False`` and never touches the
@@ -30,6 +39,7 @@ from __future__ import annotations
 import threading
 import time
 from collections import deque
+from collections.abc import Callable
 from datetime import datetime
 from pathlib import Path
 from typing import TYPE_CHECKING
@@ -38,6 +48,7 @@ import numpy as np
 from loguru import logger
 
 from jetson_imu_tui.cls.model import CLASSES
+from jetson_imu_tui.cls.vote import SoftVoter
 from jetson_imu_tui.ring_buffer import RingBuffer
 
 if TYPE_CHECKING:  # hint only — importing a concrete source here would drag in its deps.
@@ -63,6 +74,8 @@ class ClsService:
         window: int = 20,
         stride: int = 1,
         log_size: int = 3000,
+        aggregator: SoftVoter | None = None,
+        on_result: Callable[[int], None] | None = None,
     ) -> None:
         self._service = service
         self._model_path = Path(model_path)
@@ -76,6 +89,11 @@ class ClsService:
         # unless the ratio is an exact integer — the reshape in ``_infer`` relies on it.
         self._decim = max(1, int(round(self._sample_hz / self._target_hz)))
 
+        # Frame predictions -> stable decisions. Injected so the scheme is swappable; the
+        # default (window=1) is an exact passthrough, i.e. one decision per inference.
+        self._agg = aggregator if aggregator is not None else SoftVoter(window=1, emit_every=1)
+        self._on_result = on_result
+
         self._clf = None
         self._enabled = False
         self._reason = "not started"
@@ -84,6 +102,9 @@ class ClsService:
         # inference — so CLS stops competing with the sampler threads for CPU.
         self._paused = False
         self._cursor_reset = threading.Event()  # tells the loop to drop cursor + window
+        # Sensor source swap requested by a web thread, applied by the loop thread (see
+        # ``set_source``). Guarded by ``_log_lock``.
+        self._pending_source: tuple["SensorSource", float] | None = None
 
         # Rolling *raw* window: exactly window*decim samples, i.e. the span one inference
         # needs. Kept un-averaged so every window is rebuilt on a clean grid and can never
@@ -95,8 +116,12 @@ class ClsService:
         # Every 6-channel vector fed to the model, timestamped (monotonic). The recorder
         # drains this into model_input.csv so a recording captures the exact model input.
         self._input_buf = RingBuffer()
+        # Every aggregated decision, timestamped (monotonic) — the recorder drains this into
+        # cls_vote.csv, giving a recording both the frame-level and the post-vote stream.
+        self._decision_buf = RingBuffer()
         self._log: deque[dict] = deque(maxlen=int(log_size))
         self._current: dict | None = None
+        self._current_decision: dict | None = None
         self._next_id = 1
         self._log_lock = threading.Lock()
 
@@ -142,6 +167,8 @@ class ClsService:
         next_tick = time.monotonic()
         cursor = time.monotonic()  # only consume raw samples newer than this
         while not self._stop.is_set():
+            if self._pending_source is not None:
+                self._apply_pending_source()
             if self._cursor_reset.is_set():
                 self._cursor_reset.clear()
                 cursor = time.monotonic()
@@ -161,11 +188,35 @@ class ClsService:
     def _reset_window(self) -> None:
         """Drop all buffered raw data so the next window starts on a clean grid.
 
+        The aggregator is reset with it: a partial vote window spanning a discontinuity would
+        average predictions from either side of a stall, a pause or a source switch.
+
         Loop-thread only: web-thread callers signal via ``_cursor_reset`` instead."""
         self._raw.clear()
         self._group.clear()
         self._last_raw_t = None
         self._groups_since_pred = 0
+        self._agg.reset()
+
+    def _apply_pending_source(self) -> None:
+        """Land a ``set_source`` request. Loop-thread only — ``_raw`` is rebuilt here.
+
+        Re-pointing is all that is needed for the model itself: the window is rebuilt from raw
+        samples on every inference, so nothing carries over from the old source."""
+        with self._log_lock:
+            pending, self._pending_source = self._pending_source, None
+        if pending is None:
+            return
+        service, sample_hz = pending
+        self._service = service
+        self._sample_hz = float(sample_hz)
+        self._decim = max(1, int(round(self._sample_hz / self._target_hz)))
+        # maxlen is fixed at construction, so a changed decim needs a fresh deque.
+        self._raw = deque(maxlen=self._window * self._decim)
+        self._reset_window()
+        logger.info(
+            f"CLS source swapped (sample_hz={self._sample_hz:g}, decim={self._decim})"
+        )
 
     def _push_raw(self, sample: dict) -> None:
         """Feed one raw sample: emits a model-rate vector every ``decim`` samples and runs
@@ -189,9 +240,9 @@ class ClsService:
         self._groups_since_pred += 1
         if self._groups_since_pred >= self._stride and len(self._raw) == self._raw.maxlen:
             self._groups_since_pred = 0
-            self._infer()
+            self._infer(t)
 
-    def _infer(self) -> None:
+    def _infer(self, t: float) -> None:
         try:
             # Rebuild the window from raw: exactly ``decim`` samples per row, grid-aligned
             # because we only get here on a group boundary. Bit-identical to
@@ -205,18 +256,53 @@ class ClsService:
         except Exception as err:  # pragma: no cover - runtime safety, never kill the thread
             logger.warning(f"CLS inference error: {err}")
             return
+        idx = int(np.argmax(probs))
+        # Aggregate before building the entry: the entry dict is handed to HTTP threads via
+        # ``_log`` and must never be mutated afterwards, so "did this frame produce a decision"
+        # has to be known up front.
+        decision = self._agg.push(probs)
         entry = {
             "id": self._next_id,
             "t": time.time(),
             "clock": datetime.now().strftime("%H:%M:%S"),
             "cls": cls_name,
             "conf": conf,
+            "idx": idx,
             "probs": [float(p) for p in probs],
+            "decision": decision.index if decision is not None else None,
         }
+        decided: dict | None = None
+        if decision is not None:
+            decided = {
+                "t": t,
+                "clock": entry["clock"],
+                "idx": decision.index,
+                "cls": self._class_name(decision.index),
+                "conf": decision.confidence,
+                "probs": decision.probs,
+                "n": decision.n_frames,
+                "held": decision.held,
+            }
         with self._log_lock:
             self._next_id += 1
             self._log.append(entry)
             self._current = entry
+            if decided is not None:
+                self._current_decision = decided
+        if decided is not None:
+            self._decision_buf.append(decided)
+            # Outside the lock: the sink writes to a serial port, and a decision must never be
+            # able to stall an HTTP thread or kill this one.
+            sink = self._on_result
+            if sink is not None:
+                try:
+                    sink(decided["idx"])
+                except Exception as err:  # pragma: no cover - runtime safety
+                    logger.warning(f"CLS result sink failed: {err}")
+
+    @staticmethod
+    def _class_name(idx: int) -> str:
+        return CLASSES[idx] if 0 <= idx < len(CLASSES) else str(idx)
 
     # --- runtime switch ------------------------------------------------------
     def pause(self) -> None:
@@ -226,7 +312,9 @@ class ClsService:
         touching them here would race an in-flight ``_infer``."""
         with self._log_lock:
             self._paused = True
-            self._current = None  # don't show / record a stale prediction
+            # Don't show / record a stale prediction or decision.
+            self._current = None
+            self._current_decision = None
         self._cursor_reset.set()
 
     def resume(self) -> None:
@@ -243,6 +331,43 @@ class ClsService:
             self.pause()
         return not self._paused
 
+    def set_source(self, service: "SensorSource", *, sample_hz: float | None = None) -> str | None:
+        """Re-point at a different sensor source. Returns an error string, or None on success.
+
+        The checkpoint is *not* reloaded — the model is agnostic to where its samples came from,
+        so switching the web UI between the I2C IMUs and a serial one costs nothing but a window
+        refill. Like ``pause``/``resume``, this only signals: the loop thread performs the swap
+        and rebuilds the buffers on its next tick (≤ one CLS period), so it can never race an
+        in-flight inference.
+
+        A non-integral ``sample_hz / target_hz`` is refused rather than applied: the reshape in
+        ``_infer`` depends on that ratio, so the service pauses with a reason instead of feeding
+        the model mis-sized windows."""
+        hz = self._sample_hz if sample_hz is None else float(sample_hz)
+        if not self._enabled:
+            # No loop thread, so swap directly — and leave ``_reason`` alone: it holds why CLS
+            # is disabled (missing torch, bad checkpoint), which the page still needs to show.
+            self._service = service
+            self._sample_hz = hz
+            return None
+        decim = max(1, int(round(hz / self._target_hz)))
+        if abs(hz / self._target_hz - decim) > 1e-9:
+            reason = (
+                f"sample_hz ({hz:g}) must be an integer multiple of "
+                f"target_hz ({self._target_hz:g})"
+            )
+            logger.warning(f"CLS paused — {reason}")
+            self.pause()
+            with self._log_lock:
+                self._reason = reason
+            return reason
+        with self._log_lock:
+            self._pending_source = (service, hz)
+            if self._reason != "ok":
+                self._reason = "ok"
+        self._cursor_reset.set()
+        return None
+
     @property
     def running(self) -> bool:
         return self._enabled and not self._paused
@@ -257,12 +382,22 @@ class ClsService:
         """Label order the model emits probabilities in (matches ``predict`` / CLASSES)."""
         return list(CLASSES)
 
+    @property
+    def vote_config(self) -> dict[str, int]:
+        """The aggregator's knobs, for ``/cls`` and the UI."""
+        return self._agg.config
+
     def current(self) -> dict | None:
         """Thread-safe copy of the latest prediction (``cls``/``conf``/``probs``), or None.
 
         The recorder polls this per drain to persist the held prediction at 100 Hz."""
         with self._log_lock:
             return dict(self._current) if self._current else None
+
+    def current_decision(self) -> dict | None:
+        """Thread-safe copy of the latest aggregated decision — the service's actual output."""
+        with self._log_lock:
+            return dict(self._current_decision) if self._current_decision else None
 
     def inputs_since(self, t: float, limit: int | None = None) -> list[dict]:
         """Model-input samples ``{"t","acc","gyr"}`` newer than monotonic ``t``, oldest first.
@@ -271,19 +406,40 @@ class ClsService:
         sensor at the model's ``target_hz``); the recorder drains them into model_input.csv."""
         return self._input_buf.since(t, limit=limit)
 
+    def decisions_since(self, t: float, limit: int | None = None) -> list[dict]:
+        """Aggregated decisions newer than monotonic ``t``, oldest first.
+
+        One entry per decision at its own rate (``target_hz / (stride * emit_every)``), not
+        step-held — the recorder writes these to cls_vote.csv so a session holds the frame-level
+        stream and the post-vote stream side by side for offline comparison."""
+        return self._decision_buf.since(t, limit=limit)
+
     # --- web accessor ------------------------------------------------------
     def snapshot(self, since: int = 0) -> dict:
-        """Payload for GET /cls: enabled flag, current prediction, entries after ``since``."""
+        """Payload for GET /cls: enabled flag, latest decision, frame entries after ``since``."""
         if not self._enabled:
-            return {"enabled": False, "reason": self._reason, "current": None, "entries": []}
+            return {
+                "enabled": False,
+                "reason": self._reason,
+                "current": None,
+                "decision": None,
+                "entries": [],
+            }
         with self._log_lock:
             entries = [e for e in self._log if e["id"] > since]
             current = dict(self._current) if self._current else None
+            decision = dict(self._current_decision) if self._current_decision else None
             running = not self._paused
+            reason = self._reason
         return {
             "enabled": True,
             "running": running,
             "sensor": self._sensor,
             "current": current,
+            "decision": decision,
+            "vote": self._agg.config,
+            # Surfaced while enabled too: a refused ``set_source`` pauses the service, and
+            # without this the page would just go quiet with no explanation.
+            "reason": reason,
             "entries": entries,
         }

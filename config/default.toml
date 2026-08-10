@@ -2,13 +2,16 @@
 1 = "Right"
 7 = "Left"
 
-[source]                  # where samples come from
+[source]                  # boot default; the web UI can switch kinds at runtime (session only)
 kind = "i2c"              # "i2c" = BNO055 over I2C (see [buses]) | "serial" = binary frames from an Arduino/Simulink
 port = "/dev/ttyACM0"     # serial only; on Windows something like "COM5"
 baud = 115200
 label = "Left"            # label the serial IMU appears under; must match [cls] sensor
 magic = ""                # optional frame header in hex (e.g. "5aa5"); empty = align on the timestamp
 gyro_units = "deg"        # units the device sends: "deg" is scaled to rad/s, "rad" passes through
+# sample_hz = 100         # rate the device sends at; omit to inherit [defaults] sample_hz.
+                          # Only needed if the serial device's rate differs from the I2C rate —
+                          # it drives the CLS decimation, so a wrong value mis-sizes the window.
 
 [defaults]
 log_dir = "./logs"
@@ -26,3 +29,14 @@ sensor = "Left"           # which IMU label to classify (single-IMU model)
 target_hz = 10            # sampling rate feeding the model (matches training 10 Hz); sample_hz must be an integer multiple, or CLS self-disables
 window = 20               # samples per inference window (2 s @ 10 Hz)
 stride = 1                # emit a new prediction every N samples (1 = every 100 ms, sliding)
+
+[cls.vote]                # temporal aggregation: noisy 10 Hz frames -> one stable decision.
+                          # The decision is what the UI banner shows, what cls_vote.csv records,
+                          # and the only thing sent back over serial as a class-index byte.
+                          # Decision rate = target_hz / (stride * emit_every) = 2 Hz below.
+enabled = true            # false = passthrough (one decision per inference, as before)
+window = 5                # frames averaged per decision
+emit_every = 5            # frames between decisions; == window -> non-overlapping windows,
+                          # < window -> sliding (e.g. window 10 / emit_every 5 is steadier)
+hysteresis = 0            # 0 = switch as soon as the vote does; n > 1 = require n consecutive
+                          # windows to agree before the output class changes
