@@ -176,13 +176,20 @@ The same cable carries the classification result back. Each aggregated decision 
 6 stairdescent   7 sit   8 sit-to-stand   9 stand-to-sit   10 rampdescent
 ```
 
+> **The sketch must read its serial input, even if it ignores the value.** A device that only
+> transmits never drains its USB receive buffer; that buffer fills after a handful of results and
+> every further write blocks. The host caps each write (`WRITE_TIMEOUT_S`) so inference survives,
+> but from then on **no result reaches the device** — the UI shows `IMU: Serial (TX blocked)` and
+> the log says `result write failed — is the device reading its serial input?`.
+
 ```c
-// Arduino side
-if (Serial.available()) {
+// Arduino side — drain every loop(), not just when you feel like acting on it
+while (Serial.available()) {
   uint8_t cls = Serial.read();
-  if (millis() - last > 1500) failsafe();   // link went quiet
-  last = millis(); act(cls);
+  last = millis();
+  act(cls);
 }
+if (millis() - last > 1500) failsafe();   // link went quiet
 ```
 
 * **Rate:** one byte per decision — **2 Hz** at the shipped settings, not per frame.
@@ -190,8 +197,12 @@ if (Serial.available()) {
   nothing is sent; the link simply goes quiet. Time out on the Arduino if that matters.
 * **Serial source only.** Switch to the I2C IMUs and the port is closed, so transmission stops.
 * One `serial.Serial` handle is shared by the reader thread and the writer, so this needs no
-  second port. A write failure never reaches the inference thread — it is logged once and the
-  reader reconnects on its own.
+  second port. Writes are bounded and a failure never reaches the inference thread — it is logged
+  once, the result is dropped rather than queued, and the reader reconnects on its own.
+
+The source button distinguishes the three ways this can fail: `(no link)` the port will not open,
+`(no data)` it opened but no frames arrive, `(TX blocked)` frames arrive but results are not
+being accepted.
 
 ## Switching source at runtime
 

@@ -65,6 +65,16 @@ REOPEN_DELAY_S = 2.0
 # Measure the incoming frame rate over this long, then report it once per connection.
 RATE_REPORT_S = 3.0
 
+# Hard ceiling on a result write, and on waiting for the port lock. Both must be small: they are
+# paid on the CLS inference thread, and a transmitting device that never drains its receive
+# buffer would otherwise block the write *forever* (pyserial's default write_timeout is None).
+# One byte at 115200 baud takes ~87us, so 50 ms is enormous headroom; exceeding it means the
+# far end is not reading, and the protocol already treats a missing result as silence.
+WRITE_TIMEOUT_S = 0.05
+
+# No frame for this long means the stream has stopped, even though the port is still open.
+STALE_AFTER_S = 1.0
+
 GYRO_SCALE = {"rad": 1.0, "deg": math.pi / 180.0}
 
 
@@ -103,6 +113,9 @@ class SerialImuService:
         self._connected = False
         self.error: Exception | None = None  # last reader failure, for status reporting
         self.observed_hz: float | None = None  # measured wire rate, for checking sample_hz
+        self._last_frame_t: float | None = None  # monotonic time of the newest decoded frame
+        # None until the first result is written; False once the far end stops accepting them.
+        self.tx_ok: bool | None = None
 
         # The open port, shared between the reader thread and ``send_result``. ``_io_lock``
         # guards publishing/clearing it and the writes themselves; it is never held across a
@@ -127,7 +140,9 @@ class SerialImuService:
         if self._connected:
             return self.info()
         try:
-            serial.Serial(self._port, self._baud, timeout=1).close()
+            serial.Serial(
+                self._port, self._baud, timeout=1, write_timeout=WRITE_TIMEOUT_S
+            ).close()
         except Exception as err:
             self.error = err
             logger.warning(f"{self._label}: cannot open {self._port} ({err})")
@@ -145,7 +160,20 @@ class SerialImuService:
         return [ImuInfo(label=self._label, bus_id=-1, sensor_name=f"BNO055 (serial {self._port})")]
 
     def is_connected(self) -> bool:
+        """The port is open. Note this says nothing about frames actually arriving — a
+        transmitter that has gone quiet still leaves an openable port. See ``receiving``."""
         return self._connected
+
+    @property
+    def receiving(self) -> bool:
+        """A frame arrived recently, i.e. data is genuinely flowing.
+
+        The distinction matters when nothing appears to work: an open port with no frames looks
+        identical to a healthy one everywhere else, and the plots simply stop updating with no
+        explanation. The UI reports this separately so 'no link' and 'no data' are tellable
+        apart without reading the log."""
+        last = self._last_frame_t
+        return last is not None and (time.monotonic() - last) < STALE_AFTER_S
 
     # --- background sampling -----------------------------------------------
     @property
@@ -178,7 +206,10 @@ class SerialImuService:
         either an open port or None."""
         while not self._stop.is_set():
             try:
-                ser = serial.Serial(self._port, self._baud, timeout=1)
+                ser = serial.Serial(
+                    self._port, self._baud, timeout=1, write_timeout=WRITE_TIMEOUT_S
+                )
+                ser.reset_output_buffer()
             except Exception as err:  # device not plugged in (yet)
                 self.error = err
                 self._connected = False
@@ -205,6 +236,7 @@ class SerialImuService:
                         "gyro": [gx * self._gyro_scale, gy * self._gyro_scale, gz * self._gyro_scale],
                     })
                     self._connected = True
+                    self._last_frame_t = now
                     # Report the rate the device actually sends at, once per connection:
                     # ``sample_hz`` has to match it, and it is otherwise invisible.
                     n_frames += 1
@@ -237,25 +269,41 @@ class SerialImuService:
         Called from the CLS inference thread once per aggregated decision (2 Hz at the shipped
         settings), so it must never raise and never block: a closed port is simply silence — the
         reader thread is already retrying, and the agreed protocol has no 'no result' sentinel.
-        One byte at 115200 baud needs no ``flush()``; the write reaches the OS buffer directly."""
+        One byte at 115200 baud needs no ``flush()``; the write reaches the OS buffer directly.
+
+        Bounded twice over, because inference must not be hostage to the far end. A device that
+        never reads its serial input (a pure transmitter) leaves the host's write buffer full,
+        and an unbounded ``write`` would then block this thread permanently — stopping inference
+        outright. ``WRITE_TIMEOUT_S`` caps the write, and the lock is acquired with the same
+        timeout so a writer already stuck in one cannot hold up the next."""
         if not isinstance(index, int) or not 0 <= index <= 255:
             logger.warning(f"{self._label}: refusing to send out-of-range result {index!r}")
             return False
-        with self._io_lock:
+        if not self._io_lock.acquire(timeout=WRITE_TIMEOUT_S):
+            self.tx_ok = False
+            return False  # a previous write is still draining — drop this result, don't queue
+        try:
             ser = self._ser
             if ser is None:
                 return False
             try:
                 ser.write(bytes([index]))
             except Exception as err:
+                self.tx_ok = False
                 # Results stream continuously; log the first failure and stay quiet until one
-                # succeeds again, so an unplugged Arduino cannot flood the log.
+                # succeeds again, so an unplugged or non-reading device cannot flood the log.
                 if not self._tx_err_logged:
-                    logger.warning(f"{self._label}: result write failed ({err})")
+                    logger.warning(
+                        f"{self._label}: result write failed ({err}) — is the device reading "
+                        f"its serial input?"
+                    )
                     self._tx_err_logged = True
                 return False
             self._tx_err_logged = False
+            self.tx_ok = True
             return True
+        finally:
+            self._io_lock.release()
 
     # --- data --------------------------------------------------------------
     def _latest_raw(self) -> dict | None:

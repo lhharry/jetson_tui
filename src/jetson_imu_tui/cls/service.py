@@ -175,6 +175,11 @@ class ClsService:
                 self._reset_window()  # runs even while paused, so pause() never races us
             if not self._paused:
                 for sample in self._service.raw_samples_since(self._sensor, cursor):
+                    # Re-checked per sample, not just per tick: a batch can be large after a
+                    # stall, and pressing Stop must stop inference — and the results being
+                    # transmitted downstream — promptly rather than at the end of the batch.
+                    if self._paused:
+                        break
                     cursor = sample["t"]
                     self._push_raw(sample)
             next_tick += self._period
@@ -284,6 +289,11 @@ class ClsService:
                 "held": decision.held,
             }
         with self._log_lock:
+            # Stopped while this inference was running. ``pause`` sets the flag under this same
+            # lock, so checking it here makes the two mutually exclusive: once Stop returns,
+            # nothing further is published and — crucially — no further byte is transmitted.
+            if self._paused:
+                return
             self._next_id += 1
             self._log.append(entry)
             self._current = entry

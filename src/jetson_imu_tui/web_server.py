@@ -301,6 +301,14 @@ def _payload(state: ServerState, since: float | None = None) -> dict:
         "hz": state.record_hz,
         "source": state.source_kind,
         "source_connected": state.service.is_connected(),
+        # Open port != data arriving. Only the serial source can tell the two apart; the I2C
+        # sampler threads run whenever sensors are connected, so being connected is enough there.
+        "source_streaming": bool(
+            getattr(state.service, "receiving", state.service.is_connected())
+        ),
+        # Return channel health: None = nothing sent yet, False = the device is not accepting
+        # results (usually because its sketch never reads its serial input).
+        "source_tx": getattr(state.service, "tx_ok", None),
         "sources": _source_available(),
         "euler": {},
         "accel": {},
@@ -920,15 +928,24 @@ function syncSourceBtn(d){
   if(srcBusy) return;                       // don't fight an in-flight switch
   const serial = srcKind === 'serial';
   const linked = d.source_connected !== false;
-  btn.textContent = 'IMU: ' + (serial ? 'Serial' : 'I2C') + (linked ? '' : ' (no link)');
-  btn.classList.toggle('src-serial', serial && linked);
-  btn.classList.toggle('src-warn', !linked);
+  // "no link" = the port will not open; "no data" = it opened but nothing is arriving. Without
+  // the second, a silent transmitter is indistinguishable from a healthy one.
+  const streaming = d.source_streaming !== false;
+  // Results not being accepted is its own failure: data flows in fine, but the device is not
+  // reading its serial input, so nothing the model decides ever reaches it.
+  const txBad = d.source_tx === false;
+  const bad = !linked ? ' (no link)' : (!streaming ? ' (no data)' : (txBad ? ' (TX blocked)' : ''));
+  btn.textContent = 'IMU: ' + (serial ? 'Serial' : 'I2C') + bad;
+  btn.classList.toggle('src-serial', serial && linked && streaming && !txBad);
+  btn.classList.toggle('src-warn', !!bad);
   const other = serial ? 'i2c' : 'serial';
   const canSwitch = !srcSources || srcSources[other] !== false;
   btn.disabled = !canSwitch;
-  btn.title = canSwitch
-    ? 'Switch to the ' + (serial ? 'onboard I2C IMUs' : 'serial (Arduino) IMU')
-    : other + ' source unavailable on this install';
+  btn.title = txBad
+    ? 'Results are not being accepted — the device must read its serial input (Serial.read())'
+    : canSwitch
+      ? 'Switch to the ' + (serial ? 'onboard I2C IMUs' : 'serial (Arduino) IMU')
+      : other + ' source unavailable on this install';
 }
 
 function toggleView(){
