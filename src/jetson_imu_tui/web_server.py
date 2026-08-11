@@ -28,6 +28,7 @@ from jetson_imu_tui.cls.model import CLASSES
 from jetson_imu_tui.cls.service import ClsService
 from jetson_imu_tui.cls.vote import SoftVoter
 from jetson_imu_tui.config import AppConfig
+from jetson_imu_tui.control.service import ControlService
 from jetson_imu_tui.imu_common import PLACEMENTS
 from jetson_imu_tui.recorder import Recorder
 
@@ -162,19 +163,23 @@ class ServerState:
         self.record_hz = record_hz
         self.recorder: Recorder | None = None
         self.cls: "ClsService | None" = None
+        # Always present, even when [control] enabled = false: switch_source, shutdown and the
+        # recorder all reference it, and a None-check at each of those sites is one more place
+        # for the control path to go silently missing.
+        self.control: ControlService | None = None
         self._lock = threading.Lock()
 
     def toggle_zero(self) -> bool:
         return self.service.zero_toggle()
 
-    def emit_cls_result(self, index: int) -> None:
-        """Sink for aggregated CLS decisions: hand the class index to the active source.
+    def on_cls_decision(self, index: int) -> None:
+        """Sink for aggregated CLS decisions: hand the class index to the controller.
 
-        Duck-typed on purpose — only ``SerialImuService`` has ``send_result``, so this is
-        silently a no-op on I2C without ``cls/`` knowing that serial sources exist."""
-        send = getattr(self.service, "send_result", None)
-        if send is not None:
-            send(index)
+        The decision no longer goes on the wire by itself — the controller folds it into the
+        motor command it computes. Kept as an injected ``Callable[[int], None]`` so ``cls/``
+        still knows nothing about what consumes its output."""
+        if self.control is not None:
+            self.control.set_mode(index)
 
     def _stop_recorder_locked(self) -> bool:
         """Stop an active recording. Caller must hold ``_lock`` (which is not reentrant)."""
@@ -190,7 +195,8 @@ class ServerState:
         with self._lock:
             if self.recorder is None:
                 self.recorder = Recorder(
-                    self.service, self.log_dir, self.record_hz, cls=self.cls
+                    self.service, self.log_dir, self.record_hz,
+                    cls=self.cls, control=self.control,
                 ).__enter__()
                 return True
             self._stop_recorder_locked()
@@ -234,6 +240,15 @@ class ServerState:
                 notes.append("no sensor detected yet — will keep retrying")
 
             old, self.service, self.source_kind = self.service, new, kind
+            # Re-point the controller *before* the old source is torn down, then stop the
+            # motors on it. Order matters: `old.stop_sampling()` below closes the port, and
+            # whatever command was last written stays latched on the device forever. Doing
+            # this after the repoint means the loop can no longer race a live command onto
+            # `old`, and flush_stop is bounded (WRITE_TIMEOUT_S) so holding `_lock` across an
+            # HTTP request is safe.
+            if self.control is not None:
+                self.control.set_source(new)
+                self.control.flush_stop(old)
             if self.cls is not None:
                 # Re-points CLS without reloading the checkpoint; the loop thread clears the
                 # inference window and the vote buffer on its next tick.
@@ -266,7 +281,8 @@ class ServerState:
                 except Exception:
                     pass
                 self.recorder = Recorder(
-                    self.service, self.log_dir, self.record_hz, cls=self.cls
+                    self.service, self.log_dir, self.record_hz,
+                    cls=self.cls, control=self.control,
                 ).__enter__()
         return self.record_hz
 
@@ -275,6 +291,16 @@ class ServerState:
         return self.recorder is not None
 
     def shutdown(self) -> None:
+        # Controller first, so the motors are commanded to stop while the port is still open.
+        # Best-effort by nature: only a clean exit reaches this at all (SIGTERM, a crash and
+        # _free_port's SIGKILL escalation all bypass it, and every thread here is a daemon),
+        # which is why the device needs its own receive watchdog.
+        if self.control is not None:
+            try:
+                self.control.stop()
+            except Exception:
+                pass
+            self.control = None
         if self.cls is not None:
             try:
                 self.cls.stop()
@@ -307,8 +333,12 @@ def _payload(state: ServerState, since: float | None = None) -> dict:
             getattr(state.service, "receiving", state.service.is_connected())
         ),
         # Return channel health: None = nothing sent yet, False = the device is not accepting
-        # results (usually because its sketch never reads its serial input).
+        # commands (usually because its sketch never reads its serial input).
         "source_tx": getattr(state.service, "tx_ok", None),
+        # Controller status. Present even when disabled so the page can say so; `mode_age` is
+        # the one that matters most — a dead CLS leaves the loop quietly holding zero, which
+        # is safe but otherwise indistinguishable from healthy assistance at rest.
+        "control": state.control.snapshot() if state.control is not None else None,
         "sources": _source_available(),
         "euler": {},
         "accel": {},
@@ -442,6 +472,8 @@ def _make_source(cfg: AppConfig, kind: str) -> tuple["ImuService | SerialImuServ
             magic=cfg.serial_magic,
             layout=cfg.serial_layout,
             gyro_units=cfg.serial_gyro_units,
+            joint_units=cfg.serial_joint_units,
+            tx_magic=cfg.serial_tx_magic,
         ), None
     if kind != "i2c":
         return None, f'Unknown source kind "{kind}" — expected "i2c" or "serial"'
@@ -486,6 +518,21 @@ def run_server(cfg: AppConfig, host: str | None = None, port: int | None = None)
     service.start_sampling(cfg.sample_hz_for(cfg.source_kind))
 
     state = ServerState(cfg, service, cfg.log_dir, cfg.record_hz)
+    # Built before CLS so the decision sink has somewhere to land from the very first decision.
+    # Constructing it even when disabled keeps ServerState's control reference non-None, so the
+    # switch/shutdown paths have one shape instead of two.
+    state.control = ControlService(
+        service,
+        label=cfg.serial_label,
+        enabled=cfg.control_enabled,
+        rate_hz=cfg.control_rate_hz,
+        mode_timeout_s=cfg.control_mode_timeout_s,
+        sample_timeout_s=cfg.control_sample_timeout_s,
+        default_profile=cfg.control_default_profile,
+        pid_cfg=cfg.control_pid,
+        modes_cfg=cfg.control_modes,
+        profiles_cfg=cfg.control_profiles,
+    )
     if cfg.cls_enabled and cfg.cls_model_path:
         # Aggregation is always present; disabling it is a window of 1, i.e. one decision per
         # inference, which keeps ClsService to a single code path.
@@ -507,9 +554,23 @@ def run_server(cfg: AppConfig, host: str | None = None, port: int | None = None)
             window=cfg.cls_window,
             stride=cfg.cls_stride,
             aggregator=voter,
-            on_result=state.emit_cls_result,
+            on_result=state.on_cls_decision,
         )
         state.cls.start()
+        # The controller treats a mode older than mode_timeout_s as absent, so that timeout has
+        # to outlast several decision periods — including the 500 ms-1 s hole after any reset,
+        # while SoftVoter refills its window. Warn rather than adjust: the value is the
+        # operator's call, but a silently-too-short timeout looks like a dead controller.
+        # From the voter actually in use, not the config: with vote_enabled = false the voter is
+        # SoftVoter(1, 1) and the real decision period is stride/target_hz, not emit_every's.
+        emit_every = voter.config["emit_every"]
+        decision_period = (cfg.cls_stride * emit_every) / max(1e-9, cfg.cls_target_hz)
+        if cfg.control_enabled and cfg.control_mode_timeout_s < 3 * decision_period:
+            logger.warning(
+                f"control: mode_timeout_s={cfg.control_mode_timeout_s:g}s is under 3x the CLS "
+                f"decision period ({decision_period:.2f}s) — modes will expire between decisions"
+            )
+    state.control.start()
     poll_ms = max(20, int(1000 / max(1, cfg.plot_fps)))
     app = create_app(state, cfg.plot_window_seconds, poll_ms)
 
@@ -931,8 +992,8 @@ function syncSourceBtn(d){
   // "no link" = the port will not open; "no data" = it opened but nothing is arriving. Without
   // the second, a silent transmitter is indistinguishable from a healthy one.
   const streaming = d.source_streaming !== false;
-  // Results not being accepted is its own failure: data flows in fine, but the device is not
-  // reading its serial input, so nothing the model decides ever reaches it.
+  // Commands not being accepted is its own failure: data flows in fine, but the device is not
+  // reading its serial input, so no motor command ever reaches it.
   const txBad = d.source_tx === false;
   const bad = !linked ? ' (no link)' : (!streaming ? ' (no data)' : (txBad ? ' (TX blocked)' : ''));
   btn.textContent = 'IMU: ' + (serial ? 'Serial' : 'I2C') + bad;
@@ -942,7 +1003,7 @@ function syncSourceBtn(d){
   const canSwitch = !srcSources || srcSources[other] !== false;
   btn.disabled = !canSwitch;
   btn.title = txBad
-    ? 'Results are not being accepted — the device must read its serial input (Serial.read())'
+    ? 'Motor commands are not being accepted — the device must read its serial input (Serial.read())'
     : canSwitch
       ? 'Switch to the ' + (serial ? 'onboard I2C IMUs' : 'serial (Arduino) IMU')
       : other + ' source unavailable on this install';

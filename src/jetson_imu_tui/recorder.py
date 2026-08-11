@@ -22,14 +22,28 @@ def _hdr(labels: list[str], axes: tuple[str, ...]) -> str:
     return ",".join(cols) + "\n"
 
 
+CONTROL_COLUMNS = (
+    "profile", "ang_r", "vel_r", "ang_l", "vel_l",
+    "ref_r", "ref_l", "fb_r", "fb_l", "err_r", "err_l",
+    "cmd_r", "cmd_l", "enable", "stale", "sent",
+)
+
+
 class Recorder:
-    def __init__(self, service: "ImuService", log_dir: Path, hz: float, cls=None) -> None:
+    def __init__(
+        self, service: "ImuService", log_dir: Path, hz: float, cls=None, control=None
+    ) -> None:
         self._service = service
         self._labels = service.labels
         self._hz = float(hz)
         # Optional ClsService: when enabled, the held activity prediction is written to
         # cls.csv in lockstep with the IMU rows (one row per drained sample, 100 Hz).
         self._cls = cls
+        # Optional ControlService: control.csv gets one row per control tick. Its own file at
+        # its own rate, like model_input.csv — the control loop runs independently of the IMU
+        # drain, and stretching it onto the IMU grid would hide exactly the timing detail
+        # (jitter, missed ticks) that a loop-stability question needs.
+        self._control = control
         now = datetime.now()
         self.folder: Path = (
             Path(log_dir).expanduser()
@@ -42,8 +56,10 @@ class Recorder:
         self._cls_file: TextIOWrapper | None = None
         self._model_file: TextIOWrapper | None = None
         self._vote_file: TextIOWrapper | None = None
+        self._control_file: TextIOWrapper | None = None
         self._model_cursor: float = 0.0
         self._decision_cursor: float = 0.0
+        self._control_cursor: float = 0.0
 
     def __enter__(self) -> "Recorder":
         self.folder.mkdir(parents=True, exist_ok=True)
@@ -75,6 +91,13 @@ class Recorder:
                 ",".join(["Time", "vote_cls", "vote_conf", *self._cls.classes, "n_frames"]) + "\n"
             )
             self._vote_file = vf
+        # control.csv: one row per control tick — inputs, references, feedback, errors and the
+        # commands actually sent. All of it, because a velocity trace on its own cannot tell a
+        # bad profile table from an unstable loop.
+        if self._control is not None and self._control.enabled:
+            cf = open(self.folder / "control.csv", "w", encoding="utf-8", newline="")
+            cf.write(",".join(["Time", *CONTROL_COLUMNS]) + "\n")
+            self._control_file = cf
         # Drain cursor + a monotonic->wall-clock reference. The ring buffer only stores
         # monotonic timestamps, so batched samples get their own wall-clock time from this
         # reference rather than all sharing datetime.now() at write time.
@@ -83,6 +106,7 @@ class Recorder:
         self._cursor = self._t0_mono
         self._model_cursor = self._t0_mono
         self._decision_cursor = self._t0_mono
+        self._control_cursor = self._t0_mono
         self._thread = threading.Thread(target=self._loop, daemon=True)
         self._thread.start()
         return self
@@ -97,7 +121,7 @@ class Recorder:
             except Exception:
                 pass
         self._files.clear()
-        for attr in ("_cls_file", "_model_file", "_vote_file"):
+        for attr in ("_cls_file", "_model_file", "_vote_file", "_control_file"):
             fh = getattr(self, attr)
             if fh is not None:
                 try:
@@ -142,6 +166,7 @@ class Recorder:
         # streams rather than only what happens to coincide with a sample.
         self._drain_model_input()
         self._drain_decisions()
+        self._drain_control()
         samples = self._service.samples_since(self._cursor, limit=None)
         if not samples:
             return 0
@@ -211,6 +236,38 @@ class Recorder:
                 + "\n"
             )
             self._decision_cursor = d["t"]
+
+    def _drain_control(self) -> None:
+        """Write every control tick newer than the control cursor to control.csv.
+
+        Args:    none.
+        Returns: None. No-op unless a ControlService was supplied and is enabled.
+
+        One row per tick at the controller's own rate, like model_input.csv — not step-held
+        onto the IMU grid, so the file preserves the loop's real timing. Missing values (a tick
+        with no sample yet) are written as empty cells rather than zeros: zero is a meaningful
+        command here, and conflating "commanded 0" with "had nothing" would make the recording
+        lie about the one thing it exists to answer.
+        """
+        if self._control_file is None:
+            return
+        for row in self._control.entries_since(self._control_cursor):
+            ts = (self._t0_wall + timedelta(seconds=row["t"] - self._t0_mono)).strftime(
+                "%H:%M:%S.%f"
+            )
+            cells = [ts]
+            for key in CONTROL_COLUMNS:
+                v = row.get(key)
+                if v is None:
+                    cells.append("")
+                elif isinstance(v, bool):
+                    cells.append("1" if v else "0")
+                elif isinstance(v, (int, float)):
+                    cells.append(f"{v:.6f}")
+                else:
+                    cells.append(str(v))
+            self._control_file.write(",".join(cells) + "\n")
+            self._control_cursor = row["t"]
 
     def _cls_row_cells(self) -> list[str]:
         """cls/conf/probs cells for one cls.csv row, or empty cells before the first

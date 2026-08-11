@@ -111,10 +111,10 @@ Left/Right assignment or rename the IMUs.
 
 ## Serial source (Arduino / Simulink instead of I2C)
 
-The same app can run off **one IMU streaming binary frames over a serial port** — an Arduino (or
-a Simulink model) reading the BNO055 and forwarding it — instead of the Jetson reading the chips
-over I2C. Plots, recording and CLS all work; the link is bidirectional, with classification
-results going back to the Arduino (see below). The boot default is chosen in the config:
+The same app can run off **binary frames over a serial port** — an Arduino (or a Simulink model)
+reading the sensors and forwarding them — instead of the Jetson reading the chips over I2C.
+Plots, recording and CLS all work; the link is bidirectional, with motor velocity commands going
+back to the device (see below). The boot default is chosen in the config:
 
 ```toml
 [source]
@@ -122,22 +122,43 @@ kind = "serial"           # "i2c" (default) | "serial" — boot default; switcha
 port = "/dev/ttyACM0"     # "COM17" on Windows
 baud = 115200
 label = "Left"            # label the IMU appears under; must match [cls] sensor
-magic = "aa55"            # frame header in hex; required unless the layout carries a timestamp
+magic = "aa55"            # uplink frame header in hex; required unless the layout carries a timestamp
 layout = "gyro_accel"     # frame contents and channel order — see the table below
 gyro_units = "rad"        # units the device sends; "deg" is scaled to rad/s, "rad" passes through
+joint_units = "deg"       # units of the knee channels, on the control layouts
+tx_magic = "5aa5"         # downlink frame header; must match the device's Serial Receive Header
 sample_hz = 80            # rate the device sends at; omit to inherit [defaults] sample_hz
 ```
 
-**Wire format** (`read_serial.py`): an optional header followed by 6 or 7 little-endian float32.
-Accel is m/s² **including gravity**; `t`, where present, is the source's own clock in seconds.
-Pick the frame contents with `layout`:
+**Wire format** (`read_serial.py`): an optional header followed by little-endian float32. What
+those floats mean is an ordered list of **channel blocks**, so a frame that grows new channels
+costs one table row rather than a new decoder:
 
-| `layout` | floats | frame | typical source |
+| block | floats | contents |
+|---|---|---|
+| `enable` | 1 | the device's SWITCH line; non-zero = the controller may drive |
+| `accel` | 3 | `ax ay az`, m/s² **including gravity** |
+| `gyro` | 3 | `gx gy gz`, in the device's units (`gyro_units` converts) |
+| `knee4` | 4 | `ang_r vel_r ang_l vel_l` — knee angle + angular velocity, both legs |
+| `fb2` | 2 | `motor_pos_r motor_pos_l` |
+| `fb6` | 6 | `pos_r speed_r torque_r pos_l speed_l torque_l` |
+| `t` | 1 | the source's own clock in seconds — **must be the last block** |
+
+`layout` names a combination of them:
+
+| `layout` | floats | blocks | typical source |
 |---|---|---|---|
-| `accel_gyro_t` (default) | `ax ay az gx gy gz t` | 28 B + header | Simulink Serial Transmit, header `5aa5` |
-| `gyro_accel_t` | `gx gy gz ax ay az t` | 28 B + header | as above, channels swapped |
-| `accel_gyro` | `ax ay az gx gy gz` | 24 B + header | Arduino sketch, no clock |
-| `gyro_accel` | `gx gy gz ax ay az` | 24 B + header | Arduino sketch, no clock |
+| `accel_gyro_t` (default) | 7 | `accel gyro t` | Simulink Serial Transmit, header `5aa5` |
+| `gyro_accel_t` | 7 | `gyro accel t` | as above, channels swapped |
+| `accel_gyro` | 6 | `accel gyro` | Arduino sketch, no clock |
+| `gyro_accel` | 6 | `gyro accel` | Arduino sketch, no clock |
+| `{accel_gyro,gyro_accel}_knee4_fb2[_t]` | 13 / 14 | `enable … knee4 fb2 [t]` | exosuit rig — what the controller needs |
+| `{accel_gyro,gyro_accel}_knee4_fb6[_t]` | 17 / 18 | `enable … knee4 fb6 [t]` | as above, plus motor speed/torque for monitoring |
+
+A layout that does not carry a block reports it as `None`, never as a zero — so "this link has
+no knee channels" stays distinguishable from "the knees are at zero". The table is checked at
+import (block names, no duplicates, `t` last, declared float count), because a misplaced block
+shifts every channel after it and that failure is completely silent on the wire.
 
 **Alignment** needs a timestamp or a header, and the layout decides which. With a timestamp,
 byte alignment is recovered from it increasing monotonically, so the header is optional and a
@@ -166,39 +187,75 @@ empty cells), and the calibration popup. The axis remap is *reported* but not wr
 mapping is configured on the transmitting device, and it must match the one used to collect the
 training data (see the contract below).
 
-### Result return channel (Jetson → Arduino)
+### Command return channel (Jetson → device)
 
-The same cable carries the classification result back. Each aggregated decision is written as
-**one raw byte** — the class index, `0x00`–`0x0A`, in `CLASSES` order:
+The same cable carries the **motor velocity command** back, one frame per control tick:
 
 ```
-0 stand   1 walk   2 turn   3 jog   4 rampascent   5 stairascent
-6 stairdescent   7 sit   8 sit-to-stand   9 stand-to-sit   10 rampdescent
+5A A5 | float32 vel_r | float32 vel_l        10 bytes, little-endian, rad/s
 ```
+
+The classification result is no longer sent by itself — it selects which assistance profile the
+controller uses, and the controller's output is what goes on the wire. See **Assistance
+controller** below.
 
 > **The sketch must read its serial input, even if it ignores the value.** A device that only
-> transmits never drains its USB receive buffer; that buffer fills after a handful of results and
-> every further write blocks. The host caps each write (`WRITE_TIMEOUT_S`) so inference survives,
-> but from then on **no result reaches the device** — the UI shows `IMU: Serial (TX blocked)` and
-> the log says `result write failed — is the device reading its serial input?`.
+> transmits never drains its USB receive buffer; that buffer fills after a handful of commands and
+> every further write blocks. The host caps each write (`WRITE_TIMEOUT_S`) so the control loop
+> survives, but from then on **no command reaches the device** — the UI shows
+> `IMU: Serial (TX blocked)` and the log says `command write failed — is the device reading its
+> serial input?`.
 
 ```c
-// Arduino side — drain every loop(), not just when you feel like acting on it
-while (Serial.available()) {
-  uint8_t cls = Serial.read();
-  last = millis();
-  act(cls);
-}
-if (millis() - last > 1500) failsafe();   // link went quiet
+// Device side — drain every step, and fail safe when the link goes quiet
+if (Serial.available() >= 10) { readCommandFrame(&vel_r, &vel_l); last = millis(); }
+if (millis() - last > 200) { vel_r = vel_l = 0.0f; }   // watchdog: stop, do not hold
 ```
 
-* **Rate:** one byte per decision — **2 Hz** at the shipped settings, not per frame.
-* **No sentinel.** When there is no decision (CLS stopped, window still filling, a sensor stall)
-  nothing is sent; the link simply goes quiet. Time out on the Arduino if that matters.
-* **Serial source only.** Switch to the I2C IMUs and the port is closed, so transmission stops.
+* **Rate:** one frame per control tick — `[control] rate_hz`, 100 Hz shipped.
+* **Never silent while enabled.** Unlike the old result channel there is no "no decision" case:
+  every tick writes something, and everything that can go wrong (no mode, stale frame, enable
+  line low, an exception in the loop) writes **zero**. Zero velocity means the motor holds still.
+* **A device watchdog is still required.** Python commands zero on a clean shutdown and on a
+  source switch, but SIGTERM, a crash and `_free_port`'s SIGKILL escalation all bypass that, and
+  every thread here is a daemon. Hold-last-value on the device side would leave a motor running.
+* **Serial source only.** Switch to the I2C IMUs and a zero is written before the port closes.
 * One `serial.Serial` handle is shared by the reader thread and the writer, so this needs no
-  second port. Writes are bounded and a failure never reaches the inference thread — it is logged
-  once, the result is dropped rather than queued, and the reader reconnects on its own.
+  second port. Writes are bounded and a failure never reaches the control thread — it is logged
+  once, the tick's command is dropped rather than queued (the next tick carries a fresher one),
+  and the reader reconnects on its own. Non-finite and out-of-range commands are replaced/clamped
+  in `send_velocity`, so no controller bug can put them on the wire.
+
+### Assistance controller
+
+`src/jetson_imu_tui/control/` holds everything the Simulink models used to do between reading
+the sensors and packing a CAN frame. Simulink keeps only the CAN driver layer.
+
+```
+knee angle + angular velocity ──▶ profile (lookup curve + velocity feed-forward)
+                                     │  selected by the CLS decision via [control.modes]
+                                     ▼
+                              position reference
+                                     │
+   motor position feedback ─────▶ position loop (PID3/PID4 port) ──▶ velocity command ──▶ serial
+```
+
+* **Off by default** (`[control] enabled = false`). Everything else in this app only reads
+  sensors; this drives a motor.
+* Requires a `*_knee4_fb*` layout. Without motor feedback the position loop has nothing to close
+  on and the controller stays inactive with a reason in `/data`.
+* The profiles ship **inert** (zero tables, zero gain), so turning `enabled` on before filling
+  them in commands exactly zero rather than something arbitrary.
+* The loop is **not** a textbook PID: `u = kp·e + ki·∫e − kv·d/dt[LPF2(u)]`, where the third term
+  damps the controller's *own* output rate. Gains as found in the models are `kp = 7.5`,
+  `ki = 0`, `kv = 0.02`; `wn`/`zt`/`x0` for the lowpass live in the MATLAB base workspace and are
+  not recoverable from the `.slx`, so they ship as `wn = 0` (damping term disabled) until supplied.
+* **The loop now closes across the serial link** (~20–40 ms round trip) which the original did
+  not. That is destabilising at `kp = 7.5`, so the shipped config starts at `1.5`. Raise it with
+  `control.csv` open — it records `ang → ref → fb → err → cmd` per tick, which is the only way to
+  tell a bad profile table from an unstable loop.
+* `/data` exposes `control.mode_age`: a dead CLS leaves the loop quietly holding zero, which is
+  safe but otherwise indistinguishable from healthy assistance at rest.
 
 The source button distinguishes the three ways this can fail: `(no link)` the port will not open,
 `(no data)` it opened but no frames arrive, `(TX blocked)` frames arrive but results are not

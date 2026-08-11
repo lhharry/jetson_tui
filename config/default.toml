@@ -7,15 +7,26 @@ kind = "i2c"              # "i2c" = BNO055 over I2C (see [buses]) | "serial" = b
 port = "/dev/ttyACM0"     # serial only; on Windows something like "COM17"
 baud = 115200
 label = "Left"            # label the serial IMU appears under; must match [cls] sensor
-magic = "aa55"            # frame header in hex; required unless the layout carries a timestamp
-layout = "gyro_accel"     # frame contents, see read_serial.LAYOUTS:
+magic = "aa55"            # uplink frame header in hex; required unless the layout carries a timestamp
+layout = "gyro_accel"     # frame contents as an ordered list of channel blocks; see
+                          # read_serial.LAYOUTS / BLOCK_SIZES. IMU only:
                           #   accel_gyro_t  ax ay az gx gy gz t   (7 floats, Simulink)
                           #   gyro_accel_t  gx gy gz ax ay az t   (7 floats)
                           #   accel_gyro    ax ay az gx gy gz     (6 floats, no clock)
                           #   gyro_accel    gx gy gz ax ay az     (6 floats, no clock)
+                          # With knees + motor feedback, for the controller — prefix `enable`,
+                          # suffix `knee4` (ang_r vel_r ang_l vel_l) then feedback, `t` last:
+                          #   {accel_gyro,gyro_accel}_knee4_fb2[_t]   13 / 14 floats
+                          #   {accel_gyro,gyro_accel}_knee4_fb6[_t]   17 / 18 floats
+                          # fb2 = motor pos R,L. fb6 = pos/speed/torque per side.
                           # Channel order cannot be detected from the bytes: getting it wrong
                           # puts gravity in the gyro channels and degrades CLS silently.
 gyro_units = "rad"        # units the device sends: "deg" is scaled to rad/s, "rad" passes through
+joint_units = "deg"       # units of the four knee channels; same factor is applied to the angle
+                          # and the angular velocity, as the Simulink models do
+tx_magic = "5aa5"         # DOWNLINK frame header; must match the Header field of the device's
+                          # Serial Receive block. "" = unframed. Deliberately not aa55, so a
+                          # mis-wired loopback cannot look like a healthy uplink.
 sample_hz = 80            # rate the device sends at (measured 79.7 Hz); omit to inherit
                           # [defaults] sample_hz. Drives the CLS decimation, so it must divide
                           # [cls] target_hz evenly — 80/10 = 8. The serial reader logs the
@@ -40,7 +51,7 @@ stride = 1                # emit a new prediction every N samples (1 = every 100
 
 [cls.vote]                # temporal aggregation: noisy 10 Hz frames -> one stable decision.
                           # The decision is what the UI banner shows, what cls_vote.csv records,
-                          # and the only thing sent back over serial as a class-index byte.
+                          # and which [control.profiles] entry the controller assists with.
                           # Decision rate = target_hz / (stride * emit_every) = 2 Hz below.
 enabled = true            # false = passthrough (one decision per inference, as before)
 window = 5                # frames averaged per decision
@@ -48,3 +59,88 @@ emit_every = 5            # frames between decisions; == window -> non-overlappi
                           # < window -> sliding (e.g. window 10 / emit_every 5 is steadier)
 hysteresis = 0            # 0 = switch as soon as the vote does; n > 1 = require n consecutive
                           # windows to agree before the output class changes
+
+[control]                 # real-time assistance controller (src/jetson_imu_tui/control/).
+                          # Knee angle + angular velocity -> per-mode profile -> position loop
+                          # -> motor VELOCITY command, written back on the same serial port.
+                          # Requires a *_knee4_fb* layout above; without motor feedback the
+                          # position loop has nothing to close on and stays inactive.
+enabled = false           # OFF BY DEFAULT. Everything else here only reads sensors; this drives
+                          # a motor. Turn it on deliberately, and read the bring-up order below.
+rate_hz = 100             # fixed tick, matching the Simulink models' 0.01 s step. The PID is
+                          # stateful, so this is the sample rate the gains are tuned against.
+mode_timeout_s = 2.0      # no CLS decision for this long -> fall back to default_profile.
+                          # Must outlast several decision periods (2 Hz = 500 ms) plus the
+                          # ~1 s hole while SoftVoter refills after any reset.
+sample_timeout_s = 0.15   # no fresh frame for this long -> command zero and reset the loops.
+                          # ~12 frames at 80 Hz; cf. ClsService.MAX_RAW_GAP_S = 0.1.
+default_profile = ""      # profile used when no mode is valid; "" = command zero
+
+[control.pid]             # the loop from Simulink's PID3/PID4. NOT a textbook PID:
+                          #   e = ref - actual
+                          #   u = kp*e + ki*integral(e) - kv*d/dt[ LPF2(u) ]
+                          # the third term damps the controller's OWN output rate.
+kp = 1.5                  # Simulink ships 7.5. Start at 20% of it: the loop now closes across
+                          # a serial link (~20-40 ms round trip) that the original did not have,
+                          # and that delay is destabilising. Raise it only with control.csv open.
+ki = 0.0                  # as in the models (the integrator is wired but its gain block is 0)
+kv = 0.02                 # as in the models
+wn = 0.0                  # LPF2 natural frequency [rad/s]. 0 DISABLES the kv damping term,
+                          # which is the honest default: the real value lives in the MATLAB
+                          # base workspace and is not recoverable from the .slx. Supply it.
+zt = 1.0                  # LPF2 damping ratio (also from the base workspace)
+x0 = 0.0                  # LPF2 initial output
+vel_limit = 41.87         # rad/s, matching Saturation1 in Left/Right Motor Velocity
+
+[control.modes]           # CLS class name -> profile name. Keyed by NAME, not index, because
+                          # cls/model/__init__.py CLASSES is the authority on label order.
+                          # Classes not listed here use default_profile. Many-to-one is normal.
+walk = "walk"
+turn = "walk"
+jog = "walk"
+rampascent = "walk"
+rampdescent = "walk"
+stairascent = "stairs"
+stairdescent = "stairs"
+sit = "sit"
+"sit-to-stand" = "sit"
+"stand-to-sit" = "sit"
+# stand: unlisted on purpose -> default_profile (no assistance while standing still)
+
+[control.profiles.walk]   # PLACEHOLDER — every profile ships inert. `commands` all zero and
+                          # gain = 0 mean that even with enabled = true the controller computes
+                          # exactly zero, so filling in the table is a deliberate act.
+                          #   ref = clamp( sign_side * (gain*curve(angle) + kv_ff*velocity) )
+table_units = "deg"       # units of `angles` below ("deg" or "rad"); `commands` are motor-side
+angles = [0.0, 1.0]       # strictly increasing breakpoints
+commands = [0.0, 0.0]     # motor position reference at each breakpoint
+interp = "spline"         # "spline" = cubic not-a-knot, as MATLAB's interp1(...,'spline');
+                          # "linear" if you would rather reproduce it by hand
+gain = 0.0                # multiplies the curve output
+kv_ff = 0.0               # velocity feed-forward, reference-units per rad/s
+sign_r = 1.0              # keep at +/-1 and put magnitude in gain/kv_ff, so a table stays
+sign_l = -1.0             # comparable with its Simulink original
+limits_r = [0.0, 0.0]     # per-side saturation [low, high]. The models use [0,12] and [-12,0]:
+limits_l = [0.0, 0.0]     # one-directional, because a cable can only pull.
+
+[control.profiles.stairs]
+table_units = "deg"
+angles = [0.0, 1.0]
+commands = [0.0, 0.0]
+gain = 0.0
+kv_ff = 0.0
+sign_r = 1.0
+sign_l = -1.0
+limits_r = [0.0, 0.0]
+limits_l = [0.0, 0.0]
+
+[control.profiles.sit]
+table_units = "deg"
+angles = [0.0, 1.0]
+commands = [0.0, 0.0]
+gain = 0.0
+kv_ff = 0.0
+sign_r = 1.0
+sign_l = -1.0
+limits_r = [0.0, 0.0]
+limits_l = [0.0, 0.0]

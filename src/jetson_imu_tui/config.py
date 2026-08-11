@@ -33,6 +33,12 @@ class AppConfig:
     # See read_serial.LAYOUTS — the order is undetectable from the bytes, so it is declared.
     serial_layout: str = "accel_gyro_t"
     serial_gyro_units: str = "deg"
+    # Units of the four knee channels on the control layouts. Mirrors ``serial_gyro_units``;
+    # the same factor serves angle and angular velocity, as in the Simulink models.
+    serial_joint_units: str = "deg"
+    # Header prepended to each downlink (motor command) frame, hex. Must match the Header
+    # field of the device's Serial Receive block. "" sends unframed floats.
+    serial_tx_magic: str = "5aa5"
     # Wire rate of the serial device. Defaults to ``sample_hz`` (the I2C rate); it exists
     # separately because the two sources can be swapped at runtime and the rate drives the
     # CLS decimation, so one global value cannot be right for both if they differ.
@@ -49,6 +55,20 @@ class AppConfig:
     vote_window: int = 5
     vote_emit_every: int = 5
     vote_hysteresis: int = 0
+    # Real-time assistance controller (the ``control`` package). **Off by default** — every
+    # other feature here only reads sensors, whereas this one drives a motor, so it has to be
+    # switched on deliberately rather than inherited from a copied config.
+    control_enabled: bool = False
+    control_rate_hz: float = 100.0        # fixed tick; the PID state makes the rate load-bearing
+    control_mode_timeout_s: float = 2.0   # no CLS decision for this long -> neutral profile
+    control_sample_timeout_s: float = 0.15  # no fresh frame for this long -> stop the motors
+    control_default_profile: str = ""     # "" = neutral when no mode is valid
+    # Sub-tables, kept raw here and validated by ControlService: the config loader has no
+    # business knowing what a profile is, and a bad table must degrade to neutral at runtime
+    # with a visible reason rather than stop the app from starting.
+    control_pid: dict = field(default_factory=dict)
+    control_modes: dict = field(default_factory=dict)
+    control_profiles: dict = field(default_factory=dict)
 
     @property
     def labels(self) -> list[str]:
@@ -69,6 +89,7 @@ def load_config(path: Path | None = None) -> AppConfig:
     cls = raw.get("cls", {})
     vote = cls.get("vote", {})
     source = raw.get("source", {})
+    control = raw.get("control", {})
     sample_hz = int(defaults.get("sample_hz", 100))
     return AppConfig(
         bus_labels=bus_labels or {1: "Left", 7: "Right"},
@@ -86,6 +107,8 @@ def load_config(path: Path | None = None) -> AppConfig:
         serial_magic=str(source.get("magic", "")),
         serial_layout=str(source.get("layout", "accel_gyro_t")).lower(),
         serial_gyro_units=str(source.get("gyro_units", "deg")).lower(),
+        serial_joint_units=str(source.get("joint_units", "deg")).lower(),
+        serial_tx_magic=str(source.get("tx_magic", "5aa5")).lower(),
         serial_sample_hz=int(source.get("sample_hz", sample_hz)),
         cls_enabled=bool(cls.get("enabled", True)),
         cls_model_path=str(cls.get("model_path", "")),
@@ -97,4 +120,12 @@ def load_config(path: Path | None = None) -> AppConfig:
         vote_window=int(vote.get("window", 5)),
         vote_emit_every=int(vote.get("emit_every", 5)),
         vote_hysteresis=int(vote.get("hysteresis", 0)),
+        control_enabled=bool(control.get("enabled", False)),
+        control_rate_hz=float(control.get("rate_hz", 100.0)),
+        control_mode_timeout_s=float(control.get("mode_timeout_s", 2.0)),
+        control_sample_timeout_s=float(control.get("sample_timeout_s", 0.15)),
+        control_default_profile=str(control.get("default_profile", "")),
+        control_pid=dict(control.get("pid", {})),
+        control_modes=dict(control.get("modes", {})),
+        control_profiles=dict(control.get("profiles", {})),
     )
