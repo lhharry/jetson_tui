@@ -333,6 +333,14 @@ class ClsService:
         with self._log_lock:
             self._paused = False
 
+    def reset_window(self) -> None:
+        """Drop the partial window and vote buffer — for a discontinuity the gap check cannot
+        see, such as the axis remap changing under us (same timestamps, new coordinate frame).
+
+        Signals only: the loop thread does the clearing on its next tick, so this is safe to
+        call from a web thread mid-inference. No-op beyond a flag if CLS is disabled."""
+        self._cursor_reset.set()
+
     def toggle_running(self) -> bool:
         """Flip paused/running; returns True if now running."""
         if self._paused:

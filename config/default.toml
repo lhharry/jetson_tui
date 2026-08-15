@@ -21,6 +21,22 @@ sample_hz = 80            # rate the device sends at (measured 79.7 Hz); omit to
                           # [cls] target_hz evenly — 80/10 = 8. The serial reader logs the
                           # observed rate on connect, so check it against this value.
 
+[axis]                    # host-side axis remap, applied to BOTH sources (I2C and serial).
+                          # Replaces the old BNO055 AXIS_MAP_CONFIG/SIGN register writes: the
+                          # chip stays at its P1 identity default and the permutation happens
+                          # here, so the serial source can use it too and nothing is lost on a
+                          # power cycle.
+ops = []                  # applied in list order, e.g. ["rot_x_90", "flip_z"]. Rotations turn
+                          # the READINGS by the given angle (right-hand rule): rot_x_90 sends
+                          #   (x, y, z) -> (x, -z, y)
+                          # Names: rot_{x,y,z}_{90,180,270} and flip_{x,y,z}.
+                          # This is only the boot DEFAULT — a mapping applied from the web UI
+                          # is saved to <log_dir>/axis_remap.json and wins at startup. Delete
+                          # that file to fall back to this list.
+                          # An odd number of flips is a mirror: accel/gyro still follow it, but
+                          # quaternion/euler cannot and are passed through unchanged.
+                          # MUST match the mapping the CLS training data was captured with.
+
 [defaults]
 log_dir = "./logs"
 sample_hz = 100           # sampler-thread rate per sensor (BNO055 fusion is fixed at 100 Hz)
