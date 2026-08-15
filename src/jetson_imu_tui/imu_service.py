@@ -7,13 +7,18 @@ chip's fused output — no software Madgwick filter. Each configured I2C bus (fr
 ``config/default.toml`` ``[buses]``) is opened with ``adafruit_extended_bus.ExtendedI2C`` and a
 ``BNO055_I2C`` driver at address 0x28.
 
+The **axis remap is applied in software** (``imu_common.AxisState``), not written to the chip's
+volatile ``AXIS_MAP_CONFIG``/``AXIS_MAP_SIGN`` registers — see ``imu_common`` for why. The chip
+is left at its P1 identity default. Like the tare, the transform is applied when samples are
+*read out*, so the ring buffer always holds chip-frame data and changing the mapping re-frames
+the whole buffered history at once instead of leaving a mixed-frame window behind.
+
 Downstream consumers (``web_server._payload`` and ``recorder``) only use ``signals()`` →
 ``{label: {"euler","accel","gyro","quat"}}``, so this module owns all sensor specifics.
 """
 
 from __future__ import annotations
 
-import json
 import threading
 import time
 from pathlib import Path
@@ -24,14 +29,11 @@ import adafruit_bno055
 from adafruit_extended_bus import ExtendedI2C
 
 from jetson_imu_tui.imu_common import (
-    DEFAULT_CONFIG,
-    DEFAULT_SIGN,
     PLACEMENTS,
+    AxisState,
     ImuInfo,
+    apply_axis_transform,
     apply_offset,
-    decode_axis_remap,
-    is_valid_config,
-    placement_for,
 )
 from jetson_imu_tui.ring_buffer import RingBuffer
 
@@ -41,13 +43,10 @@ __all__ = ["PLACEMENTS", "ImuInfo", "ImuService"]
 
 # --- BNO055 specifics ------------------------------------------------------
 BNO055_ADDRESS = 0x28  # both buses use the default address
-REG_AXIS_MAP_CONFIG = 0x41
-REG_AXIS_MAP_SIGN = 0x42
 
 # Onboard fusion mode this project runs (accel+gyro, magnetometer off → no figure-8,
 # no magnetic-distortion heading errors; orientation is relative).
 FUSION_MODE = adafruit_bno055.IMUPLUS_MODE
-CONFIG_MODE = adafruit_bno055.CONFIG_MODE
 
 # Gyro output normalization to rad/s (the UI label and CSV expect rad/s). The Adafruit
 # driver's units depend on the library version / UNIT_SEL — VERIFY ON DEVICE: rotate at a
@@ -57,16 +56,20 @@ _GYRO_TO_RADS = 1.0
 
 
 class ImuService:
-    def __init__(self, bus_labels: dict[int, str], state_path: Path | str | None = None) -> None:
+    def __init__(
+        self,
+        bus_labels: dict[int, str],
+        state_path: Path | str | None = None,
+        axis_ops=(),
+        axis: AxisState | None = None,
+    ) -> None:
         self._bus_labels = dict(bus_labels)
         self.sensors: dict[str, adafruit_bno055.BNO055_I2C] = {}
         self._buses: dict[str, ExtendedI2C] = {}
         self._locks: dict[str, threading.Lock] = {}
-        self._state_path = Path(state_path) if state_path else None
-        self._axis_lock = threading.Lock()
-        self._axis_config = DEFAULT_CONFIG
-        self._axis_sign = DEFAULT_SIGN
-        self._load_state()
+        # Software axis remap, applied on read-out. ``axis`` lets the caller inject one shared
+        # AxisState across both sources (the web server does); otherwise one is built here.
+        self._axis = axis if axis is not None else AxisState(state_path, axis_ops)
         # Per-label zero offset for euler/accel/gyro (tare). None = no offset.
         self._offset: dict[str, dict[str, list[float]]] | None = None
         self._offset_lock = threading.Lock()
@@ -95,12 +98,8 @@ class ImuService:
                 self._buffers[label] = RingBuffer()
             except Exception as err:  # pragma: no cover - hardware dependent
                 logger.warning(f"{label} (bus {bus_id}): no BNO055 ({err})")
-        # Axis remap is volatile (lost on power-cycle): re-apply a persisted non-default map.
-        if self.sensors and (self._axis_config, self._axis_sign) != (DEFAULT_CONFIG, DEFAULT_SIGN):
-            try:
-                self.set_axis_remap(self._axis_config, self._axis_sign, persist=False)
-            except Exception as err:  # pragma: no cover - hardware dependent
-                logger.warning(f"axis-remap re-apply on connect failed: {err}")
+        # No axis registers to re-send: the remap is applied on the host, so it survives a
+        # power cycle of the sensor without any action here.
         return self.info()
 
     def disconnect(self) -> None:
@@ -223,13 +222,21 @@ class ImuService:
         }
 
     def _latest_raw(self, label: str) -> dict | None:
-        """Newest raw sample for ``label`` — from the ring buffer while the sampler runs,
-        falling back to a direct I2C read otherwise (library use without start_sampling)."""
+        """Newest sample for ``label``, **axis-remapped**, tare NOT applied.
+
+        Output: a new ``{"euler","accel","gyro","quat"}`` dict of list[float] (see
+        ``apply_axis_transform``), or None. From the ring buffer while the sampler runs,
+        falling back to a direct I2C read otherwise (library use without start_sampling).
+
+        The remap lands here rather than in ``_sample_loop`` so the buffer keeps chip-frame
+        data: everything derived from it then re-frames together when the mapping changes."""
         if self._sample_threads:
             buf = self._buffers.get(label)
-            return buf.latest() if buf is not None else None
-        sensor = self.sensors.get(label)
-        return self._read(label, sensor) if sensor is not None else None
+            sig = buf.latest() if buf is not None else None
+        else:
+            sensor = self.sensors.get(label)
+            sig = self._read(label, sensor) if sensor is not None else None
+        return apply_axis_transform(sig, self._axis.transform)
 
     def signals(self) -> dict[str, dict[str, list[float]] | None]:
         """Latest derived signals per label, with the zero offset applied when active."""
@@ -247,15 +254,13 @@ class ImuService:
         ``signals()`` applies. Returns None if the label is unknown or no data is available."""
         if label not in self.sensors:
             return None
-        sig = self._latest_raw(label)
-        if sig is None:
-            return None
-        return {key: list(sig[key]) for key in ("euler", "accel", "gyro", "quat")}
+        return self._latest_raw(label)  # already a fresh, axis-remapped dict
 
     def raw_samples_since(self, label: str, t: float, limit: int | None = None) -> list[dict]:
-        """Raw (tare-NOT-applied) ring-buffer samples ``{"t","euler","accel","gyro","quat"}``
-        for one sensor with ``sample["t"] > t``, oldest first. Copies so callers never mutate
-        buffer state shared with other consumers.
+        """Axis-remapped, tare-NOT-applied ring-buffer samples
+        ``{"t","euler","accel","gyro","quat"}`` for one sensor with ``sample["t"] > t``,
+        oldest first. ``apply_axis_transform`` copies, so callers never mutate buffer state
+        shared with other consumers.
 
         CLS block-averages the full 100 Hz batch since its last tick to match training's
         anti-aliasing downsample, so it needs every raw sample — not just ``read_raw``'s
@@ -266,18 +271,17 @@ class ImuService:
         buf = self._buffers.get(label)
         if buf is None:
             return []
-        return [
-            {"t": s["t"], **{key: list(s[key]) for key in ("euler", "accel", "gyro", "quat")}}
-            for s in buf.since(t, limit=limit)
-        ]
+        tf = self._axis.transform  # read once: the whole batch must use one mapping
+        return [{"t": s["t"], **apply_axis_transform(s, tf)} for s in buf.since(t, limit=limit)]
 
     def samples_since(self, t: float, limit: int = 300) -> list[dict]:
         """Payload-shaped samples newer than monotonic time ``t``, oldest first.
 
         The first label is the time master; for each of its samples the other labels
         contribute their nearest-in-time sample (the sub-period misalignment between the
-        independent sampler threads is invisible at plot scale). Tare is applied to
-        euler/accel/gyro per sample; quaternions are never offset."""
+        independent sampler threads is invisible at plot scale). The axis remap is applied
+        first, then the tare on top of it — the tare reference was itself captured in the
+        remapped frame. Tare covers euler/accel/gyro; quaternions are never offset."""
         labels = [lab for lab in self.labels if lab in self._buffers]
         if not labels or not self._sample_threads:
             return []
@@ -289,6 +293,7 @@ class ImuService:
             lab: self._buffers[lab].since(master_samples[0]["t"] - 0.05) for lab in labels[1:]
         }
         off = self._offset
+        tf = self._axis.transform  # read once: the whole batch must use one mapping
         idx = {lab: 0 for lab in others}
         out: list[dict] = []
         for sm in master_samples:
@@ -301,7 +306,8 @@ class ImuService:
                 idx[lab] = i
                 per_label[lab] = arr[i] if arr else None
             for lab in labels:
-                sig = apply_offset(per_label.get(lab), off.get(lab) if off else None)
+                remapped = apply_axis_transform(per_label.get(lab), tf)
+                sig = apply_offset(remapped, off.get(lab) if off else None)
                 for key in ("euler", "accel", "gyro", "quat"):
                     row[key][lab] = sig[key] if sig is not None else None
             out.append(row)
@@ -355,109 +361,23 @@ class ImuService:
                 out[label] = None
         return out
 
-    # --- axis remap --------------------------------------------------------
+    # --- axis remap (software) ---------------------------------------------
     def get_axis_remap(self) -> dict:
-        c, s = self._axis_config, self._axis_sign
-        return {
-            "config": c,
-            "sign": s,
-            "config_hex": f"0x{c:02X}",
-            "sign_hex": f"0x{s:02X}",
-            "mapping": decode_axis_remap(c, s),
-            "placement": placement_for(c, s),
-            "valid": is_valid_config(c),
-        }
+        """Output: the current mapping as a JSON-ready dict — see ``AxisTransform.describe``."""
+        return self._axis.describe()
 
-    def set_axis_remap(self, config_byte: int, sign_byte: int, *, persist: bool = True) -> dict:
-        config_byte &= 0xFF
-        sign_byte &= 0xFF
-        with self._axis_lock:
-            valid = is_valid_config(config_byte)
-            result: dict = {
-                "config": config_byte,
-                "sign": sign_byte,
-                "config_hex": f"0x{config_byte:02X}",
-                "sign_hex": f"0x{sign_byte:02X}",
-                "mapping": decode_axis_remap(config_byte, sign_byte),
-                "placement": placement_for(config_byte, sign_byte),
-                "valid": valid,
-                "ok": False,
-                "hardware": False,
-                "applied": {},
-                "message": "",
-            }
-            if not valid:
-                result["message"] = (
-                    "Invalid mapping: each output axis must map to a distinct source axis."
-                )
-                return result
+    def set_axis_remap(self, *, ops=None, config: int | None = None, sign: int | None = None,
+                       persist: bool = True) -> dict:
+        """Replace the software axis remap.
 
-            any_hw = False
-            all_ok = True
-            for label, sensor in self.sensors.items():
-                entry = self._apply_axis(label, sensor, config_byte, sign_byte)
-                result["applied"][label] = entry
-                any_hw = any_hw or entry["hardware"]
-                all_ok = all_ok and entry["ok"]
+        Input: ``ops`` = list of op names (``rot_x_90``, ``flip_z``, ...) applied in order, or
+        ``config``/``sign`` = the two BNO055-style bytes. Output: ``describe()`` plus
+        ``ok``/``message``.
 
-            self._axis_config = config_byte
-            self._axis_sign = sign_byte
-            result["hardware"] = any_hw
-            result["ok"] = all_ok
-            result["message"] = (
-                "Applied to hardware." if any_hw else "Stored (no sensors connected)."
-            )
-            if persist:
-                self._save_state()
-            return result
-
-    def _apply_axis(self, label: str, sensor: adafruit_bno055.BNO055_I2C, config_byte: int, sign_byte: int) -> dict:
-        """Write AXIS_MAP_CONFIG/SIGN on one sensor (CONFIG mode → write → restore fusion),
-        then read back. The Adafruit ``mode`` setter handles the 19/7 ms switch delays."""
-        entry: dict = {
-            "ok": False,
-            "hardware": False,
-            "readback_config": None,
-            "readback_sign": None,
-            "error": None,
-        }
-        lock = self._locks.get(label)
-        try:
-            with lock:  # type: ignore[arg-type]
-                sensor.mode = CONFIG_MODE
-                sensor._write_register(REG_AXIS_MAP_CONFIG, config_byte)
-                sensor._write_register(REG_AXIS_MAP_SIGN, sign_byte)
-                sensor.mode = FUSION_MODE
-                rc = sensor._read_register(REG_AXIS_MAP_CONFIG)
-                rs = sensor._read_register(REG_AXIS_MAP_SIGN)
-            entry["readback_config"] = rc
-            entry["readback_sign"] = rs
-            entry["hardware"] = True
-            entry["ok"] = rc == config_byte and rs == sign_byte
-            if not entry["ok"]:
-                entry["error"] = "readback mismatch (mapping may have been rejected by the chip)"
-        except Exception as err:  # pragma: no cover - hardware dependent
-            entry["error"] = f"{type(err).__name__}: {err}"
-        return entry
-
-    # --- persistence -------------------------------------------------------
-    def _load_state(self) -> None:
-        if not self._state_path or not self._state_path.exists():
-            return
-        try:
-            data = json.loads(self._state_path.read_text())
-            self._axis_config = int(data["config"]) & 0xFF
-            self._axis_sign = int(data["sign"]) & 0xFF
-        except Exception as err:
-            logger.warning(f"axis-remap: failed to load {self._state_path}: {err}")
-
-    def _save_state(self) -> None:
-        if not self._state_path:
-            return
-        try:
-            self._state_path.parent.mkdir(parents=True, exist_ok=True)
-            self._state_path.write_text(
-                json.dumps({"config": self._axis_config, "sign": self._axis_sign})
-            )
-        except Exception as err:
-            logger.warning(f"axis-remap: failed to save {self._state_path}: {err}")
+        Clears the tare on success: the stored zero reference was captured in the *previous*
+        frame, so keeping it would silently subtract the wrong offsets."""
+        result = self._axis.set(ops=ops, config=config, sign=sign, persist=persist)
+        if result.get("ok"):
+            with self._offset_lock:
+                self._offset = None
+        return result

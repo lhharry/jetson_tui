@@ -8,8 +8,13 @@ method surface matches.
 
 What serial cannot provide, it reports as ``None`` rather than faking: the stream carries only
 accelerometer and gyroscope, so ``euler`` and ``quat`` are always None (Euler/Quaternion plots,
-the 3D cube and the two matching CSVs stay empty), calibration status is unavailable, and the
-axis remap is read-only — that mapping is configured on the Arduino, not writable from here.
+the 3D cube and the two matching CSVs stay empty) and calibration status is unavailable.
+
+The **axis remap is now writable here**, unlike in the register-based version: it is a host-side
+transform (``imu_common.AxisState``, the same object ``ImuService`` uses), so it no longer
+matters that the serial link cannot reach the sensor's registers. It applies to accel/gyro; the
+euler/quat half of the transform is inert because this source has neither. Note this composes
+*on top of* whatever mapping the transmitting device already applies in its own firmware.
 
 The link is **bidirectional**: ``send_result`` writes one byte back per aggregated classification
 decision, so the Arduino that supplies the IMU is also the consumer of the model output over the
@@ -40,14 +45,11 @@ import serial
 from loguru import logger
 
 from jetson_imu_tui.imu_common import (
-    DEFAULT_CONFIG,
-    DEFAULT_SIGN,
     SIGNAL_KEYS,
+    AxisState,
     ImuInfo,
+    apply_axis_transform,
     apply_offset,
-    decode_axis_remap,
-    is_valid_config,
-    placement_for,
 )
 from jetson_imu_tui.read_serial import (
     DEFAULT_BAUD,
@@ -88,6 +90,9 @@ class SerialImuService:
         magic: str = "",
         layout: str = DEFAULT_LAYOUT,
         gyro_units: str = "deg",
+        state_path=None,
+        axis_ops=(),
+        axis: AxisState | None = None,
     ) -> None:
         self._port = port
         self._baud = int(baud)
@@ -103,10 +108,9 @@ class SerialImuService:
         self._buf = RingBuffer()
         self._offset: dict[str, dict[str, list[float]]] | None = None
         self._offset_lock = threading.Lock()
-        # Axis remap is set on the Arduino; kept here only so the UI popup has something
-        # coherent to render and to report what this end believes is in effect.
-        self._axis_config = DEFAULT_CONFIG
-        self._axis_sign = DEFAULT_SIGN
+        # Software axis remap, identical to the I2C source's — applied on read-out. ``axis``
+        # lets the caller share one AxisState across both sources (the web server does).
+        self._axis = axis if axis is not None else AxisState(state_path, axis_ops)
 
         self._stop = threading.Event()
         self._thread: threading.Thread | None = None
@@ -309,17 +313,22 @@ class SerialImuService:
     def _latest_raw(self) -> dict | None:
         return self._buf.latest()
 
-    @staticmethod
-    def _as_signal(sample: dict | None) -> dict | None:
-        """Ring-buffer sample -> the four-key signal dict every consumer expects."""
+    def _as_signal(self, sample: dict | None, tf=None) -> dict | None:
+        """Ring-buffer sample -> the four-key signal dict every consumer expects, axis-remapped.
+
+        Input: ``sample`` = buffer row ``{"t","t_src","accel","gyro"}`` or None; ``tf`` =
+        AxisTransform to apply, defaulting to the current one — pass it explicitly to pin a
+        single mapping across a whole batch. Output: a new
+        ``{"euler","accel","gyro","quat"}`` dict of list[float], euler/quat always None
+        (nothing in the stream to fill them), or None when ``sample`` is None.
+
+        ``apply_axis_transform`` copies, so the buffer row is never exposed or mutated."""
         if sample is None:
             return None
-        return {
-            "euler": None,
-            "accel": list(sample["accel"]),
-            "gyro": list(sample["gyro"]),
-            "quat": None,
-        }
+        return apply_axis_transform(
+            {"euler": None, "accel": sample["accel"], "gyro": sample["gyro"], "quat": None},
+            self._axis.transform if tf is None else tf,
+        )
 
     def signals(self) -> dict[str, dict | None]:
         """Latest signals for the single label, with the zero offset applied when active."""
@@ -334,13 +343,15 @@ class SerialImuService:
         return self._as_signal(self._latest_raw())
 
     def raw_samples_since(self, label: str, t: float, limit: int | None = None) -> list[dict]:
-        """Raw (tare-NOT-applied) buffered samples with ``sample["t"] > t``, oldest first.
+        """Axis-remapped, tare-NOT-applied buffered samples with ``sample["t"] > t``, oldest
+        first.
 
         The one method ``ClsService`` calls. Copies, so callers never mutate buffer state."""
         if label != self._label:
             return []
+        tf = self._axis.transform  # read once: the whole batch must use one mapping
         return [
-            {"t": s["t"], "t_src": s["t_src"], "accel": list(s["accel"]), "gyro": list(s["gyro"])}
+            {"t": s["t"], "t_src": s["t_src"], **self._as_signal(s, tf)}
             for s in self._buf.since(t, limit=limit)
         ]
 
@@ -350,9 +361,10 @@ class SerialImuService:
         quat are present as None so the browser still discovers the label."""
         off = self._offset
         o = off.get(self._label) if off else None
+        tf = self._axis.transform  # read once: the whole batch must use one mapping
         out: list[dict] = []
         for s in self._buf.since(t, limit=limit):
-            sig = apply_offset(self._as_signal(s), o)
+            sig = apply_offset(self._as_signal(s, tf), o)
             row: dict = {"t": s["t"]}
             for key in SIGNAL_KEYS:
                 row[key] = {self._label: sig[key] if sig is not None else None}
@@ -379,50 +391,28 @@ class SerialImuService:
                 self._offset = None
             return self._offset is not None
 
-    # --- calibration / axis remap (reported, not controllable) --------------
+    # --- calibration (reported) / axis remap (software) ---------------------
     def calibration_status(self) -> dict[str, dict | None]:
         """No calibration registers over serial — the transmitting device owns that."""
         return {self._label: None}
 
     def get_axis_remap(self) -> dict:
-        c, s = self._axis_config, self._axis_sign
-        return {
-            "config": c,
-            "sign": s,
-            "config_hex": f"0x{c:02X}",
-            "sign_hex": f"0x{s:02X}",
-            "mapping": decode_axis_remap(c, s),
-            "placement": placement_for(c, s),
-            "valid": is_valid_config(c),
-        }
+        """Output: the current mapping as a JSON-ready dict — see ``AxisTransform.describe``."""
+        return self._axis.describe()
 
-    def set_axis_remap(self, config_byte: int, sign_byte: int, *, persist: bool = True) -> dict:
-        """Record the mapping this end assumes; it cannot be written over the serial link.
+    def set_axis_remap(self, *, ops=None, config: int | None = None, sign: int | None = None,
+                       persist: bool = True) -> dict:
+        """Replace the software axis remap — same contract as ``ImuService.set_axis_remap``.
 
-        The transmitting device applies its own AXIS_MAP_CONFIG/SIGN, and that mapping must match
-        the one used to collect the training data or the classifier degrades silently."""
-        config_byte &= 0xFF
-        sign_byte &= 0xFF
-        valid = is_valid_config(config_byte)
-        if valid:
-            self._axis_config = config_byte
-            self._axis_sign = sign_byte
-        result = self.get_axis_remap()
-        result.update({
-            "config": config_byte,
-            "sign": sign_byte,
-            "config_hex": f"0x{config_byte:02X}",
-            "sign_hex": f"0x{sign_byte:02X}",
-            "mapping": decode_axis_remap(config_byte, sign_byte),
-            "placement": placement_for(config_byte, sign_byte),
-            "valid": valid,
-            "ok": False,
-            "hardware": False,
-            "applied": {},
-            "message": (
-                "Invalid mapping: each output axis must map to a distinct source axis."
-                if not valid
-                else "Serial source — set the axis mapping on the transmitting device."
-            ),
-        })
+        Input: ``ops`` = list of op names applied in order, or ``config``/``sign`` bytes.
+        Output: ``describe()`` plus ``ok``/``message``.
+
+        This composes on top of whatever the transmitting device already applies in firmware,
+        so it corrects a mounting mismatch without reflashing — but the combination, not this
+        transform alone, is what has to match the mapping the training data was captured with.
+        Clears the tare on success (the zero reference belongs to the previous frame)."""
+        result = self._axis.set(ops=ops, config=config, sign=sign, persist=persist)
+        if result.get("ok"):
+            with self._offset_lock:
+                self._offset = None
         return result

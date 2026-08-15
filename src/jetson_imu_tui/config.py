@@ -37,6 +37,10 @@ class AppConfig:
     # separately because the two sources can be swapped at runtime and the rate drives the
     # CLS decimation, so one global value cannot be right for both if they differ.
     serial_sample_hz: int = 100
+    # Host-side axis remap, applied to both sources (see imu_common.AxisState). Op names from
+    # ``imu_common.OPS``, applied in list order. This is only the *default*: a mapping set from
+    # the web UI is written to ``<log_dir>/axis_remap.json`` and takes precedence at startup.
+    axis_ops: list[str] = field(default_factory=list)
     # Real-time activity classification (CLS page). Disabled unless a checkpoint is present.
     cls_enabled: bool = True
     cls_model_path: str = ""
@@ -69,6 +73,7 @@ def load_config(path: Path | None = None) -> AppConfig:
     cls = raw.get("cls", {})
     vote = cls.get("vote", {})
     source = raw.get("source", {})
+    axis = raw.get("axis", {})
     sample_hz = int(defaults.get("sample_hz", 100))
     return AppConfig(
         bus_labels=bus_labels or {1: "Left", 7: "Right"},
@@ -87,6 +92,7 @@ def load_config(path: Path | None = None) -> AppConfig:
         serial_layout=str(source.get("layout", "accel_gyro_t")).lower(),
         serial_gyro_units=str(source.get("gyro_units", "deg")).lower(),
         serial_sample_hz=int(source.get("sample_hz", sample_hz)),
+        axis_ops=[str(op) for op in axis.get("ops", [])],
         cls_enabled=bool(cls.get("enabled", True)),
         cls_model_path=str(cls.get("model_path", "")),
         cls_sensor=str(cls.get("sensor", "Left")),

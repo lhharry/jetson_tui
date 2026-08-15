@@ -16,9 +16,9 @@ workloads (e.g. an AI model) on the same board.
 - Four signal views (Euler / Accel / Gyro / Quaternion); Left + Right overlaid.
 - Switch to a **numbers** view for live numeric readouts of every signal.
 - **Zero** (tare) the current Euler/Accel/Gyro readings from the page.
-- **Axis** popup: remap the BNO055 output axes (datasheet §3.4 placements P0–P7 or a manual
-  axis/sign mapping), applied to the chip's `AXIS_MAP_CONFIG`/`AXIS_MAP_SIGN` registers, with a
-  live 3D cube to confirm the result.
+- **Axis** popup: remap the sensor axes by building a chain of steps — rotate an axis by
+  90/180/270°, or negate one — applied **in software on the host**, for both sources, with a
+  live 3D cube to confirm the result. Datasheet §3.4 placements P0–P7 remain as presets.
 - **Calib** popup: live onboard calibration status (sys / gyro / accel, 0–3) with guidance.
 - **IMU:** button switches between the onboard I2C IMUs and a serial (Arduino) IMU at runtime.
 - **CLS** page: online activity classification, with frame predictions aggregated by soft voting
@@ -85,8 +85,8 @@ HTTP API (for scripting): `GET /` (page), `GET /data` (latest values + status JS
 `POST /record` (toggle), `POST /freq?hz=N` (set recording rate), `POST /zero` (tare toggle),
 `POST /source?kind=i2c|serial` (switch IMU source), `GET /calibration` (per-sensor calibration
 levels), `GET /cls` (predictions + latest decision), `POST /cls/toggle` (stop/start inference),
-`GET /axis-remap` (current mapping) and `POST /axis-remap` (apply `placement=P0..P7` or numeric
-`config`/`sign`). `Ctrl-C` stops cleanly.
+`GET /axis-remap` (current mapping) and `POST /axis-remap` (apply `{"ops":["rot_x_90",...]}`,
+or `placement=P0..P7`, or numeric `config`/`sign`). `Ctrl-C` stops cleanly.
 
 ## Configuration
 
@@ -108,6 +108,41 @@ web_port = 8000
 
 The bus→label table is the single source of truth — change it here to swap
 Left/Right assignment or rename the IMUs.
+
+## Axis remap (software)
+
+The sensor axes are remapped **on the host**, applied to both sources. Open the **Axis** popup
+and build a chain of steps: pick an axis, pick 90/180/270°, hit **Rotate** — or **Negate** to
+flip one axis. The 3D cube follows live, so you adjust until it matches the real sensor.
+
+```toml
+[axis]
+ops = ["rot_y_90"]        # applied in list order; [] = identity
+```
+
+Op names are `rot_{x,y,z}_{90,180,270}` and `flip_{x,y,z}`. **Rotations turn the readings**, not
+the sensor — `rot_x_90` sends `(x, y, z) → (x, -z, y)`, right-hand rule.
+
+* `[axis] ops` is only the **boot default**. A mapping applied from the UI is written to
+  `<log_dir>/axis_remap.json`, which wins at startup; delete that file to fall back to the TOML.
+* Applying a mapping **clears the tare** (the zero reference belongs to the old frame) and
+  **resets the CLS window** (its buffered frames do too, and their timestamps are continuous so
+  the gap check would never catch it).
+* `accel` and `gyro` are permuted and signed; `quat` is re-expressed and `euler` is recomputed
+  from it, so all four CSVs and the cube stay in one coordinate system. At identity the chip's
+  own fused euler is passed through untouched.
+* An **odd number of negations is a mirror**, not a mounting orientation. `accel`/`gyro` still
+  follow it, but no rotation quaternion exists, so `quat`/`euler` pass through unchanged and the
+  popup says so. Prefer rotations unless you specifically want a reflection.
+* P0–P7 presets and numeric `config`/`sign` still work (same bit layout as the old registers),
+  so existing scripts and old `axis_remap.json` files keep working.
+
+> This used to write the BNO055's `AXIS_MAP_CONFIG`/`AXIS_MAP_SIGN` registers. Moving it to the
+> host fixed three things: the serial source can use it at all, nothing is lost on a power cycle,
+> and the UI can speak in rotations instead of packed bytes. The chip is left at its P1 identity
+> default — if you previously relied on a register mapping, re-enter it here.
+
+Covered by `others/tests/test_axis_transform.py` (61 cases, no hardware needed).
 
 ## Serial source (Arduino / Simulink instead of I2C)
 
@@ -162,9 +197,12 @@ watch `/data` — the peak should read ≈ 1.5, not ≈ 90.
 
 **Not available over serial**, because the stream carries only accelerometer and gyroscope:
 Euler and Quaternion plots, the 3D cube, `euler_angles.csv` / `quaternions.csv` (written with
-empty cells), and the calibration popup. The axis remap is *reported* but not writable — that
-mapping is configured on the transmitting device, and it must match the one used to collect the
-training data (see the contract below).
+empty cells), and the calibration popup.
+
+The **axis remap does work over serial** — it is a host-side transform now, so it no longer
+matters that the link cannot reach the sensor's registers. It composes *on top of* whatever
+mapping the transmitting device applies in its own firmware, so you can correct a mounting
+mismatch without reflashing; what has to match the training capture is the combination.
 
 ### Result return channel (Jetson → Arduino)
 
@@ -245,9 +283,8 @@ gyroscope in rad/s, quaternion `(w, x, y, z)` unitless. If gyro readings look ~5
 the installed driver is reporting deg/s — set `_GYRO_TO_RADS = math.pi/180` in
 `src/jetson_imu_tui/imu_service.py`.
 
-**Axis remap** — the **Axis** popup writes `AXIS_MAP_CONFIG`/`AXIS_MAP_SIGN` on the chip. These
-registers are **volatile** (lost on power cycle); the chosen mapping is saved to
-`<log_dir>/axis_remap.json` and re-applied automatically on connect.
+**Axis remap** — see [Axis remap (software)](#axis-remap-software) below. It is applied on the
+host, not written to the chip's `AXIS_MAP_CONFIG`/`AXIS_MAP_SIGN` registers.
 
 > Absolute heading (9-DOF) would require **NDOF** mode + magnetometer + a per-boot figure-8.
 > That was deliberately *not* chosen here because of the thigh-mount magnetic environment; it
@@ -336,8 +373,10 @@ into `ClsService`, so it can be swapped or unit-tested on its own.
    (readings ~57× too large), set `_GYRO_TO_RADS = math.pi/180` in `imu_service.py`.
    Pin the `adafruit-circuitpython-bno055` version to the one used during data capture.
    On the serial source the equivalent knob is `[source] gyro_units`.
-2. **Axis remap.** The persisted `<log_dir>/axis_remap.json` mapping must match the
-   mapping used when the training data was collected (default P1 identity unless changed).
+2. **Axis remap.** The effective mapping — `[axis] ops`, or `<log_dir>/axis_remap.json` if
+   present — must match the one used when the training data was collected (default identity
+   unless changed). On the serial source this means the *combination* of the transmitting
+   device's own firmware mapping and the host-side one.
 3. **Tare / gravity.** CLS bypasses the tare and feeds **gravity-inclusive** accel (the
    model needs it). Confirm the training data was captured with tare OFF too.
 4. **Model I/O.** Accel is normalized ÷9.8 (in `cls/preprocess.py`); the 11-class order in
@@ -348,8 +387,9 @@ Offline model-math parity is proven by `others/tools/parity_check_cls.py` (run f
 LIMU-BERT-Public repo); the 100 Hz→10 Hz block-average is covered by
 `others/tests/test_cls_downsample.py`, serial decoding + unit conversion by
 `others/tests/test_read_serial.py`, vote aggregation by `others/tests/test_vote.py`, the return
-channel by `others/tests/test_serial_tx.py`, and the runtime source switch by
-`others/tests/test_source_switch.py`.
+channel by `others/tests/test_serial_tx.py`, the runtime source switch by
+`others/tests/test_source_switch.py`, and the axis remap by
+`others/tests/test_axis_transform.py`.
 
 > The checkpoint's output width must match `CLASSES` in `cls/model/__init__.py`. A 7-class `.pt`
 > against the 11-label list fails to load and CLS self-disables with a `size mismatch` warning.

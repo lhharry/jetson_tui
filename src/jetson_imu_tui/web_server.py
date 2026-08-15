@@ -28,7 +28,7 @@ from jetson_imu_tui.cls.model import CLASSES
 from jetson_imu_tui.cls.service import ClsService
 from jetson_imu_tui.cls.vote import SoftVoter
 from jetson_imu_tui.config import AppConfig
-from jetson_imu_tui.imu_common import PLACEMENTS
+from jetson_imu_tui.imu_common import PLACEMENTS, AxisState
 from jetson_imu_tui.recorder import Recorder
 
 # Both sources are optional *at import time*: the I2C stack (Blinka / adafruit-bno055) is
@@ -151,12 +151,18 @@ class ServerState:
         service: "ImuService | SerialImuService",
         log_dir: Path,
         record_hz: int,
+        axis: AxisState | None = None,
     ) -> None:
         self.cfg = cfg
         self.service = service
         self.source_kind = cfg.source_kind
-        # Built sources are kept so switching back is instant and per-source state (tare
-        # offset, axis remap) survives a round trip.
+        # The axis remap describes the physical mounting, so it is shared by every source
+        # rather than cached per-source; ``_make_source`` hands the same object to each.
+        self.axis = axis if axis is not None else AxisState(
+            Path(cfg.log_dir) / "axis_remap.json", cfg.axis_ops
+        )
+        # Built sources are kept so switching back is instant and the per-source tare offset
+        # survives a round trip.
         self._sources: dict[str, "ImuService | SerialImuService"] = {cfg.source_kind: service}
         self.log_dir = log_dir
         self.record_hz = record_hz
@@ -210,7 +216,7 @@ class ServerState:
                 return {"ok": True, "kind": kind, "message": f"already using {kind}"}
             new = self._sources.get(kind)
             if new is None:
-                new, err = _make_source(self.cfg, kind)
+                new, err = _make_source(self.cfg, kind, self.axis)
                 if err is not None:
                     return {"ok": False, "kind": self.source_kind, "message": err}
                 self._sources[kind] = new
@@ -391,10 +397,26 @@ def create_app(state: ServerState, window_s: float, poll_ms: int) -> Flask:
 
     @app.route("/axis-remap", methods=["POST"])
     def axis_remap_post():
+        """Apply a host-side axis remap. Accepts, in precedence order:
+
+        * ``ops``   — list of op names (``rot_x_90``, ``flip_z``, ...) applied in list order
+        * ``placement`` — ``P0``..``P7``, the datasheet mounting presets
+        * ``config`` + ``sign`` — the two bytes, kept so existing scripts keep working
+
+        On success the tare is dropped by the service and the CLS window is cleared here: the
+        buffered frames carry the old coordinate frame, and their timestamps are continuous so
+        the gap check would never notice."""
         body = request.get_json(silent=True) or {}
+        ops = body.get("ops")
         placement = request.args.get("placement") or body.get("placement")
-        if placement and str(placement).upper() in PLACEMENTS:
+        kwargs: dict
+        if ops is not None:
+            if not isinstance(ops, list):
+                return jsonify({"ok": False, "message": "'ops' must be a list of op names"}), 400
+            kwargs = {"ops": ops}
+        elif placement and str(placement).upper() in PLACEMENTS:
             cfg_b, sgn_b = PLACEMENTS[str(placement).upper()]
+            kwargs = {"config": cfg_b, "sign": sgn_b}
         else:
             raw_cfg = request.args.get("config", body.get("config"))
             raw_sgn = request.args.get("sign", body.get("sign"))
@@ -407,12 +429,16 @@ def create_app(state: ServerState, window_s: float, poll_ms: int) -> Flask:
                         {
                             "ok": False,
                             "valid": False,
-                            "message": "provide 'placement' (P0-P7) or numeric 'config' and 'sign'",
+                            "message": "provide 'ops', 'placement' (P0-P7), or numeric 'config' and 'sign'",
                         }
                     ),
                     400,
                 )
-        return jsonify(state.service.set_axis_remap(cfg_b, sgn_b))
+            kwargs = {"config": cfg_b, "sign": sgn_b}
+        result = state.service.set_axis_remap(**kwargs)
+        if result.get("ok") and state.cls is not None:
+            state.cls.reset_window()
+        return jsonify(result)
 
     return app
 
@@ -422,13 +448,20 @@ def _source_available() -> dict[str, bool]:
     return {"i2c": ImuService is not None, "serial": SerialImuService is not None}
 
 
-def _make_source(cfg: AppConfig, kind: str) -> tuple["ImuService | SerialImuService | None", str | None]:
+def _make_source(
+    cfg: AppConfig, kind: str, axis: AxisState
+) -> tuple["ImuService | SerialImuService | None", str | None]:
     """Build one sample source. Returns ``(service, None)`` or ``(None, error_message)``.
 
     Both kinds expose the same method surface, so nothing downstream (payload, recorder, CLS)
     cares which one it gets. A missing dependency is returned rather than raised: at startup the
     caller turns it into a ``SystemExit`` (a silent fallback to the other source would be worse
-    than not starting), but a runtime switch just reports it and stays where it is."""
+    than not starting), but a runtime switch just reports it and stays where it is.
+
+    ``axis`` is the **one shared** ``AxisState`` — both sources get the same object, not a copy.
+    The remap describes how the sensor is physically mounted, so it cannot be per-source: built
+    sources are cached across switches, and independent copies would let a mapping applied on
+    one source silently not apply to the other."""
     if kind == "serial":
         if SerialImuService is None:
             return None, (
@@ -442,12 +475,13 @@ def _make_source(cfg: AppConfig, kind: str) -> tuple["ImuService | SerialImuServ
             magic=cfg.serial_magic,
             layout=cfg.serial_layout,
             gyro_units=cfg.serial_gyro_units,
+            axis=axis,
         ), None
     if kind != "i2c":
         return None, f'Unknown source kind "{kind}" — expected "i2c" or "serial"'
     if ImuService is None:
         return None, f'[source] kind = "i2c" needs the Adafruit I2C stack: {_I2C_IMPORT_ERR}'
-    return ImuService(cfg.bus_labels, state_path=Path(cfg.log_dir) / "axis_remap.json"), None
+    return ImuService(cfg.bus_labels, axis=axis), None
 
 
 def run_server(cfg: AppConfig, host: str | None = None, port: int | None = None) -> None:
@@ -464,7 +498,10 @@ def run_server(cfg: AppConfig, host: str | None = None, port: int | None = None)
     # this port *and* the I2C buses + CUDA, so killing it first lets us grab everything cleanly.
     _free_port(host, port)
 
-    service, err = _make_source(cfg, cfg.source_kind)
+    # One axis remap for the whole process: <log_dir>/axis_remap.json if it exists, else the
+    # [axis] ops default from the TOML. Every source built below shares this object.
+    axis = AxisState(Path(cfg.log_dir) / "axis_remap.json", cfg.axis_ops)
+    service, err = _make_source(cfg, cfg.source_kind, axis)
     if err is not None:
         # The *boot* source is a hard requirement; a runtime switch reports instead.
         raise SystemExit(err)
@@ -485,7 +522,7 @@ def run_server(cfg: AppConfig, host: str | None = None, port: int | None = None)
     # after startup is picked up. With no I2C sensors this is a no-op.
     service.start_sampling(cfg.sample_hz_for(cfg.source_kind))
 
-    state = ServerState(cfg, service, cfg.log_dir, cfg.record_hz)
+    state = ServerState(cfg, service, cfg.log_dir, cfg.record_hz, axis=axis)
     if cfg.cls_enabled and cfg.cls_model_path:
         # Aggregation is always present; disabling it is a window of 1, i.e. one decision per
         # inference, which keeps ClsService to a single code path.
@@ -604,11 +641,14 @@ _HTML = """<!DOCTYPE html>
   .presets button{border:1px solid var(--border);background:var(--panel2);color:var(--fg);padding:8px 0;border-radius:8px;font-size:13px;cursor:pointer}
   .presets button:hover{filter:brightness(1.1)}
   .presets button.active{background:var(--accent);border-color:var(--accent);color:#fff}
-  .axisrow{display:flex;align-items:center;gap:10px}
-  .axisrow>span.albl{width:74px;color:var(--muted);font-size:12px}
-  .axisrow select{flex:1;background:var(--panel2);color:var(--fg);border:1px solid var(--border);border-radius:6px;padding:7px}
-  .signbtn{width:42px;border:1px solid var(--border);background:var(--panel2);color:var(--fg);border-radius:6px;padding:7px 0;font-weight:700;cursor:pointer}
-  .signbtn.neg{background:#ef4444;border-color:#ef4444;color:#fff}
+  .opsrow{display:flex;align-items:center;gap:7px}
+  .opsrow select{flex:1;background:var(--panel2);color:var(--fg);border:1px solid var(--border);border-radius:6px;padding:7px}
+  .chain{display:flex;flex-wrap:wrap;gap:6px;align-items:center;min-height:28px}
+  .chip{display:inline-flex;align-items:center;gap:7px;background:var(--panel2);border:1px solid var(--border);border-radius:999px;padding:4px 10px;font-size:12px}
+  .chip.mir{border-color:#f59e0b}
+  .chip button{background:none;border:0;color:var(--muted);cursor:pointer;font-size:14px;line-height:1;padding:0}
+  .chip button:hover{color:#f87171}
+  .mapout{font-family:ui-monospace,SFMono-Regular,Menlo,monospace;font-size:12px;color:var(--fg);line-height:1.7}
   .warn{color:#f87171;font-size:12px;font-weight:600}
   .mfoot{display:flex;align-items:center;gap:10px;padding-top:4px}
   .mfoot .grow{flex:1}
@@ -698,25 +738,35 @@ _HTML = """<!DOCTYPE html>
   <div id="axisOverlay" class="overlay" onclick="if(event.target===this)closeAxis()">
     <div class="modal" role="dialog" aria-modal="true" aria-label="Axis remap">
       <div class="mhead">
-        <span class="mtitle">Axis Remap &nbsp;<span class="muted">BNO055 §3.4 · shared by all sensors</span></span>
+        <span class="mtitle">Axis Remap &nbsp;<span class="muted">software · shared by all sensors</span></span>
         <span class="grow"></span>
         <button class="btn" onclick="closeAxis()">Close</button>
       </div>
       <div class="mbody">
         <div class="mcol">
-          <div class="mlabel">Mounting presets</div>
-          <div class="presets" id="presets"></div>
-          <div class="mlabel">Manual mapping &nbsp;<span class="muted">output ← source · sign</span></div>
-          <div class="axisrow"><span class="albl">X out</span><select id="ax-x"></select><button class="signbtn" id="sg-x" data-axis="x" onclick="toggleSign('x')">+</button></div>
-          <div class="axisrow"><span class="albl">Y out</span><select id="ax-y"></select><button class="signbtn" id="sg-y" data-axis="y" onclick="toggleSign('y')">+</button></div>
-          <div class="axisrow"><span class="albl">Z out</span><select id="ax-z"></select><button class="signbtn" id="sg-z" data-axis="z" onclick="toggleSign('z')">+</button></div>
-          <div id="axisWarn" class="warn" style="display:none">Each output must map to a distinct source axis (invalid mapping is rejected by the chip).</div>
+          <div class="mlabel">Add a step</div>
+          <div class="opsrow">
+            <select id="opAxis"><option value="x">X</option><option value="y">Y</option><option value="z">Z</option></select>
+            <select id="opDeg"><option value="90">90°</option><option value="180">180°</option><option value="270">270°</option></select>
+            <button class="btn" onclick="addRot()">Rotate</button>
+            <button class="btn" onclick="addFlip()">Negate</button>
+          </div>
+          <div class="mlabel">Steps <span class="muted">applied top to bottom</span><span style="flex:1"></span>
+            <button class="btn" onclick="undoOp()">Undo</button>
+            <button class="btn" onclick="clearOps()">Clear</button>
+          </div>
+          <div class="chain" id="opChain"></div>
+          <div class="mlabel">Result <span class="muted">output ← source · sign</span></div>
+          <div class="mapout" id="axisMap"></div>
+          <div id="axisWarn" class="warn" style="display:none"></div>
           <div class="mfoot">
             <span id="axisBytes" class="muted">CONFIG 0x24 · SIGN 0x00</span>
             <span class="grow"></span>
             <button id="axisApply" class="btn" onclick="applyAxis()">Apply</button>
           </div>
           <div id="axisMsg" class="muted"></div>
+          <div class="mlabel">Datasheet presets <span class="muted">P0–P7 · replaces the steps</span></div>
+          <div class="presets" id="presets"></div>
         </div>
         <div class="mcol">
           <div class="mlabel">Live orientation
@@ -1001,62 +1051,114 @@ function applyTheme(light){
 function toggleTheme(){ applyTheme(!document.documentElement.classList.contains('light')); }
 
 // ---- axis remap modal -----------------------------------------------------
+// The remap is a host-side transform now, so this panel builds a chain of steps
+// (rotate an axis by 90/180/270, or negate one) instead of hand-packing register bytes.
+// The op matrices mirror imu_common.OPS so the resulting mapping can be previewed without a
+// round-trip; the server recomputes it from the op names and stays the authority.
 const AXIS_PRESETS = {
   P0:[0x21,0x04], P1:[0x24,0x00], P2:[0x24,0x06], P3:[0x21,0x02],
   P4:[0x24,0x03], P5:[0x21,0x01], P6:[0x21,0x07], P7:[0x24,0x05],
 };
+const AXIS_OPS = {
+  rot_x_90:[[1,0,0],[0,0,-1],[0,1,0]],   rot_x_180:[[1,0,0],[0,-1,0],[0,0,-1]],
+  rot_x_270:[[1,0,0],[0,0,1],[0,-1,0]],  rot_y_90:[[0,0,1],[0,1,0],[-1,0,0]],
+  rot_y_180:[[-1,0,0],[0,1,0],[0,0,-1]], rot_y_270:[[0,0,-1],[0,1,0],[1,0,0]],
+  rot_z_90:[[0,-1,0],[1,0,0],[0,0,1]],   rot_z_180:[[-1,0,0],[0,-1,0],[0,0,1]],
+  rot_z_270:[[0,1,0],[-1,0,0],[0,0,1]],
+  flip_x:[[-1,0,0],[0,1,0],[0,0,1]], flip_y:[[1,0,0],[0,-1,0],[0,0,1]], flip_z:[[1,0,0],[0,1,0],[0,0,-1]],
+};
 const AXIS_NAMES = ['X','Y','Z'];
-let axisSign = { x:0, y:0, z:0 };   // 0 = +, 1 = -
+let axisOps = [];          // the step chain, applied in order
+let axisPreset = null;     // [config, sign] when a P0-P7 preset is staged instead of a chain
+let axisDirty = false;     // nothing to Apply until the user actually changes something
+let axisServer = null;     // last state fetched from the server
 let cubeLabel = null;
 
 function buildAxisControls(){
   document.getElementById('presets').innerHTML = Object.keys(AXIS_PRESETS).map(p =>
     '<button data-p="' + p + '" onclick="applyPreset(\\'' + p + '\\')">' + p + (p==='P1'?' •':'') + '</button>').join('');
-  ['x','y','z'].forEach(out => {
-    const sel = document.getElementById('ax-' + out);
-    sel.innerHTML = AXIS_NAMES.map((n,i)=>'<option value="' + i + '">' + n + '</option>').join('');
-    sel.onchange = recomputeAxis;
-  });
 }
 const hx = b => '0x' + b.toString(16).toUpperCase().padStart(2,'0');
-const configByte = () => (+document.getElementById('ax-x').value)
-  | ((+document.getElementById('ax-y').value)<<2) | ((+document.getElementById('ax-z').value)<<4);
-const signByte = () => (axisSign.x<<2)|(axisSign.y<<1)|(axisSign.z);
-function axisValid(c){ const f=[c&3,(c>>2)&3,(c>>4)&3].sort(); return f[0]===0&&f[1]===1&&f[2]===2; }
-function updateSignBtn(out){
-  const b=document.getElementById('sg-'+out);
-  b.textContent = axisSign[out] ? '−' : '+';
-  b.classList.toggle('neg', !!axisSign[out]);
+function matmul(a,b){ return [0,1,2].map(i=>[0,1,2].map(j=>a[i][0]*b[0][j]+a[i][1]*b[1][j]+a[i][2]*b[2][j])); }
+function composeOps(ops){
+  let m=[[1,0,0],[0,1,0],[0,0,1]];
+  for(const o of ops){ if(AXIS_OPS[o]) m=matmul(AXIS_OPS[o],m); }   // later ops on top
+  return m;
 }
-function toggleSign(out){ axisSign[out]=axisSign[out]?0:1; updateSignBtn(out); recomputeAxis(); }
-function applyPreset(p){ const v=AXIS_PRESETS[p]; setControls(v[0],v[1]); }
-function setControls(cfg, sgn){
-  document.getElementById('ax-x').value = cfg & 3;
-  document.getElementById('ax-y').value = (cfg>>2)&3;
-  document.getElementById('ax-z').value = (cfg>>4)&3;
-  axisSign = { x:(sgn>>2)&1, y:(sgn>>1)&1, z:sgn&1 };
-  ['x','y','z'].forEach(updateSignBtn);
-  recomputeAxis();
+function permSigns(m){
+  const p=[],s=[];
+  for(const row of m){ const j=row.findIndex(v=>v!==0); p.push(j); s.push(row[j]); }
+  return [p,s];
+}
+function bytesFromPermSigns(p,s){
+  return [p[0]|(p[1]<<2)|(p[2]<<4), ((s[0]<0?1:0)<<2)|((s[1]<0?1:0)<<1)|(s[2]<0?1:0)];
+}
+function permSignsFromBytes(c,sg){
+  return [[c&3,(c>>2)&3,(c>>4)&3], [(sg>>2)&1?-1:1, (sg>>1)&1?-1:1, sg&1?-1:1]];
+}
+// Determinant of a signed permutation = product of the signs x the parity of the permutation.
+// For 3 elements the Vandermonde product is +2 for an even permutation and -2 for an odd one.
+function detOf(p,s){
+  return s[0]*s[1]*s[2] * (((p[0]-p[1])*(p[1]-p[2])*(p[2]-p[0]))/2);
+}
+function opLabel(o){
+  if(o.startsWith('flip_')) return '−' + o.slice(5).toUpperCase();
+  const parts=o.split('_');     // rot_x_90
+  return parts[1].toUpperCase() + ' +' + parts[2] + '°';
+}
+function addRot(){
+  const a=document.getElementById('opAxis').value, d=document.getElementById('opDeg').value;
+  axisOps.push('rot_'+a+'_'+d); axisPreset=null; axisDirty=true; recomputeAxis();
+}
+function addFlip(){
+  axisOps.push('flip_'+document.getElementById('opAxis').value);
+  axisPreset=null; axisDirty=true; recomputeAxis();
+}
+function removeOp(i){ axisOps.splice(i,1); axisPreset=null; axisDirty=true; recomputeAxis(); }
+function undoOp(){ if(axisOps.length){ axisOps.pop(); axisPreset=null; axisDirty=true; recomputeAxis(); } }
+function clearOps(){ axisOps=[]; axisPreset=null; axisDirty=true; recomputeAxis(); }
+function applyPreset(p){ axisOps=[]; axisPreset=AXIS_PRESETS[p]; axisDirty=true; recomputeAxis(); }
+// Current mapping as [perm, signs]: the staged preset, else the step chain, else — while
+// nothing has been touched — whatever the server reports (which may have come from either).
+function stagedPermSigns(){
+  if(axisPreset) return permSignsFromBytes(axisPreset[0],axisPreset[1]);
+  if(!axisDirty && axisServer) return permSignsFromBytes(axisServer.config,axisServer.sign);
+  return permSigns(composeOps(axisOps));
 }
 function recomputeAxis(){
-  const c=configByte(), s=signByte(), ok=axisValid(c);
-  document.getElementById('axisBytes').textContent='CONFIG '+hx(c)+' · SIGN '+hx(s);
-  document.getElementById('axisWarn').style.display = ok ? 'none' : 'block';
-  document.getElementById('axisApply').disabled = !ok;
+  document.getElementById('opChain').innerHTML = axisOps.length
+    ? axisOps.map((o,i)=>'<span class="chip'+(o.startsWith('flip_')?' mir':'')+'">'+opLabel(o)
+        +'<button title="remove" onclick="removeOp('+i+')">×</button></span>').join('')
+    : '<span class="muted" style="font-size:12px">'
+      + (axisPreset ? 'preset staged — applying replaces the steps' : 'none — identity') + '</span>';
+  const [p,s] = stagedPermSigns();
+  const [c,sg] = bytesFromPermSigns(p,s);
+  document.getElementById('axisMap').innerHTML = ['x','y','z'].map((o,i)=>
+    o.toUpperCase()+' out  ←  '+(s[i]<0?'−':'+')+AXIS_NAMES[p[i]]).join('<br>');
+  document.getElementById('axisBytes').textContent='CONFIG '+hx(c)+' · SIGN '+hx(sg);
+  const warn=document.getElementById('axisWarn');
+  const det = detOf(p,s);   // -1 = mirror, not a mounting orientation
+  warn.style.display = det<0 ? 'block' : 'none';
+  warn.textContent = 'Mirrored mapping — accel/gyro follow it, but quaternion/euler cannot '
+    + 'and are passed through unchanged (the 3D cube will not match).';
+  document.getElementById('axisApply').disabled = !axisDirty;
   let match=null;
-  for(const p in AXIS_PRESETS){ const v=AXIS_PRESETS[p]; if(v[0]===c&&v[1]===s) match=p; }
+  for(const q in AXIS_PRESETS){ const v=AXIS_PRESETS[q]; if(v[0]===c&&v[1]===sg) match=q; }
   document.querySelectorAll('#presets button').forEach(b=>b.classList.toggle('active', b.dataset.p===match));
 }
 async function applyAxis(){
-  const c=configByte(), s=signByte();
   const msg=document.getElementById('axisMsg');
   msg.textContent='Applying…';
+  const body = axisPreset ? {config:axisPreset[0], sign:axisPreset[1]} : {ops:axisOps};
   try{
-    const r=await fetch('/axis-remap',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({config:c,sign:s})});
+    const r=await fetch('/axis-remap',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify(body)});
     const d=await r.json();
-    if(d.ok && d.hardware) msg.textContent='✓ '+(d.message||'Applied')+' ('+hx(d.config)+'/'+hx(d.sign)+')';
-    else if(d.ok) msg.textContent='✓ '+(d.message||'Stored');
-    else msg.textContent='✗ '+(d.message||'Failed');
+    if(d.ok){
+      axisServer=d; axisOps=(d.ops||[]).slice(); axisPreset=null; axisDirty=false;
+      msg.textContent='✓ '+(d.message||'Applied')+' ('+hx(d.config)+'/'+hx(d.sign)+')'
+        + (d.placement ? ' · '+d.placement : '');
+      recomputeAxis();
+    } else { msg.textContent='✗ '+(d.message||'Failed'); }
   }catch(e){ msg.textContent='✗ request failed'; }
 }
 async function openAxis(){
@@ -1065,8 +1167,13 @@ async function openAxis(){
   sel.innerHTML=labels.map(l=>'<option>'+l+'</option>').join('');
   if(!cubeLabel || labels.indexOf(cubeLabel)<0) cubeLabel=labels[0];
   sel.value=cubeLabel;
-  try{ const d=await (await fetch('/axis-remap')).json(); setControls(d.config,d.sign); }
-  catch(e){ setControls(0x24,0x00); }
+  document.getElementById('axisMsg').textContent='';
+  axisPreset=null; axisDirty=false;
+  try{
+    const d=await (await fetch('/axis-remap')).json();
+    axisServer=d; axisOps=(d.ops||[]).slice();
+  }catch(e){ axisServer=null; axisOps=[]; }
+  recomputeAxis();
   startCube();
 }
 function closeAxis(){ document.getElementById('axisOverlay').classList.remove('open'); stopCube(); }
