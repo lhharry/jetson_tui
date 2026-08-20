@@ -250,6 +250,28 @@ Colours run by position *within* a chart, so the right chart's `pos_r` and the l
 `pos_l` share one — the two legs read as parallel. A group added to `TELEMETRY_GROUPS` gets a
 layout from the same rule with no edit to the page.
 
+**Chart heights are draggable.** Charts share the column evenly by default, which stops working
+once a group splits into five or six plots. Drag the grip along a chart's bottom edge to pin
+that one to a height; the rest keep sharing what is left, and the column scrolls if the total
+overflows. Double-click the grip to hand a chart back to the shared row. Heights are stored per
+`signal|chart` in `localStorage`, so they survive the rebuild that every theme change, label
+change and source switch triggers.
+
+**Category channels are labelled, not numbered.** `finalClass` is a class *index*, so its chart
+is drawn differently from a measurement:
+
+* the Y axis reads `stand` / `walk` / `sit`, not `0` / `1` / `7`;
+* the range is pinned to the whole class set, so a given height on the chart always means the
+  same class instead of the axis rescaling around whichever classes are on screen;
+* the line is stepped — a class index does not interpolate, and a ramp between two classes
+  would draw a transition through classes that were never predicted;
+* how many class names fit is computed from the chart's current height, so dragging it taller
+  fills in the ones a short chart had to skip.
+
+`web_server.ENUM_TICKS` is the table (`{"finalClass": CLASSES}`); it lives there rather than in
+`imu_common` so the channel registry stays free of classifier imports, and a test pins it to
+`CLASSES` so the two cannot drift.
+
 **Clamping noisy channels.** A single spike on a channel whose real values are small stretches
 the shared Y axis and flattens everything beside it, so a group can be given an absolute limit:
 

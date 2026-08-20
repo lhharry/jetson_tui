@@ -351,6 +351,14 @@ def _payload(state: ServerState, since: float | None = None) -> dict:
     return out
 
 
+# Telemetry channels that carry a category index rather than a measurement, mapped to the label
+# set they index. Such a channel is drawn with integer ticks named after the class and a stepped
+# line: a class index does not interpolate, and "3.5" is not something the device can mean.
+# Declared here rather than in imu_common because this is the module that already knows about
+# CLASSES — the channel registry stays free of classifier imports.
+ENUM_TICKS: dict[str, list[str]] = {"finalClass": list(CLASSES)}
+
+
 def _available_telemetry(service) -> tuple[str, ...]:
     """Telemetry groups a source carries, () for one that has none.
 
@@ -381,6 +389,7 @@ def create_app(state: ServerState, window_s: float, poll_ms: int) -> Flask:
         # ``charts`` is how a group is cut into plots (imu_common._chart_split); ``clip`` is
         # the limit its values were clamped to, shown in the header so a flat line at the limit
         # is not mistaken for the signal genuinely sitting there.
+        .replace("__ENUMS__", json.dumps(ENUM_TICKS))
         .replace("__TELEMETRY__", json.dumps(
             [{"key": g, "channels": list(ch), "unit": u,
               "clip": state.cfg.telemetry_clip.get(g),
@@ -703,10 +712,15 @@ _HTML = """<!DOCTYPE html>
   .grow{flex:1}
   #status{font-variant-numeric:tabular-nums;color:var(--muted);font-size:12px;white-space:nowrap}
   #dot{display:inline-block;width:8px;height:8px;border-radius:50%;background:#22c55e;margin-right:7px;vertical-align:middle}
-  /* Charts never shrink below MIN_CHART_PX: a group split into 5 or 6 plots would otherwise
-     squeeze each one flat. Few charts still grow to fill; too many scroll instead. */
+  /* Charts never shrink below their floor: a group split into 5 or 6 plots would otherwise
+     squeeze each one flat. Few charts still grow to fill; too many scroll instead. Drag a
+     chart's grip to pin it to a height (see addGrip); the floor drops to MIN_CHART_PX then,
+     so a channel you only need to glance at can be made small. */
   #charts{flex:1;min-height:0;display:flex;flex-direction:column;gap:8px;padding:8px;overflow-y:auto}
-  .chart{flex:1 0 160px;min-height:160px;display:flex;flex-direction:column;background:var(--panel);border:1px solid var(--border);border-radius:10px;padding:6px 10px}
+  .chart{flex:1 0 160px;min-height:90px;display:flex;flex-direction:column;background:var(--panel);border:1px solid var(--border);border-radius:10px;padding:6px 10px 0}
+  .grip{height:9px;margin:1px -10px 0;border-radius:0 0 10px 10px;cursor:ns-resize;flex:0 0 auto}
+  .grip:hover{background:var(--border)}
+  .grip:active{background:var(--muted)}
   .chead{display:flex;align-items:center;gap:16px;padding:1px 2px 5px;font-size:12px;color:var(--muted)}
   .ctitle{font-weight:700;color:var(--fg);text-transform:uppercase;letter-spacing:.05em}
   /* Channel names keep their own case so they match the Simulink signal they came from —
@@ -950,6 +964,9 @@ let clsMode = false;              // CLS page active (a pseudo-signal, not a plo
 let clsSince = 0;                 // highest CLS entry id already shown
 let clsTimer = null;
 const CLS_NAMES = __CLASSES__;    // index -> label, injected from cls/model/__init__.py CLASSES
+// Telemetry channel -> the names its integer values stand for (see ENUM_TICKS). A chart drawing
+// one of these labels its Y ticks by name instead of by number.
+const ENUMS = __ENUMS__;
 const CLS_COLORS = { stand:'#9aa4b2', walk:'#22c55e', turn:'#eab308', jog:'#ef4444',
                      rampascent:'#3b82f6', stairascent:'#a855f7', stairdescent:'#ec4899',
                      sit:'#14b8a6', 'sit-to-stand':'#f97316', 'stand-to-sit':'#8b5cf6',
@@ -1025,18 +1042,99 @@ function chartCols(spec){
     samples.map(s => { const v = s[signal] && s[signal][sr.name]; return v ? v[spec.axIdx] : null; }))];
 }
 
+// ---- per-chart height ----------------------------------------------------
+// Charts default to sharing the column evenly (flex), which is right until a group splits into
+// five or six plots and each one is too short to read. Dragging a chart's bottom edge pins that
+// one chart to a height; the rest keep sharing what is left. Heights are keyed by
+// "signal|chart" and kept in localStorage, because rebuildCharts() throws the DOM away on every
+// theme change, label change and source switch.
+const MIN_CHART_PX = 90;
+let chartH = {};
+try { chartH = JSON.parse(localStorage.getItem('chartH') || '{}') || {}; } catch(_) { chartH = {}; }
+const saveChartH = () => { try { localStorage.setItem('chartH', JSON.stringify(chartH)); } catch(_) {} };
+const chartKey = spec => signal + '|' + spec.key;
+
+// '' hands the chart back to the flex row; a number pins it. Set on every rebuild so a stored
+// height survives one.
+function applyChartH(card, spec){
+  const h = chartH[chartKey(spec)];
+  card.style.flex = h ? ('0 0 ' + h + 'px') : '';
+}
+
+// A grip rather than CSS `resize:vertical`: the card is a flex item, so the browser's own
+// resize would set a height that flex-basis then overrides. Setting `flex` is what actually
+// sticks, and it also keeps "pinned" and "sharing" as one explicit piece of state.
+function addGrip(card, spec){
+  const grip = document.createElement('div');
+  grip.className = 'grip';
+  grip.title = 'Drag to resize · double-click to reset';
+  let startY = 0, startH = 0;
+  grip.addEventListener('pointerdown', e => {
+    startY = e.clientY;
+    startH = card.getBoundingClientRect().height;
+    grip.setPointerCapture(e.pointerId);
+    e.preventDefault();
+  });
+  grip.addEventListener('pointermove', e => {
+    if(!grip.hasPointerCapture(e.pointerId)) return;
+    const h = Math.max(MIN_CHART_PX, Math.round(startH + (e.clientY - startY)));
+    chartH[chartKey(spec)] = h;
+    card.style.flex = '0 0 ' + h + 'px';
+  });
+  const release = e => {
+    if(grip.hasPointerCapture(e.pointerId)) grip.releasePointerCapture(e.pointerId);
+    saveChartH();
+  };
+  grip.addEventListener('pointerup', release);
+  grip.addEventListener('pointercancel', release);
+  grip.addEventListener('dblclick', () => {
+    delete chartH[chartKey(spec)];
+    card.style.flex = '';
+    saveChartH();
+  });
+  card.appendChild(grip);
+}
+
+
 function chartOpts(w, h, spec){
   const T = theme();
+  // A chart drawing a single enum channel (finalClass) is categorical: its Y axis is named
+  // classes, not numbers. That is the difference between "the line is at 7.0" and "the line
+  // says sit".
+  const names = spec.series.length === 1 ? ENUMS[spec.series[0].name] : null;
   const series = [{}];
-  spec.series.forEach(sr => series.push({ stroke: sr.color, width: 2, points:{show:false} }));
+  spec.series.forEach(sr => series.push({
+    stroke: sr.color, width: 2, points:{show:false},
+    // A class index holds until it changes; drawing a ramp between two classes would show a
+    // transition through classes that were never predicted.
+    paths: (names && uPlot.paths && uPlot.paths.stepped)
+      ? uPlot.paths.stepped({ align: 1 }) : undefined,
+  }));
   const ym = yBySignal[signal];
-  const yscale = (ym && !ym.auto && ym.max > ym.min) ? { range: [ym.min, ym.max] } : {};
+  const yscale = (ym && !ym.auto && ym.max > ym.min) ? { range: [ym.min, ym.max] }
+    // Pin the whole class range, so the line's height means the same thing from one moment to
+    // the next instead of the axis rescaling around whichever classes happen to be on screen.
+    : (names ? { range: [-0.5, names.length - 0.5] } : {});
   // Live: a rolling window pinned to the newest sample, ticks labelled as seconds ago.
   // Offline: the window the server returned, ticks labelled as seconds into the session.
   const xscale = offline ? { time:false }
                          : { time:false, range: () => [latestT - WINDOW_S, latestT] };
   const xvalues = offline ? (u,vs,ai,sp,incr) => vs.map(v => v.toFixed(tDecimals(incr)))
                           : (u,vs,ai,sp,incr) => vs.map(v => (v - latestT).toFixed(tDecimals(incr)));
+  const yaxis = { stroke:T.axis, grid:{ stroke:T.grid }, ticks:{ stroke:T.grid }, size:54 };
+  if(names){
+    yaxis.size = 96;                       // class names are wider than numbers
+    // Every tick is a whole class, and how many fit is a function of the chart's height —
+    // which the user can drag. Short chart: every other class. Tall: all of them.
+    yaxis.splits = (u) => {
+      const px = u.bbox.height / (window.devicePixelRatio || 1);
+      const step = Math.max(1, Math.ceil(names.length / Math.max(2, Math.floor(px / 18))));
+      const out = [];
+      for(let i = 0; i < names.length; i += step) out.push(i);
+      return out;
+    };
+    yaxis.values = (u, vs) => vs.map(v => names[v] != null ? names[v] : '');
+  }
   return {
     width: w, height: h,
     legend: { show:false },
@@ -1044,7 +1142,7 @@ function chartOpts(w, h, spec){
     scales: { x: xscale, y: yscale },
     axes: [
       { stroke:T.axis, grid:{ stroke:T.grid }, ticks:{ stroke:T.grid }, values:xvalues },
-      { stroke:T.axis, grid:{ stroke:T.grid }, ticks:{ stroke:T.grid }, size:54 },
+      yaxis,
     ],
     // Offline only: a drag-zoom asks for more detail than the decimated window holds, so it
     // re-fetches that range at full budget instead of magnifying the envelope.
@@ -1084,7 +1182,10 @@ function rebuildCharts(){
       + spec.series.map((sr,k)=>'<span class="cval"><i style="background:' + sr.color + '"></i>'
           + sr.name + ' <b data-v="' + k + '">--</b></span>').join('');
     const body = document.createElement('div'); body.className = 'canvas';
-    card.appendChild(head); card.appendChild(body); wrap.appendChild(card);
+    card.appendChild(head); card.appendChild(body);
+    addGrip(card, spec);
+    applyChartH(card, spec);
+    wrap.appendChild(card);
     const u = new uPlot(chartOpts(body.clientWidth || 300, body.clientHeight || 140, spec),
                         [[], ...spec.series.map(()=>[])], body);
     body.__u = u; charts.push(u); heads.push(head); ro.observe(body);
