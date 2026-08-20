@@ -37,6 +37,23 @@ sample_hz = 80            # rate the device sends at. MEASURED VALUE, not the no
                           # step, so RE-MEASURE: the reader logs the rate a few seconds after
                           # connecting and the page shows it next to the poll rate.
 
+[telemetry.clip]          # absolute limit per telemetry group (serial only). A value outside
+                          # ±limit is clamped to it before the plots and the CSVs see it, so one
+                          # noise spike cannot stretch the shared Y axis and flatten every other
+                          # channel in the group. Applied on read-out: the ring buffer keeps
+                          # what the device sent, so changing a limit re-applies it to the
+                          # buffered history rather than leaving mangled samples behind.
+                          # A group NOT listed here passes through untouched — which is why
+                          # "state" must never be added: its t_src is the device clock, and any
+                          # limit would flatten it into a plateau seconds after start-up.
+                          # The trade is deliberate and lossy: a flat line at the limit cannot
+                          # be told apart from the signal genuinely sitting there. The chart
+                          # header shows "clip ±N" on a clamped group so it is not misread.
+                          # Non-finite values (NaN/inf) are dropped for every group regardless.
+trace = 100.0             # finalClass 0..10, L_KVEL ~0.4, L_KWRAP ~1.8 — all tiny next to a
+                          # spike, and LU_AVEL_F shares their axis. Raise it if a real
+                          # LU_AVEL_F peak is being cut off.
+
 [axis]                    # host-side axis remap, applied to BOTH sources (I2C and serial).
                           # Replaces the old BNO055 AXIS_MAP_CONFIG/SIGN register writes: the
                           # chip stays at its P1 identity default and the permutation happens

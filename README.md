@@ -237,6 +237,40 @@ a motor torque would be meaningless) and they get their own charts, their own Nu
 their own CSVs. `imu_common.TELEMETRY_GROUPS` is the one table that names them — it drives the
 `/data` payload, the CSV headers, the offline loader and the charts at once.
 
+**How a group is cut into charts** is derived from its channel names, not written out anywhere:
+
+| group | charts | why |
+|---|---|---|
+| `knee` | `right` (`ang_r` `vel_r`), `left` (`ang_l` `vel_l`) | the channels pair off by side, so one leg's angle and rate sit together and read against the other's |
+| `motor` | `right` (`pos_r` `speed_r` `torque_r`), `left` | same |
+| `trace` | one per channel | no side to pair by, and the ranges do not compare — a 0–10 class index on the same axis as a few-hundred deg/s velocity is a flat line |
+| `state` | one per channel | `enable` is 0/1, `t_src` climbs into the thousands |
+
+Colours run by position *within* a chart, so the right chart's `pos_r` and the left chart's
+`pos_l` share one — the two legs read as parallel. A group added to `TELEMETRY_GROUPS` gets a
+layout from the same rule with no edit to the page.
+
+**Clamping noisy channels.** A single spike on a channel whose real values are small stretches
+the shared Y axis and flattens everything beside it, so a group can be given an absolute limit:
+
+```toml
+[telemetry.clip]
+trace = 100.0             # values outside ±100 are clamped to it
+```
+
+* Applied **on read-out**, so the ring buffer still holds what the device sent and raising the
+  limit re-exposes the buffered history instead of finding it already flattened.
+* Applied once, in `SerialImuService._clean`, which every consumer goes through — so a clamped
+  value is what the plots draw *and* what `trace.csv` records.
+* A group not listed passes through untouched. **Never add `state`**: `t_src` is the device
+  clock, and any limit turns it into a plateau seconds after start-up.
+* Lossy on purpose — a flat line at the limit cannot be told from the signal genuinely sitting
+  there, so a clamped group's chart header carries a `clip ±100` badge.
+* **Non-finite values (NaN/inf) are dropped for every group**, limit or no limit. That is not
+  cosmetic: `json.dumps` renders NaN as a bare `NaN` token, which is valid Python and invalid
+  JSON, so one NaN on the wire would make the browser reject the whole `/data` response — and
+  the poll's `catch` swallows it, leaving a frozen page and nothing in the log.
+
 **Switching to `exo_v1` is not backward compatible.** 26 and 94 are not multiples of each other,
 so a device still sending the old frame never aligns and the UI shows `(no data)` forever. The
 reader logs a hint after 5 s (`open but no frame decoded … check [source] layout`), and

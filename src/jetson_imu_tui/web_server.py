@@ -32,6 +32,7 @@ from jetson_imu_tui.imu_common import (
     PLACEMENTS,
     SIGNAL_AXES,
     SIGNAL_UNITS,
+    TELEMETRY_CHARTS,
     TELEMETRY_GROUPS,
     AxisState,
 )
@@ -377,8 +378,14 @@ def create_app(state: ServerState, window_s: float, poll_ms: int) -> Flask:
             {k: {"axes": list(SIGNAL_AXES[k]), "unit": SIGNAL_UNITS.get(k, "")}
              for k in SIGNAL_AXES}
         ))
+        # ``charts`` is how a group is cut into plots (imu_common._chart_split); ``clip`` is
+        # the limit its values were clamped to, shown in the header so a flat line at the limit
+        # is not mistaken for the signal genuinely sitting there.
         .replace("__TELEMETRY__", json.dumps(
-            [{"key": g, "channels": list(ch), "unit": u} for g, ch, u in TELEMETRY_GROUPS]
+            [{"key": g, "channels": list(ch), "unit": u,
+              "clip": state.cfg.telemetry_clip.get(g),
+              "charts": [{"title": t, "channels": list(cs)} for t, cs in TELEMETRY_CHARTS[g]]}
+             for g, ch, u in TELEMETRY_GROUPS]
         ))
     )
 
@@ -558,6 +565,7 @@ def _make_source(
             layout=cfg.serial_layout,
             gyro_units=cfg.serial_gyro_units,
             axis=axis,
+            clip=cfg.telemetry_clip,
         ), None
     if kind != "i2c":
         return None, f'Unknown source kind "{kind}" — expected "i2c" or "serial"'
@@ -695,10 +703,15 @@ _HTML = """<!DOCTYPE html>
   .grow{flex:1}
   #status{font-variant-numeric:tabular-nums;color:var(--muted);font-size:12px;white-space:nowrap}
   #dot{display:inline-block;width:8px;height:8px;border-radius:50%;background:#22c55e;margin-right:7px;vertical-align:middle}
-  #charts{flex:1;min-height:0;display:flex;flex-direction:column;gap:8px;padding:8px}
-  .chart{flex:1;min-height:0;display:flex;flex-direction:column;background:var(--panel);border:1px solid var(--border);border-radius:10px;padding:6px 10px}
+  /* Charts never shrink below MIN_CHART_PX: a group split into 5 or 6 plots would otherwise
+     squeeze each one flat. Few charts still grow to fill; too many scroll instead. */
+  #charts{flex:1;min-height:0;display:flex;flex-direction:column;gap:8px;padding:8px;overflow-y:auto}
+  .chart{flex:1 0 160px;min-height:160px;display:flex;flex-direction:column;background:var(--panel);border:1px solid var(--border);border-radius:10px;padding:6px 10px}
   .chead{display:flex;align-items:center;gap:16px;padding:1px 2px 5px;font-size:12px;color:var(--muted)}
   .ctitle{font-weight:700;color:var(--fg);text-transform:uppercase;letter-spacing:.05em}
+  /* Channel names keep their own case so they match the Simulink signal they came from —
+     finalClass, not FINALCLASS. */
+  .cname{text-transform:none;letter-spacing:0}
   .cval{display:inline-flex;align-items:center;gap:6px;font-variant-numeric:tabular-nums}
   .cval i{width:10px;height:10px;border-radius:3px;display:inline-block}
   .cval b{color:var(--fg);min-width:60px;display:inline-block}
@@ -911,7 +924,6 @@ const TELEMETRY = __TELEMETRY__;
 const TELE_BY_KEY = Object.fromEntries(TELEMETRY.map(g => [g.key, g]));
 const UNITS = Object.fromEntries(Object.entries(SIGNALS).map(([k,v]) => [k, v.unit]));
 const isTele = k => !!TELE_BY_KEY[k];
-const axesOf = k => isTele(k) ? TELE_BY_KEY[k].channels : SIGNALS[k].axes;
 const unitOf = k => isTele(k) ? TELE_BY_KEY[k].unit : (SIGNALS[k] ? SIGNALS[k].unit : '');
 const THEMES = {
   dark:  { axis:'#8b93a7', grid:'#222a38', series:['#e879f9','#22d3ee'], ax:{x:'#f87171',y:'#4ade80',z:'#60a5fa',w:'#fbbf24'},
@@ -946,28 +958,50 @@ const clsColor = c => CLS_COLORS[c] || '#60a5fa';
 
 const fmt = (sig, v) => v == null ? '--' : v.toFixed(sig === 'quat' ? 3 : 2);
 
+// Decimals for an x tick, from the tick spacing uPlot settled on. Enough to tell adjacent
+// ticks apart and no more: at 1 s spacing milliseconds are noise, but at 20 ms spacing
+// dropping them makes every label on the axis read the same number.
+function tDecimals(incr){
+  if(!(incr > 0)) return 1;
+  if(incr >= 1) return 0;
+  if(incr >= 0.1) return 1;
+  if(incr >= 0.01) return 2;
+  return 3;
+}
+
 // One chart spec per plot the current selection needs. Per-sensor signals cut one chart per
-// axis with a line per sensor; a telemetry group is one chart with a line per channel. Both
-// shapes come out as {title, key, series:[{name,color}]}, so everything downstream is shared.
+// axis with a line per sensor; a telemetry group is cut by imu_common._chart_split — right/left
+// where the channels pair up, one chart per channel where they do not. Both shapes come out as
+// {title, key, axIdx, series:[{name, idx, color}]}, so everything downstream is shared.
+//
+// Colours run by position *within the chart*, not by wire position, so the right chart's pos_r
+// and the left chart's pos_l share a colour and the two legs read as parallel.
 function chartSpecs(){
   const T = theme();
   if(isTele(signal)){
     const g = TELE_BY_KEY[signal];
-    return [{ title: signal, key: signal,
-              series: g.channels.map((c,k) => ({ name:c, color: T.multi[k % T.multi.length] })) }];
+    return (g.charts || []).map(ch => ({
+      title: signal + ' <span class="cname" style="color:' + T.multi[0] + '">' + ch.title + '</span>',
+      key: ch.title,
+      axIdx: 0,
+      series: ch.channels.map((name,k) => ({
+        name, idx: g.channels.indexOf(name), color: T.multi[k % T.multi.length],
+      })),
+    }));
   }
   const sg = SIGNALS[signal];
   if(!sg) return [];
-  return sg.axes.map(ax => ({
-    title: signal + ' <span style="color:' + (T.ax[ax] || T.axis) + '">' + ax + '</span>',
+  return sg.axes.map((ax, ai) => ({
+    title: signal + ' <span class="cname" style="color:' + (T.ax[ax] || T.axis) + '">' + ax + '</span>',
     key: ax,
-    series: labels.map((lab,k) => ({ name:lab, color: T.series[k % T.series.length] })),
+    axIdx: ai,
+    series: labels.map((lab,k) => ({ name:lab, idx:k, color: T.series[k % T.series.length] })),
   }));
 }
 
 // Columns for one chart in uPlot order [xs, ...series]. The only place that knows where the
 // numbers come from, so live polling and offline replay differ here and nowhere else.
-function chartCols(spec, i){
+function chartCols(spec){
   if(offline){
     if(isTele(signal)){
       const g = offline.telemetry[signal];
@@ -981,11 +1015,14 @@ function chartCols(spec, i){
   }
   const ts = samples.map(s => s.t);
   if(isTele(signal)){
-    return [ts, ...spec.series.map((sr, ci) =>
-      samples.map(s => { const v = s.telemetry && s.telemetry[signal]; return v ? v[ci] : null; }))];
+    // sr.idx is the channel's position in the group's wire order — NOT its position in this
+    // chart. With one chart per channel the two differ, and using the chart-local index would
+    // draw every plot from the group's first channel.
+    return [ts, ...spec.series.map(sr =>
+      samples.map(s => { const v = s.telemetry && s.telemetry[signal]; return v ? v[sr.idx] : null; }))];
   }
   return [ts, ...spec.series.map(sr =>
-    samples.map(s => { const v = s[signal] && s[signal][sr.name]; return v ? v[i] : null; }))];
+    samples.map(s => { const v = s[signal] && s[signal][sr.name]; return v ? v[spec.axIdx] : null; }))];
 }
 
 function chartOpts(w, h, spec){
@@ -998,8 +1035,8 @@ function chartOpts(w, h, spec){
   // Offline: the window the server returned, ticks labelled as seconds into the session.
   const xscale = offline ? { time:false }
                          : { time:false, range: () => [latestT - WINDOW_S, latestT] };
-  const xvalues = offline ? (u,vs) => vs.map(v => v.toFixed(1))
-                          : (u,vs) => vs.map(v => (v - latestT).toFixed(0));
+  const xvalues = offline ? (u,vs,ai,sp,incr) => vs.map(v => v.toFixed(tDecimals(incr)))
+                          : (u,vs,ai,sp,incr) => vs.map(v => (v - latestT).toFixed(tDecimals(incr)));
   return {
     width: w, height: h,
     legend: { show:false },
@@ -1035,12 +1072,15 @@ function rebuildCharts(){
     }
   });
   const unit = unitOf(signal);
+  // Clamped groups say so: a flat line at the limit reads as a real measurement otherwise.
+  const clip = isTele(signal) ? TELE_BY_KEY[signal].clip : null;
+  const badge = (unit ? ' <span class="runit">' + unit + '</span>' : '')
+    + (clip != null ? ' <span class="runit">clip ±' + clip + '</span>' : '');
   specs = chartSpecs();
   specs.forEach((spec) => {
     const card = document.createElement('div'); card.className = 'chart';
     const head = document.createElement('div'); head.className = 'chead';
-    head.innerHTML = '<span class="ctitle">' + spec.title
-        + (unit ? ' <span class="runit">' + unit + '</span>' : '') + '</span>'
+    head.innerHTML = '<span class="ctitle">' + spec.title + badge + '</span>'
       + spec.series.map((sr,k)=>'<span class="cval"><i style="background:' + sr.color + '"></i>'
           + sr.name + ' <b data-v="' + k + '">--</b></span>').join('');
     const body = document.createElement('div'); body.className = 'canvas';
@@ -1056,7 +1096,7 @@ function redraw(){
   charts.forEach((u, i) => {
     const spec = specs[i];
     if(!spec) return;
-    const cols = chartCols(spec, i);
+    const cols = chartCols(spec);
     u.setData(cols);
     // Header value: the newest sample live, the last point of the window offline.
     const n = cols[0].length;

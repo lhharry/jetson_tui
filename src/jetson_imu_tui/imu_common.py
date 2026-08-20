@@ -86,6 +86,42 @@ TELEMETRY_CHANNELS: dict[str, tuple[str, ...]] = {g: ch for g, ch, _ in TELEMETR
 
 TELEMETRY_KEYS: tuple[str, ...] = tuple(g for g, _, _ in TELEMETRY_GROUPS)
 
+# Side suffixes that make a group splittable into a right chart and a left one.
+_SIDES = (("right", "_r"), ("left", "_l"))
+
+
+def _chart_split(channels: tuple[str, ...]) -> tuple[tuple[str, tuple[str, ...]], ...]:
+    """Channel list -> the charts it should be drawn as: ((title, channels), ...).
+
+    Args:
+        channels: tuple[str, ...], one group's channel names in wire order.
+
+    Returns:
+        tuple of (chart title, channels on that chart), in display order. Every input channel
+        appears exactly once across the result.
+
+    A group whose channels split cleanly into ``_r`` / ``_l`` halves becomes two charts, right
+    then left, so one leg's quantities can be read together and compared against the other's.
+    Anything else gets one chart per channel: with no side to pair them by there is no reason
+    to think two channels share a Y range, and ``trace`` is the proof — a class index of 0..10
+    overlaid on a few-hundred deg/s velocity flattens the class line onto the axis.
+
+    Matching is case-sensitive on purpose. ``MotorCom_L`` is a left *motor command*, not one
+    half of a symmetric pair, and lower-casing the test would drag it into a "left" chart with
+    nothing to sit beside.
+    """
+    halves = [(title, tuple(c for c in channels if c.endswith(sfx))) for title, sfx in _SIDES]
+    if all(h for _t, h in halves) and sum(len(h) for _t, h in halves) == len(channels):
+        return tuple(halves)
+    return tuple((c, (c,)) for c in channels)
+
+
+# Group name -> the charts its channels are drawn as. Derived, never hand-written, so a group
+# added to TELEMETRY_GROUPS gets a sensible layout with no edit here and none in the page.
+TELEMETRY_CHARTS: dict[str, tuple[tuple[str, tuple[str, ...]], ...]] = {
+    g: _chart_split(ch) for g, ch, _ in TELEMETRY_GROUPS
+}
+
 
 @dataclass
 class ImuInfo:

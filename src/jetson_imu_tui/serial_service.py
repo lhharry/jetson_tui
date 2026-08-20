@@ -98,6 +98,17 @@ RATE_REPORT_S = 3.0
 # far end is not reading, and the protocol already treats a missing result as silence.
 WRITE_TIMEOUT_S = 0.05
 
+# Rate-limit the TX failure log by *time*, not by state. A link sitting right at its limit
+# alternates success and failure many times a second, and a flag cleared on every success turns
+# "one line per episode" into a flood that buries everything else in the log.
+TX_LOG_EVERY_S = 10.0
+
+# After a failed write, stop trying for this long. A far end that is not draining its receive
+# buffer cannot recover within one decision interval, and every attempt costs the inference
+# thread up to WRITE_TIMEOUT_S — at several decisions a second that is real time spent blocking
+# on a link already known to be dead.
+TX_BACKOFF_S = 1.0
+
 # No frame for this long means the stream has stopped, even though the port is still open.
 STALE_AFTER_S = 1.0
 
@@ -128,6 +139,7 @@ class SerialImuService:
         state_path=None,
         axis_ops=(),
         axis: AxisState | None = None,
+        clip: dict[str, float] | None = None,
     ) -> None:
         self._port = port
         self._baud = int(baud)
@@ -145,6 +157,8 @@ class SerialImuService:
         self._telemetry = tuple(
             g for g in TELEMETRY_KEYS if blocks & set(_GROUP_BLOCK.get(g, ()))
         )
+        # Per-group absolute limit, applied on read-out (see ``_clean``). Empty = no clamping.
+        self._clip = {k: abs(float(v)) for k, v in (clip or {}).items()}
 
         self._buf = RingBuffer(maxlen=BUFFER_MAXLEN)
         self._offset: dict[str, dict[str, list[float]]] | None = None
@@ -170,7 +184,9 @@ class SerialImuService:
         # Rate limits: the reader retries every REOPEN_DELAY_S and results are written
         # continuously, so both failures log once per episode rather than on every attempt.
         self._open_err_logged = False
-        self._tx_err_logged = False
+        # monotonic time of the last logged TX failure, and the earliest time to try again.
+        self._tx_err_logged_at = 0.0
+        self._tx_retry_at = 0.0
 
     # --- lifecycle ---------------------------------------------------------
     @property
@@ -266,7 +282,8 @@ class SerialImuService:
             with self._io_lock:
                 self._ser = ser
                 self._open_err_logged = False
-                self._tx_err_logged = False
+                self._tx_err_logged_at = 0.0
+                self._tx_retry_at = 0.0
             n_frames, t_first, rate_logged = 0, None, False
             # An open port that never yields a frame is the one failure ``decode_frames`` cannot
             # report: it just keeps hunting for a byte phase, silently, forever. The reader
@@ -345,19 +362,35 @@ class SerialImuService:
     def send_result(self, index: int) -> bool:
         """Write one classification-result byte back to the device. Returns True if written.
 
-        Called from the CLS inference thread once per aggregated decision (2 Hz at the shipped
-        settings), so it must never raise and never block: a closed port is simply silence — the
-        reader thread is already retrying, and the agreed protocol has no 'no result' sentinel.
-        One byte at 115200 baud needs no ``flush()``; the write reaches the OS buffer directly.
+        Called from the CLS inference thread once per aggregated decision, so it must never
+        raise and never block: a closed port is simply silence — the reader thread is already
+        retrying, and the agreed protocol has no 'no result' sentinel. One byte needs no
+        ``flush()``; the write reaches the OS buffer directly.
 
-        Bounded twice over, because inference must not be hostage to the far end. A device that
-        never reads its serial input (a pure transmitter) leaves the host's write buffer full,
-        and an unbounded ``write`` would then block this thread permanently — stopping inference
-        outright. ``WRITE_TIMEOUT_S`` caps the write, and the lock is acquired with the same
-        timeout so a writer already stuck in one cannot hold up the next."""
+        Bounded three ways, because inference must not be hostage to the far end:
+
+        * ``WRITE_TIMEOUT_S`` caps the write itself. A device that does not drain its receive
+          buffer leaves the host's write buffer full, and an unbounded ``write`` would block
+          this thread permanently — stopping inference outright.
+        * The lock is acquired with the same timeout, so a writer already stuck in one cannot
+          hold up the next.
+        * ``TX_BACKOFF_S`` skips writes entirely for a while after a failure. Without it a
+          blocked link costs ``WRITE_TIMEOUT_S`` on *every* decision, which at several decisions
+          a second is a large slice of the inference thread spent waiting on a link already
+          known to be refusing bytes.
+
+        Note what a *flapping* result means, because it is the diagnostic that matters here: the
+        far end is draining, just not fast enough to keep up, so its buffer fills gradually and
+        the link degrades from "occasionally blocked" to "always blocked". That is a receive
+        *rate* problem on the device, not a wiring problem — see the README's return-channel
+        section.
+        """
         if not isinstance(index, int) or not 0 <= index <= 255:
             logger.warning(f"{self._label}: refusing to send out-of-range result {index!r}")
             return False
+        now = time.monotonic()
+        if now < self._tx_retry_at:
+            return False              # backing off; the next decision carries a fresher class
         if not self._io_lock.acquire(timeout=WRITE_TIMEOUT_S):
             self.tx_ok = False
             return False  # a previous write is still draining — drop this result, don't queue
@@ -369,16 +402,18 @@ class SerialImuService:
                 ser.write(bytes([index]))
             except Exception as err:
                 self.tx_ok = False
-                # Results stream continuously; log the first failure and stay quiet until one
-                # succeeds again, so an unplugged or non-reading device cannot flood the log.
-                if not self._tx_err_logged:
+                self._tx_retry_at = now + TX_BACKOFF_S
+                if now - self._tx_err_logged_at >= TX_LOG_EVERY_S:
+                    self._tx_err_logged_at = now
                     logger.warning(
-                        f"{self._label}: result write failed ({err}) — is the device reading "
-                        f"its serial input?"
+                        f"{self._label}: result write failed ({err}) — the device is not "
+                        f"draining its serial input fast enough (further failures quiet for "
+                        f"{TX_LOG_EVERY_S:.0f}s)"
                     )
-                    self._tx_err_logged = True
                 return False
-            self._tx_err_logged = False
+            if self.tx_ok is False:
+                logger.info(f"{self._label}: result writes recovered")
+            self._tx_err_logged_at = 0.0
             self.tx_ok = True
             return True
         finally:
@@ -430,6 +465,10 @@ class SerialImuService:
         ``apply_axis_transform``: that function emits exactly the four sensor keys and drops
         everything else, and rotating a motor torque or a class index would be meaningless
         anyway. Telemetry is attached alongside the transformed signal, never through it.
+
+        Clamping and non-finite rejection happen here rather than in the reader thread, so the
+        ring buffer always holds what the device actually sent: changing a limit re-applies it
+        to the whole buffered history instead of leaving mangled samples behind it.
         """
         if sample is None:
             return None
@@ -438,10 +477,45 @@ class SerialImuService:
             if group == "state":
                 # Assembled, not copied: its two channels come from different blocks, and
                 # either may be absent on a layout that carries only the other.
-                out[group] = [sample.get("enable"), sample.get("t_src")]
+                vals = [sample.get("enable"), sample.get("t_src")]
             else:
                 vals = sample.get(_GROUP_SOURCE[group])
-                out[group] = list(vals) if vals is not None else None
+            out[group] = self._clean(group, vals) if vals is not None else None
+        return out
+
+    def _clean(self, group: str, vals) -> list:
+        """One group's raw values -> what consumers may see: clamped, and finite or None.
+
+        Args:
+            group: str, a TELEMETRY_GROUPS name — selects the limit from ``self._clip``.
+            vals:  sequence of float | None, the group's channels in wire order.
+
+        Returns:
+            list of float | None, same length and order as ``vals``.
+
+        Two different problems, two different answers:
+
+        * **Out of range** is a noise spike on a channel whose real values are small, and it is
+          *clamped* to the limit. The trade is deliberate and lossy — a flat line at the limit
+          is indistinguishable from the signal genuinely sitting there — but it keeps the shared
+          Y axis usable, which a single 9999 does not. Only groups named in ``[telemetry.clip]``
+          are clamped; anything else passes through, which is why ``state`` must stay out of
+          that table (``t_src`` is a device clock that climbs into the thousands).
+        * **Non-finite** is not out of range, it is invalid, so it becomes None regardless of
+          any limit. This is not cosmetic: ``json.dumps`` renders NaN as a bare ``NaN`` token,
+          which is valid Python and invalid JSON, so one NaN on the wire makes the browser
+          reject the entire ``/data`` response — and ``tick()``'s catch swallows it, leaving a
+          frozen page and nothing in the log.
+        """
+        lim = self._clip.get(group)
+        out: list = []
+        for v in vals:
+            if v is None or not math.isfinite(v):
+                out.append(None)
+            elif lim is None:
+                out.append(v)
+            else:
+                out.append(lim if v > lim else (-lim if v < -lim else v))
         return out
 
     def telemetry(self) -> dict[str, list[float] | None]:
