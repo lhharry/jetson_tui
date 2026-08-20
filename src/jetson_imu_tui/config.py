@@ -60,6 +60,9 @@ class AppConfig:
     vote_window: int = 5
     vote_emit_every: int = 5
     vote_hysteresis: int = 0
+    # Absolute path of the TOML this was loaded from. Recorded into every session folder so
+    # a recording can be traced back to the settings that produced it.
+    config_path: str = ""
 
     @property
     def labels(self) -> list[str]:
@@ -84,6 +87,7 @@ def load_config(path: Path | None = None) -> AppConfig:
     clip = raw.get("telemetry", {}).get("clip", {})
     sample_hz = int(defaults.get("sample_hz", 100))
     return AppConfig(
+        config_path=str(Path(src).resolve()),
         bus_labels=bus_labels or {1: "Left", 7: "Right"},
         log_dir=Path(defaults.get("log_dir", "./logs")).expanduser(),
         sample_hz=sample_hz,

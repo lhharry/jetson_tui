@@ -200,11 +200,54 @@ class ServerState:
             self.recorder = None
         return True
 
+    def recorder_meta(self) -> dict:
+        """Effective settings for the session about to be recorded, for <session>/config.json.
+
+        Args:    none. Reads ``self.cfg`` and the live source.
+        Returns: dict, JSON-ready.
+
+        Built here rather than in ``Recorder`` because this is the only object holding both the
+        config and the active source. The measured wire rate is included alongside the configured
+        one: their disagreement is the failure this file exists to make visible after the fact.
+        """
+        cfg = self.cfg
+        svc = self.service
+        observed = getattr(svc, "observed_hz", None)
+        meta: dict = {
+            "config_path": cfg.config_path,
+            "source": {
+                "kind": self.source_kind,
+                "sample_hz": cfg.sample_hz_for(self.source_kind),
+                "observed_hz": observed,
+                "port": cfg.serial_port,
+                "baud": cfg.serial_baud,
+                "layout": cfg.serial_layout,
+                "gyro_units": cfg.serial_gyro_units,
+                "label": cfg.serial_label,
+            },
+            "record_hz": self.record_hz,
+            "axis_ops": list(self.axis.transform.ops),
+            "telemetry_clip": dict(cfg.telemetry_clip),
+        }
+        if self.cls is not None and self.cls.enabled:
+            meta["cls"] = {
+                "model_path": cfg.cls_model_path,
+                "sensor": cfg.cls_sensor,
+                "stride": cfg.cls_stride,
+                **self.cls.timing(observed),
+                "vote_enabled": cfg.vote_enabled,
+                "vote": self.cls.vote_config,
+            }
+        else:
+            meta["cls"] = None
+        return meta
+
     def toggle_record(self) -> bool:
         with self._lock:
             if self.recorder is None:
                 self.recorder = Recorder(
-                    self.service, self.log_dir, self.record_hz, cls=self.cls
+                    self.service, self.log_dir, self.record_hz, cls=self.cls,
+                    meta=self.recorder_meta(),
                 ).__enter__()
                 return True
             self._stop_recorder_locked()
@@ -284,7 +327,8 @@ class ServerState:
                 except Exception:
                     pass
                 self.recorder = Recorder(
-                    self.service, self.log_dir, self.record_hz, cls=self.cls
+                    self.service, self.log_dir, self.record_hz, cls=self.cls,
+                    meta=self.recorder_meta(),
                 ).__enter__()
         return self.record_hz
 
@@ -311,51 +355,89 @@ class ServerState:
             pass
 
 
+# Relative disagreement between the configured wire rate and the measured one, past which the
+# page badges it and the log warns once. 5% is far below the ratios that actually go wrong here
+# (150 vs 100 is 50%) and far above the jitter of a rate averaged over RATE_REPORT_S.
+RATE_TOLERANCE = 0.05
+
+
+def _rate_health(cfg: AppConfig, kind: str, observed: float | None) -> dict | None:
+    """Configured vs measured wire rate. None when they agree, or nothing was measured.
+
+    Args:
+        cfg:      AppConfig, for the declared ``sample_hz`` of this source kind.
+        kind:     str, "serial" or "i2c".
+        observed: float | None, the rate the source actually measured on the wire.
+
+    Returns:
+        dict {"configured", "observed", "ratio"} | None.
+
+    ``sample_hz`` drives the CLS decimation and nothing validates it, so getting it wrong
+    rescales every model window with no error anywhere -- a configured 150 against a real 100
+    stretched the 2 s window to 3.0 s and went unnoticed for an unknown number of sessions.
+    """
+    if not observed or observed <= 0:
+        return None
+    configured = float(cfg.sample_hz_for(kind))
+    if configured <= 0 or abs(observed - configured) / configured <= RATE_TOLERANCE:
+        return None
+    return {"configured": configured, "observed": float(observed),
+            "ratio": float(observed) / configured}
+
+
 def _payload(state: ServerState, since: float | None = None) -> dict:
+    # Bind the source once. It is swapped wholesale by ``switch_source``, so reading
+    # ``state.service`` per field lets one response mix a stale ``signals()`` with a fresh
+    # ``samples_since()`` -- two different label sets in one payload.
+    svc = state.service
+    observed = getattr(svc, "observed_hz", None)
     out: dict = {
         "t": time.monotonic(),
         "recording": state.recording,
-        "zeroed": state.service.is_zeroed,
+        "zeroed": svc.is_zeroed,
         "hz": state.record_hz,
         # Rows per second actually being written, so the requested rate and the achieved one are
         # on screen together. None until the first measurement window closes, or when not
         # recording.
         "rows_hz": (state.recorder.rows_hz if state.recorder is not None else None),
         "source": state.source_kind,
-        "source_connected": state.service.is_connected(),
+        "source_connected": svc.is_connected(),
         # Open port != data arriving. Only the serial source can tell the two apart; the I2C
         # sampler threads run whenever sensors are connected, so being connected is enough there.
-        "source_streaming": bool(
-            getattr(state.service, "receiving", state.service.is_connected())
-        ),
+        "source_streaming": bool(getattr(svc, "receiving", svc.is_connected())),
         # Return channel health: None = nothing sent yet, False = the device is not accepting
         # results (usually because its sketch never reads its serial input).
-        "source_tx": getattr(state.service, "tx_ok", None),
-        # The wire rate actually measured, so the page can show it against the configured
-        # sample_hz. A mismatch silently rescales every CLS window, and is invisible otherwise.
-        "observed_hz": getattr(state.service, "observed_hz", None),
+        "source_tx": getattr(svc, "tx_ok", None),
+        # The wire rate actually measured, against the configured sample_hz. A mismatch silently
+        # rescales every CLS window, so it is served as a flag rather than left to the eye.
+        "observed_hz": observed,
+        "sample_hz": state.cfg.sample_hz_for(state.source_kind),
+        "rate_mismatch": _rate_health(state.cfg, state.source_kind, observed),
+        # Fraction of recent frames repeating the previous frame's device clock. observed_hz is
+        # blind to this: a device resending each sample 3x still shows a healthy wire rate.
+        "dup_ratio": getattr(svc, "dup_ratio", None),
         "sources": _source_available(),
         # Which device-global telemetry groups this source carries. Empty on I2C. The page
         # builds its telemetry charts from this, so a group the link lacks gets no chart
         # rather than a flat line at zero.
-        "telemetry_groups": list(_available_telemetry(state.service)),
+        "telemetry_groups": list(_available_telemetry(svc)),
         "euler": {},
         "accel": {},
         "gyro": {},
         "quat": {},
         "telemetry": {},
     }
-    for label, sig in state.service.signals().items():
+    for label, sig in svc.signals().items():
         for key in ("euler", "accel", "gyro", "quat"):
             out[key][label] = sig[key] if sig is not None else None
-    tele = getattr(state.service, "telemetry", None)
+    tele = getattr(svc, "telemetry", None)
     if tele is not None:
         out["telemetry"] = tele()
     if since is not None:
         # Batch of buffered samples newer than the client's cursor (memory read, no I2C).
         # Telemetry rides inside these rows -- see SerialImuService.samples_since for why it
         # must not be a second cursor.
-        out["samples"] = state.service.samples_since(since)
+        out["samples"] = svc.samples_since(since)
     return out
 
 
@@ -450,7 +532,12 @@ def create_app(state: ServerState, window_s: float, poll_ms: int) -> Flask:
             since = int(request.args.get("since", 0))
         except (TypeError, ValueError):
             since = 0
-        return jsonify(state.cls.snapshot(since))
+        snap = state.cls.snapshot(since)
+        if snap.get("enabled"):
+            # Computed here, not in ClsService: the observed rate is a property of the source,
+            # and cls/ deliberately knows nothing about which source it is reading.
+            snap["timing"] = state.cls.timing(getattr(state.service, "observed_hz", None))
+        return jsonify(snap)
 
     @app.route("/cls/toggle", methods=["POST"])
     def cls_toggle() -> Response:
@@ -581,6 +668,9 @@ def _make_source(
             magic=cfg.serial_magic,
             layout=cfg.serial_layout,
             gyro_units=cfg.serial_gyro_units,
+            # Only so the reader can warn when the measurement disagrees with it; nothing in
+            # the decode path uses it.
+            expected_hz=cfg.serial_sample_hz,
             axis=axis,
             clip=cfg.telemetry_clip,
         ), None
@@ -774,6 +864,7 @@ _HTML = """<!DOCTYPE html>
   .chip button:hover{color:#f87171}
   .mapout{font-family:ui-monospace,SFMono-Regular,Menlo,monospace;font-size:12px;color:var(--fg);line-height:1.7}
   .warn{color:#f87171;font-size:12px;font-weight:600}
+  .badge{color:#fbbf24;font-weight:600}
   .mfoot{display:flex;align-items:center;gap:10px;padding-top:4px}
   .mfoot .grow{flex:1}
   #axisApply[disabled]{opacity:.45;cursor:not-allowed}
@@ -1780,13 +1871,24 @@ async function pollCls(){
   runBtn.style.display = '';
   runBtn.textContent = running ? 'Stop' : 'Start';
   runBtn.classList.toggle('rec-on', running);
+  // What the window really spans, measured against the wire rate. If it disagrees with the
+  // trained span the model is seeing time-scaled input, which has no other symptom.
+  const tm = d.timing;
+  let winNote = '';
+  if(tm && tm.window_s){
+    const off = Math.abs(tm.window_s - tm.trained_window_s) > 0.15 * tm.trained_window_s;
+    winNote = '<span class="clsvote' + (off ? ' warn' : '') + '" title="window '
+            + tm.window + ' vectors x decim ' + tm.decim + (tm.nominal ? ' / sample_hz' : ' / measured wire rate')
+            + '">window ' + tm.window_s.toFixed(2) + 's'
+            + (off ? ' (trained ' + tm.trained_window_s.toFixed(2) + 's)' : '') + '</span>';
+  }
   const v = d.vote || {};
   // The banner shows the aggregated decision — the service's actual output, and the only thing
   // sent back over serial. The raw 10 Hz stream stays visible in the log below.
   const voteNote = v.window > 1
       ? 'voted · ' + v.window + ' frames every ' + v.emit_every
         + (v.hysteresis > 1 ? ' · hysteresis ' + v.hysteresis : '')
-      : 'per frame (voting off)';
+      : 'per frame · aggregation is device-side';
   banner.title = voteNote;
   if(!running){
     banner.className = 'clsbanner';
@@ -1797,7 +1899,8 @@ async function pollCls(){
     banner.innerHTML = '<span class="clscls" style="color:' + clsColor(d.decision.cls) + '">'
         + d.decision.cls + '</span>'
         + '<span class="clsconf">' + (d.decision.conf * 100).toFixed(0) + '%</span>'
-        + '<span class="clsvote">' + voteNote + (d.decision.held ? ' · held' : '') + '</span>';
+        + '<span class="clsvote">' + voteNote + (d.decision.held ? ' · held' : '') + '</span>'
+        + winNote;
   } else {
     banner.className = 'clsbanner';
     banner.innerHTML = '<span class="muted">waiting for data (' + (d.sensor || '') + ')…</span>';
@@ -1860,7 +1963,21 @@ async function tick(){
       }
       // The measured wire rate next to the poll rate: it is the only visible check that
       // [source] sample_hz matches reality, and a mismatch rescales every CLS window silently.
-      const obs = (d.observed_hz != null) ? ' · wire ' + d.observed_hz.toFixed(1) + ' Hz' : '';
+      let obs = (d.observed_hz != null) ? ' · wire ' + d.observed_hz.toFixed(1) + ' Hz' : '';
+      // Two independent faults, and the first hides the second: a device resending each sample
+      // three times still puts a healthy wire rate on the line, so duplication needs its own badge.
+      if(d.rate_mismatch){
+        obs += ' <span class="badge" title="[source] sample_hz disagrees with the measured wire'
+             + ' rate. CLS decimates by sample_hz, so every model window is scaled by this factor.">'
+             + '≠ sample_hz ' + d.rate_mismatch.configured.toFixed(0)
+             + ' (×' + d.rate_mismatch.ratio.toFixed(2) + ')</span>';
+      }
+      if(d.dup_ratio != null && d.dup_ratio > 0.1){
+        const factor = 1 / Math.max(1e-9, 1 - d.dup_ratio);
+        obs += ' <span class="badge" title="Frames repeating the previous device timestamp. The'
+             + ' wire rate looks healthy but the data is that many times staler.">stale ×'
+             + factor.toFixed(1) + '</span>';
+      }
       document.getElementById('status').innerHTML = '<span id="dot"></span>live · t=' + d.t.toFixed(1) + 's' + rateStr + obs;
       const rb = document.getElementById('recBtn');
       // Show the rate actually being written next to the one that was asked for: a setting

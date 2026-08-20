@@ -64,6 +64,7 @@ from jetson_imu_tui.imu_common import (
     apply_offset,
 )
 from jetson_imu_tui.read_serial import (
+    DT_MAX,
     DEFAULT_BAUD,
     DEFAULT_LAYOUT,
     DEFAULT_PORT,
@@ -88,8 +89,34 @@ _GROUP_BLOCK = {"knee": ("knee4",), "motor": ("fb6",), "trace": ("trace5",),
 # not to spin on a missing device, short enough that re-plugging the Arduino recovers on its own.
 REOPEN_DELAY_S = 2.0
 
-# Measure the incoming frame rate over this long, then report it once per connection.
+# Length of one wire-rate measurement window. The rate is recomputed every window for as long
+# as the link is up, not latched after the first one: ``sample_hz`` has to match the rate the
+# device is sending *now*, and a device whose rate drifts mid-session would otherwise keep
+# showing whatever it happened to be doing three seconds after connecting.
 RATE_REPORT_S = 3.0
+
+# Fraction of frames repeating the previous frame's device clock, past which the link is
+# reporting stale data and says so. A healthy link repeats nothing; the exo rig currently
+# repeats every sample three times (ratio 0.67) because its model overruns real time 3x.
+# This is the only signal that catches it -- the wire rate stays a perfectly healthy 100 Hz.
+DUP_WARN_RATIO = 0.10
+
+# Largest magnitude any non-clock channel may carry. Real values are orders below it: knee
+# velocities peak in the hundreds of deg/s, motor feedback lower still. A frame that decoded
+# from misaligned bytes reads as a float32 built from unrelated bits, which is astronomically
+# large far more often than it is plausible -- every corrupted frame observed in the recorded
+# sessions carried at least one value above 1e11.
+MAX_ABS_VALUE = 1e6
+
+# Consecutive frames rejected *solely* by the clock rule before the current one is accepted as a
+# new baseline. Without this, a device reboot (its clock restarts at zero, which reads as a
+# backward jump forever after) would silently discard every subsequent frame. Layouts carrying
+# ``t`` recover from a restart by re-aligning; this is the equivalent escape hatch for ``t_src``,
+# which by design gates nothing in the decoder.
+CLOCK_REBASELINE_FRAMES = 8
+
+# One log line per this many seconds while frames are being dropped, however many there are.
+DROP_LOG_EVERY_S = 10.0
 
 # Hard ceiling on a result write, and on waiting for the port lock. Both must be small: they are
 # paid on the CLS inference thread, and a transmitting device that never drains its receive
@@ -136,6 +163,7 @@ class SerialImuService:
         magic: str = "",
         layout: str = DEFAULT_LAYOUT,
         gyro_units: str = "deg",
+        expected_hz: float | None = None,
         state_path=None,
         axis_ops=(),
         axis: AxisState | None = None,
@@ -172,6 +200,18 @@ class SerialImuService:
         self._connected = False
         self.error: Exception | None = None  # last reader failure, for status reporting
         self.observed_hz: float | None = None  # measured wire rate, for checking sample_hz
+        # Configured wire rate, kept only to warn when the measurement disagrees with it.
+        self._expected_hz = float(expected_hz) if expected_hz else None
+        # Fraction of recent frames carrying the previous frame's device clock. None until the
+        # first window closes, or when the layout has no clock to compare.
+        self.dup_ratio: float | None = None
+        self._rate_logged = False
+        # Entry filter state: the last accepted device clock, and how many frames in a row have
+        # been rejected by the clock rule alone (see ``_accept``).
+        self._last_good_clock: float | None = None
+        self._clock_reject_streak = 0
+        self.dropped_frames = 0
+        self._drop_logged_at = 0.0
         self._last_frame_t: float | None = None  # monotonic time of the newest decoded frame
         # None until the first result is written; False once the far end stops accepting them.
         self.tx_ok: bool | None = None
@@ -284,7 +324,12 @@ class SerialImuService:
                 self._open_err_logged = False
                 self._tx_err_logged_at = 0.0
                 self._tx_retry_at = 0.0
-            n_frames, t_first, rate_logged = 0, None, False
+            # Rolling measurement window: frames, duplicate clocks, and its start time.
+            win_n, win_dup, win_t0, prev_clock, first_frame = 0, 0, None, None, True
+            self._rate_logged = False
+            # The device may have restarted while the port was down, so the previous
+            # connection's clock says nothing about this one.
+            self._last_good_clock, self._clock_reject_streak = None, 0
             # An open port that never yields a frame is the one failure ``decode_frames`` cannot
             # report: it just keeps hunting for a byte phase, silently, forever. The reader
             # thread is blocked inside that generator and cannot notice, so the deadline is
@@ -296,6 +341,8 @@ class SerialImuService:
                 for f in decode_frames(
                     ser, magic=self._magic, layout=self._layout, stop=self._stop
                 ):
+                    if not self._accept(f):
+                        continue
                     gx, gy, gz = f["gyro"]
                     now = time.monotonic()
                     # Buffered timestamps must be *strictly* increasing. Every consumer walks
@@ -323,19 +370,21 @@ class SerialImuService:
                     })
                     self._connected = True
                     self._last_frame_t = now
-                    # Report the rate the device actually sends at, once per connection:
-                    # ``sample_hz`` has to match it, and it is otherwise invisible.
-                    n_frames += 1
-                    if t_first is None:
-                        t_first = now
+                    # Rate and staleness, measured continuously. ``sample_hz`` has to match the
+                    # wire rate and nothing else validates it; duplication is invisible to the
+                    # rate alone, so both are counted in the same window.
+                    clock = f["t_src"] if f["t_src"] is not None else f["t"]
+                    if clock is not None and prev_clock is not None and clock == prev_clock:
+                        win_dup += 1
+                    prev_clock = clock
+                    win_n += 1
+                    if first_frame:
+                        first_frame = False
+                        win_t0 = now
                         warn_timer.cancel()
-                    elif not rate_logged and now - t_first >= RATE_REPORT_S:
-                        self.observed_hz = n_frames / (now - t_first)
-                        logger.info(
-                            f"{self._label}: {self.observed_hz:.1f} Hz observed on {self._port} "
-                            f"— set sample_hz to match"
-                        )
-                        rate_logged = True
+                    elif now - win_t0 >= RATE_REPORT_S:
+                        self._close_rate_window(win_n, win_dup, now - win_t0, has_clock=clock is not None)
+                        win_n, win_dup, win_t0 = 0, 0, now
             except Exception as err:  # port missing / unplugged mid-stream
                 self.error = err
                 self._connected = False
@@ -349,6 +398,134 @@ class SerialImuService:
                     except Exception:
                         pass
             self._stop.wait(REOPEN_DELAY_S)
+
+    def _accept(self, f: dict) -> bool:
+        """Is this decoded frame plausible enough to buffer? Advances the filter's state.
+
+        Args:    f: dict, one frame as ``read_serial.decode_frames`` yields it.
+        Returns: bool. False means drop this frame and keep going -- never re-sync.
+
+        ``exo_v1`` carries no sync timestamp, so once the decoder has locked on, its only check
+        is that ``aa55`` still lands on the frame boundary. A misaligned frame whose body happens
+        to contain those two bytes at that offset is accepted whole, with a body of garbage.
+        That is not hypothetical: the three recorded sessions hold seven such frames, and every
+        one of them reached the plots and the CSVs.
+
+        Two rules, and deliberately not a third:
+
+        * **Clock sanity** -- the device clock must not go backwards, and must not jump more than
+          ``DT_MAX``, measured against the last *accepted* frame rather than the last decoded one
+          so a single bad frame cannot drag the baseline with it.
+        * **Magnitude** -- any data channel beyond ``MAX_ABS_VALUE`` condemns the frame.
+
+        **Non-finite data does not.** A NaN in the controller trace is something the device
+        genuinely computed (a 0/0 in the control law), not evidence that the bytes are wrong, and
+        the frame carrying it still holds perfectly good IMU and knee readings. Those are cleaned
+        to None where they are read out -- ``_clean`` for telemetry, ``_as_signal`` for accel and
+        gyro -- which is the existing "buffer keeps what the device sent" contract. Dropping the
+        whole frame would discard real data to remove a value already handled, and it costs
+        nothing in detection: every one of the seven corrupted frames in the recorded sessions
+        carries a magnitude above 1e11, and across all three sessions there is not one NaN.
+        A non-finite *clock* is different and is rejected below -- it is this filter's own state
+        variable, and a NaN baseline would never compare true against anything again.
+
+        The clock rule pointedly does **not** reject ``dt == 0``. Repeated timestamps are normal
+        here twice over: this device sends each sample three times, and float32 quantisation
+        makes adjacent timestamps compare equal once uptime is long enough (``read_serial``'s
+        module docstring works the threshold out). Rejecting equality would drop two thirds of a
+        healthy stream today.
+
+        Re-syncing on a bad frame would be worse than dropping it: alignment is currently correct
+        -- one frame in ~10000 is corrupt, not the phase -- so tearing down the lock would throw
+        away ``SYNC_FRAMES`` good frames to fix nothing.
+        """
+        for key in ("accel", "gyro", "joints", "feedback", "trace"):
+            vals = f.get(key)
+            if vals is None:
+                continue
+            for v in vals:
+                if abs(v) > MAX_ABS_VALUE:   # NaN compares False here, which is intended
+                    return self._drop(f"{key} out of range ({v:g})")
+        enable = f.get("enable")
+        if enable is not None and abs(enable) > MAX_ABS_VALUE:
+            return self._drop(f"enable out of range ({enable:g})")
+
+        clock = f["t_src"] if f["t_src"] is not None else f["t"]
+        if clock is None:
+            return True                      # no clock in this layout: magnitude rule is all there is
+        if not math.isfinite(clock):
+            # Never counted toward the re-baseline streak: adopting NaN as the baseline would
+            # make every later comparison false and reject the stream forever.
+            return self._drop(f"clock not finite ({clock})")
+        last = self._last_good_clock
+        if last is not None and not (0.0 <= clock - last < DT_MAX):
+            self._clock_reject_streak += 1
+            if self._clock_reject_streak < CLOCK_REBASELINE_FRAMES:
+                return self._drop(f"clock step {clock - last:+g}s outside [0, {DT_MAX})")
+            # Long enough to be the device restarting rather than one corrupt frame. Adopt it.
+            logger.info(
+                f"{self._label}: device clock restarted (now {clock:g}s) — re-baselining after "
+                f"{self._clock_reject_streak} rejected frames"
+            )
+        self._clock_reject_streak = 0
+        self._last_good_clock = clock
+        return True
+
+    def _drop(self, why: str) -> bool:
+        """Count one rejected frame, logging at most once per ``DROP_LOG_EVERY_S``. Returns False."""
+        self.dropped_frames += 1
+        now = time.monotonic()
+        if now - self._drop_logged_at >= DROP_LOG_EVERY_S:
+            self._drop_logged_at = now
+            logger.warning(
+                f"{self._label}: dropped an implausible frame ({why}); "
+                f"{self.dropped_frames} total since start"
+            )
+        return False
+
+    def _close_rate_window(self, n_frames: int, n_dup: int, elapsed: float,
+                           *, has_clock: bool) -> None:
+        """Publish one measurement window's wire rate and duplicate ratio, warning if either is bad.
+
+        Args:
+            n_frames:  int, frames decoded in this window.
+            n_dup:     int, of those, how many repeated the previous frame's device clock.
+            elapsed:   float, seconds the window spanned.
+            has_clock: bool, whether the layout carries a device clock at all. Without one
+                       duplication is unmeasurable and is reported as None, never as zero.
+
+        Returns: None. Logs at most one line per condition per connection.
+
+        Two independent failures, and the first hides the second: a device that resends every
+        sample three times still puts a healthy 100 Hz on the wire, so the rate check passes
+        while the model is being fed data a third as fresh as it thinks.
+        """
+        if elapsed <= 0 or n_frames <= 0:
+            return
+        self.observed_hz = n_frames / elapsed
+        self.dup_ratio = (n_dup / n_frames) if has_clock else None
+        if self._rate_logged:
+            return
+        self._rate_logged = True
+        logger.info(
+            f"{self._label}: {self.observed_hz:.1f} Hz observed on {self._port} "
+            f"— set sample_hz to match"
+        )
+        exp = self._expected_hz
+        if exp and abs(self.observed_hz - exp) / exp > 0.05:
+            logger.warning(
+                f"{self._label}: [source] sample_hz = {exp:g} but the device is sending "
+                f"{self.observed_hz:.1f} Hz — CLS decimates by sample_hz, so every model window "
+                f"is scaled by {self.observed_hz / exp:.2f}x with no other symptom"
+            )
+        if self.dup_ratio is not None and self.dup_ratio > DUP_WARN_RATIO:
+            factor = 1.0 / max(1e-9, 1.0 - self.dup_ratio)
+            logger.warning(
+                f"{self._label}: {self.dup_ratio * 100:.0f}% of frames repeat the previous "
+                f"device timestamp — each sample is being sent ~{factor:.1f}x, so the link "
+                f"carries only ~{self.observed_hz / factor:.0f} distinct samples/s despite "
+                f"{self.observed_hz:.0f} Hz on the wire. This is a device-side fix."
+            )
 
     def _warn_no_frames(self) -> None:
         """Timer callback: the port has been open for NO_FRAME_WARN_S with nothing decoded.
@@ -442,13 +619,25 @@ class SerialImuService:
         ``{"euler","accel","gyro","quat"}`` dict of list[float], euler/quat always None
         (nothing in the stream to fill them), or None when ``sample`` is None.
 
+        A non-finite component becomes None, the same answer ``_clean`` gives telemetry. The
+        entry filter already refuses such frames, so this is the second line rather than the
+        first -- but it is the line that matters if one ever gets through: ``json.dumps`` writes
+        NaN as a bare ``NaN`` token, which is valid Python and invalid JSON, so a single NaN
+        makes the browser reject the whole ``/data`` response, and ``tick()``'s catch swallows
+        the failure into a frozen page with nothing in the log.
+
         ``apply_axis_transform`` copies, so the buffer row is never exposed or mutated."""
         if sample is None:
             return None
-        return apply_axis_transform(
+        out = apply_axis_transform(
             {"euler": None, "accel": sample["accel"], "gyro": sample["gyro"], "quat": None},
             self._axis.transform if tf is None else tf,
         )
+        for key in ("accel", "gyro"):
+            vals = out.get(key)
+            if vals is not None and not all(math.isfinite(v) for v in vals):
+                out[key] = [v if math.isfinite(v) else None for v in vals]
+        return out
 
     def available_telemetry(self) -> tuple[str, ...]:
         """The ``imu_common.TELEMETRY_GROUPS`` names this link carries, in table order.

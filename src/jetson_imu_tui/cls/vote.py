@@ -4,11 +4,20 @@ A frame-level prediction is noisy: sensor noise, transient poses and genuinely a
 in the gait cycle all produce single-frame misclassifications. A downstream consumer (a controller
 adjusting assistance) neither needs nor should react to every raw frame — doing so makes its
 behaviour jittery. So predictions are collected over a short window and distilled into one robust
-decision, trading a little latency for a large gain in stability. Same principle as the majority
-vote in the exosuit literature, except the windows here are fixed-length in *frames*: no gait
-phase or step segmentation signal is available, the prediction stream is all there is.
+decision, trading a little latency for a large gain in stability.
 
-At the shipped settings (10 Hz in, ``window = emit_every = 5``) that is one decision per 500 ms.
+**Not used by default.** Aggregation is done on the device now (the Simulink model emits one
+decision per gait step, keyed on the zero crossing of knee angular velocity), so the shipped
+config sets ``[cls.vote] enabled = false`` and ``ClsService`` runs as an exact passthrough. This
+module stays because it is injected through a clean seam and costs nothing to keep; flipping
+``enabled`` restores host-side aggregation.
+
+The windows here are fixed-length in *frames*, which is the weaker of the two schemes: it was
+written when the frame stream was all that was available, and the ``exo_v1`` layout's ``knee4``
+block has since made real step segmentation possible. A window whose boundary is a gait event
+beats one whose boundary is a frame count.
+
+At ``window = emit_every = 5`` with a 10 Hz frame rate that is one decision per 500 ms.
 
 **Soft, not hard.** Probability vectors are averaged element-wise and the argmax of the average
 is the decision, rather than counting predicted labels. Two reasons this matters at five votes:

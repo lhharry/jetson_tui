@@ -36,6 +36,7 @@ rate and behaved like a wake-up interval.
 
 from __future__ import annotations
 
+import json
 import threading
 import time
 from datetime import datetime, timedelta
@@ -79,8 +80,12 @@ GRID_EPS = 1e-9
 
 
 class Recorder:
-    def __init__(self, service: "ImuService", log_dir: Path, hz: float, cls=None) -> None:
+    def __init__(self, service: "ImuService", log_dir: Path, hz: float, cls=None,
+                 meta: dict | None = None) -> None:
         self._service = service
+        # Effective settings, written to <session>/config.json so a recording is
+        # self-describing. Built by the caller, which is the only place that has the config.
+        self._meta = meta
         self._labels = service.labels
         # Target CSV rows per second. 0 (or less) means every frame — see the module docstring
         # for why this is a time gate rather than an "every Nth frame" stride.
@@ -119,6 +124,17 @@ class Recorder:
 
     def __enter__(self) -> "Recorder":
         self.folder.mkdir(parents=True, exist_ok=True)
+        # Settings first, before any CSV exists: a session killed mid-write should still say
+        # what produced it. Reconstructing this after the fact means reverse-engineering decim
+        # from the spacing of model_input.csv, which is exactly the archaeology it exists to
+        # prevent. A failure here must not stop the recording.
+        if self._meta is not None:
+            try:
+                (self.folder / "config.json").write_text(
+                    json.dumps(self._meta, indent=2, sort_keys=True), encoding="utf-8"
+                )
+            except Exception as err:
+                logger.warning(f"recorder: could not write config.json ({err})")
         layout = {
             "quaternions.csv": ("quat", ("w", "x", "y", "z")),
             "accelerometers.csv": ("accel", ("x", "y", "z")),
@@ -175,12 +191,22 @@ class Recorder:
             self._thread.join(timeout=2.0)
         # One last pass now the writer thread is done. It exits from its sleep the moment _stop
         # is set, so everything that arrived since its final wake-up is still unwritten — up to
-        # a whole drain period, and a whole second at hz = 1. Nothing else can be touching the
-        # files at this point, so this is safe to do on the caller's thread.
-        try:
-            self._drain()
-        except Exception as err:  # a broken source must not lose the rows already on disk
-            logger.warning(f"recorder: final drain failed ({err})")
+        # a whole drain period, and a whole second at hz = 1.
+        #
+        # Only safe once the writer has actually finished. ``_drain`` is not reentrant: it writes
+        # through the same file handles and advances the same cursor and row-grid counters, so
+        # running it beside a live writer interleaves two rows into one line. The join above can
+        # time out, so it is checked rather than assumed.
+        if self._thread is not None and self._thread.is_alive():
+            logger.warning(
+                "recorder: writer thread did not stop within 2s — skipping the final drain "
+                "rather than writing beside it; the last few samples are lost"
+            )
+        else:
+            try:
+                self._drain()
+            except Exception as err:  # a broken source must not lose the rows already on disk
+                logger.warning(f"recorder: final drain failed ({err})")
         for fh in (*self._files.values(), *self._tele_files.values()):
             try:
                 fh.close()
@@ -233,6 +259,10 @@ class Recorder:
         self._drain_decisions()
         samples = self._service.samples_since(self._cursor, limit=None)
         if not samples:
+            # Still close the rate window. Returning early without counting leaves ``rows_hz``
+            # frozen at whatever it last measured, so a source that stops feeding shows the UI a
+            # healthy row rate forever -- the one case the readout exists to expose.
+            self._count_rows(0)
             return 0
         # Snapshot the held CLS prediction once per drain: it can't change mid-drain, so every
         # sample in this batch shares it — the step-hold between consecutive inferences.
