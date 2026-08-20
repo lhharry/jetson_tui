@@ -298,6 +298,16 @@ class SerialImuService:
                 ):
                     gx, gy, gz = f["gyro"]
                     now = time.monotonic()
+                    # Buffered timestamps must be *strictly* increasing. Every consumer walks
+                    # this buffer with a "> cursor" cursor -- the recorder, CLS and the browser
+                    # all do -- so two samples sharing a value means whichever the cursor lands
+                    # on hides the rest of its tick forever. That is not hypothetical on a
+                    # coarse clock: Windows' monotonic ticks at 15.6 ms, which at 160 Hz puts
+                    # two or three frames on the same value. Nudging by a microsecond keeps the
+                    # ordering honest; ``t`` is host arrival time and already approximate, and
+                    # the device's own clock rides untouched in ``t_src``.
+                    if self._last_frame_t is not None and now <= self._last_frame_t:
+                        now = self._last_frame_t + 1e-6
                     # The device clock, whichever block carries it. ``t_src`` is the data block
                     # and ``t`` the sync one; a layout has at most one, and downstream neither
                     # knows nor cares which it was.

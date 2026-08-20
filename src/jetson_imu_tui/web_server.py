@@ -267,9 +267,13 @@ class ServerState:
             return {"ok": True, "kind": kind, "message": msg}
 
     def set_record_hz(self, hz) -> int:
-        """Set the recording rate (1–200 Hz); restart an active recorder to apply it."""
+        """Set the CSV row rate (0 = every frame, else 1–500 rows/s); restart the recorder.
+
+        0 is the meaningful default rather than an off switch: it records the stream as the
+        device produced it. A positive value thins the recording to about that many rows per
+        second — see ``Recorder`` for how rows are selected."""
         try:
-            hz = max(1, min(100, int(hz)))
+            hz = max(0, min(500, int(hz)))
         except (TypeError, ValueError):
             return self.record_hz
         with self._lock:
@@ -313,6 +317,10 @@ def _payload(state: ServerState, since: float | None = None) -> dict:
         "recording": state.recording,
         "zeroed": state.service.is_zeroed,
         "hz": state.record_hz,
+        # Rows per second actually being written, so the requested rate and the achieved one are
+        # on screen together. None until the first measurement window closes, or when not
+        # recording.
+        "rows_hz": (state.recorder.rows_hz if state.recorder is not None else None),
         "source": state.source_kind,
         "source_connected": state.service.is_connected(),
         # Open port != data arriving. Only the serial source can tell the two apart; the I2C
@@ -827,8 +835,8 @@ _HTML = """<!DOCTYPE html>
       <button id="themeBtn" class="btn" onclick="toggleTheme()">Light</button>
       <button id="zeroBtn" class="btn" onclick="toggleZero()" title="Zero out current Euler/Accel/Gyro readings (tare)">Zero</button>
       <button id="recBtn" class="btn" onclick="toggleRecord()">Record</button>
-      <label class="reclabel" title="Recording rate — only affects logging to disk, not the plot">
-        Rec Hz <input id="freq" class="num" type="number" min="1" max="100" step="1"></label>
+      <label class="reclabel" title="CSV rows per second. 0 = write every frame the device sends. A positive value thins the recording to about that many rows per second, picking whole frames — values are never averaged. Affects the file on disk only, not the plots.">
+        Rec Hz <input id="freq" class="num" type="number" min="0" max="500" step="1"></label>
       <span id="status"><span id="dot"></span>connecting…</span>
     </div>
     <div id="charts"></div>
@@ -1855,7 +1863,11 @@ async function tick(){
       const obs = (d.observed_hz != null) ? ' · wire ' + d.observed_hz.toFixed(1) + ' Hz' : '';
       document.getElementById('status').innerHTML = '<span id="dot"></span>live · t=' + d.t.toFixed(1) + 's' + rateStr + obs;
       const rb = document.getElementById('recBtn');
-      rb.textContent = d.recording ? 'Recording' : 'Record';
+      // Show the rate actually being written next to the one that was asked for: a setting
+      // the device cannot satisfy (more rows than frames) is then visible, not assumed.
+      rb.textContent = d.recording
+        ? ('Recording' + (d.rows_hz != null ? ' · ' + d.rows_hz.toFixed(0) + '/s' : ''))
+        : 'Record';
       rb.classList.toggle('rec-on', !!d.recording);
       const zb = document.getElementById('zeroBtn');
       zb.textContent = d.zeroed ? 'Zeroed' : 'Zero';
@@ -1876,7 +1888,7 @@ window.addEventListener('DOMContentLoaded', () => {
   applyTheme(saved === 'light');
   document.getElementById('freq').addEventListener('change', async (e) => {
     const v = parseInt(e.target.value, 10);
-    if(v >= 1 && v <= 100){ try { await fetch('/freq?hz=' + v, {method:'POST'}); } catch(_) {} }
+    if(v >= 0 && v <= 500){ try { await fetch('/freq?hz=' + v, {method:'POST'}); } catch(_) {} }
   });
   document.getElementById('ymin').addEventListener('change', applyYInput);
   document.getElementById('ymax').addEventListener('change', applyYInput);

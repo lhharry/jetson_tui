@@ -75,7 +75,21 @@ log_dir = "./logs"
 sample_hz = 100           # sampler-thread rate per sensor (BNO055 fusion is fixed at 100 Hz)
 plot_fps = 15             # browser poll rate; each poll now fetches the full sample batch
 plot_window_seconds = 10  # rolling time window shown in the plots
-record_hz = 100           # buffer drain cadence; CSV data rate follows sample_hz (no dup/skip)
+record_hz = 0             # CSV rows per second. 0 = write every frame the device sends, which
+                          # is what you want unless the files are getting unwieldy.
+                          # A positive value thins the recording to about that many rows per
+                          # second by picking WHOLE FRAMES: values are never averaged and never
+                          # repeated, so every cell in a row is a number the device actually
+                          # sent and the row's Time is when it sent it. What a thinned recording
+                          # loses is the frames in between, and the timestamps show which.
+                          # This is NOT a polling cadence — how often the writer thread wakes is
+                          # recorder.DRAIN_HZ, a constant that affects batching and nothing else.
+                          # Selection is gated on time, not on an "every Nth frame" stride, so
+                          # the row rate does not depend on [source] sample_hz being correct:
+                          # ask for 50 and you get 50 whatever the device turns out to send.
+                          # No anti-alias filter is applied — record at 0 and filter offline if
+                          # you need a clean spectrum. The Record button shows the rate actually
+                          # achieved next to this setting.
 web_host = "127.0.0.1"    # bind host. Loopback by default: a Jetson in the field exposes
                           # nothing, and a laptop reaches the UI over an ssh tunnel (the
                           # startup banner prints the command). Pass --lan, or set "::" here,

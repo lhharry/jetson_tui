@@ -19,7 +19,9 @@ class AppConfig:
     sample_hz: int = 100
     plot_fps: int = 15
     plot_window_seconds: float = 10.0
-    record_hz: int = 100
+    # CSV rows per second; 0 = every frame the source produced. Not a polling cadence —
+    # see recorder.Recorder, whose DRAIN_HZ constant owns that.
+    record_hz: int = 0
     web_host: str = "::"
     web_port: int = 8000
     # Sample source: the two I2C BNO055s, or one IMU streaming binary frames over serial.
@@ -87,7 +89,7 @@ def load_config(path: Path | None = None) -> AppConfig:
         sample_hz=sample_hz,
         plot_fps=int(defaults.get("plot_fps", 15)),
         plot_window_seconds=float(defaults.get("plot_window_seconds", 10.0)),
-        record_hz=int(defaults.get("record_hz", 100)),
+        record_hz=max(0, int(defaults.get("record_hz", 0))),
         web_host=str(defaults.get("web_host", "::")),
         web_port=int(defaults.get("web_port", 8000)),
         source_kind=str(source.get("kind", "i2c")).lower(),

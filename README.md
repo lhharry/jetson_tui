@@ -23,7 +23,8 @@ workloads (e.g. an AI model) on the same board.
 - **IMU:** button switches between the onboard I2C IMUs and a serial (Arduino) IMU at runtime.
 - **CLS** page: online activity classification, with frame predictions aggregated by soft voting
   into one stable decision — sent back to the Arduino as a class-index byte over the same link.
-- **Record** toggle and an adjustable **recording frequency** from the page.
+- **Record** toggle with an adjustable **row rate** from the page — `0` writes every frame,
+  a positive value thins the file to that many rows per second (see **Recording rate**).
 - **Load** a past recording and review it offline in the same charts, with zoom that
   re-fetches at full resolution.
 - Recording writes one directory of comma-separated files per session under
@@ -127,7 +128,7 @@ or `placement=P0..P7`, or numeric `config`/`sign`), `GET /recordings` (list reco
 log_dir = "./logs"
 plot_fps = 15             # browser poll rate (samples/sec fetched by the page)
 plot_window_seconds = 10  # rolling time window shown in the plots
-record_hz = 100           # CSV drain cadence
+record_hz = 0             # CSV rows per second; 0 = every frame (see Recording rate)
 web_host = "127.0.0.1"    # loopback only; "::" = IPv6+IPv4 dual-stack, or pass --lan
 web_port = 8000
 ```
@@ -374,6 +375,42 @@ if (millis() - last > 1500) failsafe();   // link went quiet
 The source button distinguishes the three ways this can fail: `(no link)` the port will not open,
 `(no data)` it opened but no frames arrive, `(TX blocked)` frames arrive but results are not
 being accepted.
+
+## Recording rate
+
+`record_hz` is the number of **rows per second in the CSV**, and the Record button shows the rate
+actually achieved next to it.
+
+```toml
+[defaults]
+record_hz = 0             # every frame the device sent
+# record_hz = 20          # ~20 rows/s instead, for a long session
+```
+
+* **`0` records everything.** That is the default and what you want unless the files are getting
+  unwieldy.
+* **A positive value selects whole frames.** Values are never averaged and never repeated, so
+  every cell in a row is a number the device actually sent and the row's `Time` is when it sent
+  it. What a thinned recording loses is the frames in between — and the timestamps show which.
+* **All eight per-sample files thin identically**, so row *n* of `knee.csv` is still the same
+  instant as row *n* of `accelerometers.csv`.
+* **`model_input.csv` and `cls_vote.csv` are unaffected.** They run at the model's and the
+  voter's own rates and keep their own cursors.
+* **No anti-alias filter is applied.** Thinning is decimation, so high-frequency content folds
+  down — record at `0` and filter offline if you need a clean spectrum.
+
+> Selection is gated on each sample's timestamp against a fixed `t0 + n/hz` grid, not on an
+> "every Nth frame" stride. A stride has to be computed from the wire rate, and the configured
+> wire rate (`[source] sample_hz`) is exactly the thing that tends to be wrong — deriving the
+> stride from it would make the row rate inherit that error. Gating on time cannot: ask for 50
+> and you get 50 whatever the device turns out to be doing, and it stays right if the device's
+> rate later changes. The cost is that the gap between adjacent rows alternates between
+> neighbouring frame counts (3 or 4 frames, at 161 Hz thinned to 50) rather than being constant.
+
+**This is not a polling cadence.** How often the writer thread wakes is `recorder.DRAIN_HZ`, a
+constant — it changes how much is batched per write, never what ends up in the file. The setting
+used to *be* that cadence while looking like a row rate, so changing it did nothing to the
+output: wake-ups × rows-per-wake stayed constant at the device's rate.
 
 ## Reviewing a recording
 
