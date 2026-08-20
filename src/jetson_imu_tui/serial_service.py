@@ -1,14 +1,24 @@
-"""SerialImuService — one IMU arriving as binary frames over a serial port.
+"""SerialImuService — one IMU (plus the rig's telemetry) arriving as binary frames over serial.
 
 A drop-in alternative to ``ImuService`` for setups where the BNO055 is read by an Arduino (or a
-Simulink model) that streams ``read_serial``'s 7-float frames instead of the Jetson reading the
-chip over I2C. The web server picks between them from ``[source] kind`` in the config; everything
+Simulink model) that streams ``read_serial``'s frames instead of the Jetson reading the chip over
+I2C. The web server picks between them from ``[source] kind`` in the config; everything
 downstream (``web_server._payload``, ``Recorder``, ``ClsService``) is unchanged because the
 method surface matches.
 
-What serial cannot provide, it reports as ``None`` rather than faking: the stream carries only
-accelerometer and gyroscope, so ``euler`` and ``quat`` are always None (Euler/Quaternion plots,
-the 3D cube and the two matching CSVs stay empty) and calibration status is unavailable.
+**Two kinds of channel travel the same frame.** The IMU half (accel/gyro) is a *sensor signal*:
+it is axis-remapped, tare-able, and keyed by sensor label. The rest — knee angles, motor
+feedback, the controller trace, the enable line, the device clock — is *device telemetry*: it
+belongs to the rig rather than to a labelled IMU, so it has no label layer and never passes
+through the axis transform (rotating a motor torque would be meaningless). The two shapes stay
+separate all the way to the browser; ``imu_common.TELEMETRY_GROUPS`` is the one table that names
+the telemetry channels. Which groups a link actually carries depends on its ``layout``, and
+``available_telemetry`` reports that — a layout without knee channels says so, rather than
+serving zeros.
+
+What serial cannot provide, it reports as ``None`` rather than faking: the stream carries no
+fusion output, so ``euler`` and ``quat`` are always None (Euler/Quaternion plots, the 3D cube
+and the two matching CSVs stay empty) and calibration status is unavailable.
 
 The **axis remap is now writable here**, unlike in the register-based version: it is a host-side
 transform (``imu_common.AxisState``, the same object ``ImuService`` uses), so it no longer
@@ -28,7 +38,8 @@ Two invariants keep the rest of the app working unchanged:
 * Buffered ``"t"`` is the host's ``time.monotonic()`` at decode, exactly like
   ``ImuService._sample_loop``. The recorder's monotonic->wall-clock mapping, the browser's
   ``since`` cursor and CLS's ``MAX_RAW_GAP_S`` gap check all assume that clock; the source's own
-  timestamp rides along as ``"t_src"``.
+  timestamp rides along as ``"t_src"`` and gates nothing — it is there so a dropped frame can be
+  measured against the device's clock rather than inferred from host arrival jitter.
 * ``gyro_scale`` is applied once, in the reader thread before buffering, so the plots, the CSVs
   and the model all see the same rad/s values. BNO055 firmware commonly emits deg/s (values
   quantized to 1/16, peaking in the hundreds) while the classifier was trained on rad/s — feeding
@@ -46,6 +57,7 @@ from loguru import logger
 
 from jetson_imu_tui.imu_common import (
     SIGNAL_KEYS,
+    TELEMETRY_KEYS,
     AxisState,
     ImuInfo,
     apply_axis_transform,
@@ -59,6 +71,18 @@ from jetson_imu_tui.read_serial import (
     decode_frames,
 )
 from jetson_imu_tui.ring_buffer import RingBuffer
+
+# Telemetry group -> the buffer-row key holding its values, in TELEMETRY_GROUPS order. "state"
+# is assembled rather than copied (its two channels come from different blocks), so it is absent
+# here and handled explicitly in ``_telemetry``.
+_GROUP_SOURCE = {"knee": "joints", "motor": "feedback", "trace": "trace"}
+
+# Which read_serial block has to be present for each group to be offered at all. A layout
+# without the block reports the group as unavailable, which is not the same as reporting zeros.
+# "state" keys on ``enable`` rather than on the clock: a layout carrying only a clock is the
+# plain IMU forwarder, whose ``t_src`` already rides in every row and needs no group of its own.
+_GROUP_BLOCK = {"knee": ("knee4",), "motor": ("fb6",), "trace": ("trace5",),
+                "state": ("enable",)}
 
 # Wait this long before re-opening the port after a failed open or a dropped link. Long enough
 # not to spin on a missing device, short enough that re-plugging the Arduino recovers on its own.
@@ -76,6 +100,17 @@ WRITE_TIMEOUT_S = 0.05
 
 # No frame for this long means the stream has stopped, even though the port is still open.
 STALE_AFTER_S = 1.0
+
+# The port opened but nothing decoded for this long. Almost always a layout mismatch: the
+# device's frame length is not the configured one, so no byte phase ever aligns and the decoder
+# retries in silence forever. Worth one log line, because the symptom (plots never move) is
+# identical to an unplugged cable and the decoder itself is deliberately quiet.
+NO_FRAME_WARN_S = 5.0
+
+# Serial links run faster than the I2C sensors and can be pushed to 200 Hz, where the shared
+# default (2048 ≈ 10 s) is thin for the plot window plus a stalled poll. Sized here rather than
+# by raising ring_buffer.DEFAULT_MAXLEN, which the I2C sensors and CLS also draw on.
+BUFFER_MAXLEN = 4096
 
 GYRO_SCALE = {"rad": 1.0, "deg": math.pi / 180.0}
 
@@ -104,8 +139,14 @@ class SerialImuService:
         if gyro_units not in GYRO_SCALE:
             logger.warning(f"unknown gyro_units '{gyro_units}' — assuming deg/s")
         self._gyro_scale = GYRO_SCALE.get(gyro_units, GYRO_SCALE["deg"])
+        # Which telemetry groups this link carries, fixed at construction because the layout is.
+        # Consumers ask once and build their columns/charts from the answer.
+        blocks = set(LAYOUTS[self._layout].blocks)
+        self._telemetry = tuple(
+            g for g in TELEMETRY_KEYS if blocks & set(_GROUP_BLOCK.get(g, ()))
+        )
 
-        self._buf = RingBuffer()
+        self._buf = RingBuffer(maxlen=BUFFER_MAXLEN)
         self._offset: dict[str, dict[str, list[float]]] | None = None
         self._offset_lock = threading.Lock()
         # Software axis remap, identical to the I2C source's — applied on read-out. ``axis``
@@ -227,17 +268,31 @@ class SerialImuService:
                 self._open_err_logged = False
                 self._tx_err_logged = False
             n_frames, t_first, rate_logged = 0, None, False
+            # An open port that never yields a frame is the one failure ``decode_frames`` cannot
+            # report: it just keeps hunting for a byte phase, silently, forever. The reader
+            # thread is blocked inside that generator and cannot notice, so the deadline is
+            # armed here and cancelled by the first frame.
+            warn_timer = threading.Timer(NO_FRAME_WARN_S, self._warn_no_frames)
+            warn_timer.daemon = True
+            warn_timer.start()
             try:
                 for f in decode_frames(
                     ser, magic=self._magic, layout=self._layout, stop=self._stop
                 ):
                     gx, gy, gz = f["gyro"]
                     now = time.monotonic()
+                    # The device clock, whichever block carries it. ``t_src`` is the data block
+                    # and ``t`` the sync one; a layout has at most one, and downstream neither
+                    # knows nor cares which it was.
                     self._buf.append({
                         "t": now,
-                        "t_src": f["t"],
+                        "t_src": f["t_src"] if f["t_src"] is not None else f["t"],
                         "accel": f["accel"],
                         "gyro": [gx * self._gyro_scale, gy * self._gyro_scale, gz * self._gyro_scale],
+                        "joints": f["joints"],
+                        "feedback": f["feedback"],
+                        "trace": f["trace"],
+                        "enable": f["enable"],
                     })
                     self._connected = True
                     self._last_frame_t = now
@@ -246,6 +301,7 @@ class SerialImuService:
                     n_frames += 1
                     if t_first is None:
                         t_first = now
+                        warn_timer.cancel()
                     elif not rate_logged and now - t_first >= RATE_REPORT_S:
                         self.observed_hz = n_frames / (now - t_first)
                         logger.info(
@@ -258,6 +314,7 @@ class SerialImuService:
                 self._connected = False
                 logger.warning(f"{self._label}: serial read failed ({err}) — retrying")
             finally:
+                warn_timer.cancel()
                 with self._io_lock:
                     self._ser = None
                     try:
@@ -265,6 +322,24 @@ class SerialImuService:
                     except Exception:
                         pass
             self._stop.wait(REOPEN_DELAY_S)
+
+    def _warn_no_frames(self) -> None:
+        """Timer callback: the port has been open for NO_FRAME_WARN_S with nothing decoded.
+
+        Args:    none.
+        Returns: None. Logs once per connection episode.
+
+        Names the likely cause rather than the symptom. Every silent way this fails — wrong
+        ``layout`` (the device's frame length is not the configured one, so no byte phase can
+        ever align), wrong ``magic``, or a device that has stopped transmitting — looks exactly
+        like an unplugged cable from the outside.
+        """
+        n = LAYOUTS[self._layout].n_floats
+        logger.warning(
+            f"{self._label}: {self._port} is open but no frame decoded in {NO_FRAME_WARN_S:.0f}s "
+            f"— check [source] layout ('{self._layout}', {n} floats) and magic "
+            f"('{self._magic or 'none'}') against what the device sends"
+        )
 
     # --- result return channel ----------------------------------------------
     def send_result(self, index: int) -> bool:
@@ -330,6 +405,49 @@ class SerialImuService:
             self._axis.transform if tf is None else tf,
         )
 
+    def available_telemetry(self) -> tuple[str, ...]:
+        """The ``imu_common.TELEMETRY_GROUPS`` names this link carries, in table order.
+
+        Args:    none.
+        Returns: tuple[str, ...] — e.g. ("knee", "motor", "trace", "state") on ``exo_v1``,
+                 ("state",) on a legacy layout that only has a clock, () on one with neither.
+
+        Fixed by ``layout`` at construction. Consumers build their columns, files and charts
+        from this rather than probing a sample, so an all-zero frame cannot be mistaken for an
+        absent channel. ``ImuService`` has no such method — callers reach it through
+        ``getattr(service, "available_telemetry", None)``, the same duck-typing the result
+        return channel uses."""
+        return self._telemetry
+
+    def _telemetry_row(self, sample: dict | None) -> dict[str, list[float] | None] | None:
+        """Buffer row -> ``{group: [values] | None}`` for the groups this layout carries.
+
+        Input:  ``sample`` = buffer row, or None.
+        Output: dict keyed by group name, values list[float] (copied) or None when the frame
+                had nothing for it; None when ``sample`` is None.
+
+        Copies, so the buffer row is never exposed. Deliberately does **not** go through
+        ``apply_axis_transform``: that function emits exactly the four sensor keys and drops
+        everything else, and rotating a motor torque or a class index would be meaningless
+        anyway. Telemetry is attached alongside the transformed signal, never through it.
+        """
+        if sample is None:
+            return None
+        out: dict[str, list[float] | None] = {}
+        for group in self._telemetry:
+            if group == "state":
+                # Assembled, not copied: its two channels come from different blocks, and
+                # either may be absent on a layout that carries only the other.
+                out[group] = [sample.get("enable"), sample.get("t_src")]
+            else:
+                vals = sample.get(_GROUP_SOURCE[group])
+                out[group] = list(vals) if vals is not None else None
+        return out
+
+    def telemetry(self) -> dict[str, list[float] | None]:
+        """Latest telemetry values, one entry per available group ({} when none)."""
+        return self._telemetry_row(self._latest_raw()) or {}
+
     def signals(self) -> dict[str, dict | None]:
         """Latest signals for the single label, with the zero offset applied when active."""
         off = self._offset
@@ -358,7 +476,12 @@ class SerialImuService:
     def samples_since(self, t: float, limit: int = 300) -> list[dict]:
         """Payload-shaped samples newer than monotonic ``t``, oldest first — the plot's and the
         recorder's data source. One sensor, so there is no cross-label alignment to do; euler and
-        quat are present as None so the browser still discovers the label."""
+        quat are present as None so the browser still discovers the label.
+
+        Rows carry ``"telemetry"`` when the layout has any: ``{group: [values] | None}``, the
+        device-global channels alongside the per-label signals. **It has to be this one call**,
+        not a second cursor-based method — the recorder writes every CSV from one batch, and two
+        cursors would let frames land between them and drift the files' row counts apart."""
         off = self._offset
         o = off.get(self._label) if off else None
         tf = self._axis.transform  # read once: the whole batch must use one mapping
@@ -368,6 +491,8 @@ class SerialImuService:
             row: dict = {"t": s["t"]}
             for key in SIGNAL_KEYS:
                 row[key] = {self._label: sig[key] if sig is not None else None}
+            if self._telemetry:
+                row["telemetry"] = self._telemetry_row(s)
             out.append(row)
         return out
 

@@ -16,13 +16,18 @@ dependencies = [
     "numpy>=1.21,<2",
     # TOML parsing on Python 3.10; tomllib is stdlib from 3.11 onward
     "tomli>=2; python_version < '3.11'",
+    # read_serial / serial_service: binary frames from an Arduino or Simulink model. A core
+    # dependency rather than an extra because [source] kind = "serial" is a supported boot
+    # default and a missing source at startup is a hard exit, not a fallback.
+    "pyserial>=3.5",
 ]
 
 [project.optional-dependencies]
 # Real-time CLS inference. On the Jetson, torch is installed from NVIDIA's wheels rather
 # than PyPI, so it is an optional extra, not a hard dependency. CLS self-disables if absent.
 cls = ["torch>=2"]
-# read_serial: BNO055 frames over a serial link (Simulink) instead of the I2C sensors.
+# Kept so `pip install .[serial]` in existing scripts and docs still resolves; pyserial is a
+# core dependency now, so this extra adds nothing.
 serial = ["pyserial>=3.5"]
 
 [project.scripts]

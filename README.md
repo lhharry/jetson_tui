@@ -23,23 +23,34 @@ workloads (e.g. an AI model) on the same board.
 - **IMU:** button switches between the onboard I2C IMUs and a serial (Arduino) IMU at runtime.
 - **CLS** page: online activity classification, with frame predictions aggregated by soft voting
   into one stable decision — sent back to the Arduino as a class-index byte over the same link.
-- **Record** toggle and an adjustable **recording frequency** (1–200 Hz) from the page.
+- **Record** toggle and an adjustable **recording frequency** from the page.
+- **Load** a past recording and review it offline in the same charts, with zoom that
+  re-fetches at full resolution.
 - Recording writes one directory of comma-separated files per session under
   `<log_dir>/YYYY_MM_DD/HH_MM_SS/`:
   - `quaternions.csv` — `Time,Left_w,Left_x,Left_y,Left_z,Right_w,Right_x,Right_y,Right_z`
   - `accelerometers.csv` — `Time,Left_x,Left_y,Left_z,Right_x,Right_y,Right_z`
   - `gyroscopes.csv` — same columns as accel
   - `euler_angles.csv` — degrees (ZYX intrinsic: x=roll, y=pitch, z=yaw)
+  - one file per **telemetry group** the source carries — `knee.csv`, `motor.csv`,
+    `trace.csv`, `state.csv` (serial `exo_v1` only; a group the link lacks gets no file
+    rather than a file of empty cells)
   - with CLS active: `cls.csv` (frame predictions + per-class probabilities),
     `cls_vote.csv` (one row per aggregated decision) and `model_input.csv` (the exact
     6-channel vectors fed to the model)
 
+  Every per-sample file is written from one drain batch, so their row counts are equal by
+  construction — line *n* of `knee.csv` is the same instant as line *n* of `accelerometers.csv`.
+
 ## Install
 
 ```bash
-pip install -e .            # flask + adafruit-circuitpython-bno055 + Adafruit-Blinka + adafruit-extended-bus
-pip install -e ".[serial]"  # add pyserial if the IMU arrives over serial (see below)
+pip install -e .            # flask + pyserial + adafruit-circuitpython-bno055 + Blinka + extended-bus
 ```
+
+`pyserial` is a core dependency: `[source] kind = "serial"` is a supported boot default and a
+missing source at startup is a hard exit, not a fallback. The old `.[serial]` extra still
+resolves, but adds nothing.
 
 Make sure the user is in the `i2c` group and both buses are exposed:
 
@@ -59,10 +70,16 @@ kits, pins 3/5 already map to bus 7 out of the box.
 ## Run
 
 ```bash
-jetson-imu-tui                          # bind/port from config (default [::]:8000)
+jetson-imu-tui                          # loopback only (default 127.0.0.1:8000)
+jetson-imu-tui --lan                    # serve the network instead (bind ::)
 jetson-imu-tui --config path/to/my.toml
-jetson-imu-tui --host 127.0.0.1 --port 8011
+jetson-imu-tui --host 0.0.0.0 --port 8011
 ```
+
+**It binds loopback by default**, so a Jetson in the field exposes nothing and the app needs
+no network at all — every asset (uPlot, three.js) is vendored under `static/`. Reach the UI
+over an SSH tunnel, or pass `--lan` to serve it on the network. An explicit `--host` wins over
+both, so a specific address is never silently widened.
 
 On start it auto-connects the IMUs and prints the URL(s). Open it from your laptop:
 
@@ -78,15 +95,24 @@ On start it auto-connects the IMUs and prints the URL(s). Open it from your lapt
 
 In the browser: switch signal (Euler / Accel / Gyro / Quat), toggle **Numbers** for a
 text readout, **Pause** to freeze, set the **Hz** field to change recording rate, and
-**Record** to write TSVs on the Jetson. uPlot is loaded from a CDN, so the *browser*
-needs internet for the library (the Jetson does not).
+**Record** to write CSVs on the Jetson, and **Load** to reopen a past recording offline (see
+**Reviewing a recording** below). uPlot and three.js are vendored in `static/` — nothing is
+fetched from the internet, by the Jetson or the browser.
+
+Which signal buttons appear depends on the source: the four per-sensor signals always, plus one
+button per **telemetry group** the link carries (`knee`, `motor`, `trace`, `state` on the
+`exo_v1` serial layout — see **Serial source** below). The status line shows the measured wire
+rate next to the poll rate; it is the only visible check that `[source] sample_hz` matches
+reality.
 
 HTTP API (for scripting): `GET /` (page), `GET /data` (latest values + status JSON),
 `POST /record` (toggle), `POST /freq?hz=N` (set recording rate), `POST /zero` (tare toggle),
 `POST /source?kind=i2c|serial` (switch IMU source), `GET /calibration` (per-sensor calibration
 levels), `GET /cls` (predictions + latest decision), `POST /cls/toggle` (stop/start inference),
 `GET /axis-remap` (current mapping) and `POST /axis-remap` (apply `{"ops":["rot_x_90",...]}`,
-or `placement=P0..P7`, or numeric `config`/`sign`). `Ctrl-C` stops cleanly.
+or `placement=P0..P7`, or numeric `config`/`sign`), `GET /recordings` (list recorded sessions),
+`GET /recordings/<date>/<time>` (one session as plot-ready columns; optional `from`, `to`,
+`max_points`). `Ctrl-C` stops cleanly.
 
 ## Configuration
 
@@ -101,8 +127,8 @@ or `placement=P0..P7`, or numeric `config`/`sign`). `Ctrl-C` stops cleanly.
 log_dir = "./logs"
 plot_fps = 15             # browser poll rate (samples/sec fetched by the page)
 plot_window_seconds = 10  # rolling time window shown in the plots
-record_hz = 100           # TSV recording rate
-web_host = "::"           # "::" = IPv6+IPv4 dual-stack; "0.0.0.0" = IPv4 only
+record_hz = 100           # CSV drain cadence
+web_host = "127.0.0.1"    # loopback only; "::" = IPv6+IPv4 dual-stack, or pass --lan
 web_port = 8000
 ```
 
@@ -146,33 +172,84 @@ Covered by `others/tests/test_axis_transform.py` (61 cases, no hardware needed).
 
 ## Serial source (Arduino / Simulink instead of I2C)
 
-The same app can run off **one IMU streaming binary frames over a serial port** — an Arduino (or
-a Simulink model) reading the BNO055 and forwarding it — instead of the Jetson reading the chips
-over I2C. Plots, recording and CLS all work; the link is bidirectional, with classification
-results going back to the Arduino (see below). The boot default is chosen in the config:
+**This is the shipped default.** The app runs off binary frames arriving over a serial port —
+an Arduino (`others/simulink/motor_control.slx` on an MKR WiFi 1010) reading the sensors and
+forwarding them — instead of the Jetson reading BNO055s over I2C. On the `exo_v1` layout the
+same frame carries the rig's telemetry too: both knees, motor feedback, and the controller
+trace that shows how `finalClass` turned into a motor command. Plots, recording and CLS all
+work, and the link is bidirectional, with classification results going back to the Arduino
+(see below). Switch back to the onboard I2C sensors at runtime with the **IMU:** button, or
+change the boot default in the config:
 
 ```toml
 [source]
-kind = "serial"           # "i2c" (default) | "serial" — boot default; switchable at runtime
+kind = "serial"           # "serial" (default) | "i2c" — boot default; switchable at runtime
 port = "/dev/ttyACM0"     # "COM17" on Windows
 baud = 115200
 label = "Left"            # label the IMU appears under; must match [cls] sensor
 magic = "aa55"            # frame header in hex; required unless the layout carries a timestamp
-layout = "gyro_accel"     # frame contents and channel order — see the table below
-gyro_units = "rad"        # units the device sends; "deg" is scaled to rad/s, "rad" passes through
-sample_hz = 80            # rate the device sends at; omit to inherit [defaults] sample_hz
+layout = "exo_v1"         # frame contents and channel order — see the table below
+gyro_units = "deg"        # units the device sends; "deg" is scaled to rad/s, "rad" passes through
+sample_hz = 80            # rate the device actually sends at — MEASURED, not nominal
 ```
 
-**Wire format** (`read_serial.py`): an optional header followed by 6 or 7 little-endian float32.
-Accel is m/s² **including gravity**; `t`, where present, is the source's own clock in seconds.
-Pick the frame contents with `layout`:
+**Wire format** (`read_serial.py`): an optional header followed by little-endian float32. What
+those floats mean is an ordered list of **channel blocks**, so a frame that grows new channels
+costs one table row rather than a new decoder. Accel is m/s² **including gravity**.
+
+| block | floats | contents |
+|---|---|---|
+| `enable` | 1 | the device's SWITCH line; non-zero = the controller may drive |
+| `gyro` | 3 | `gx gy gz`, in the device's units (`gyro_units` converts) |
+| `accel` | 3 | `ax ay az`, m/s² **including gravity** |
+| `knee4` | 4 | `ang_r vel_r ang_l vel_l` — knee angle + angular velocity, both legs |
+| `fb6` | 6 | `pos_r speed_r torque_r pos_l speed_l torque_l` — motor feedback |
+| `trace5` | 5 | `finalClass LU_AVEL_F L_KVEL L_KWRAP MotorCom_L` — controller trace |
+| `t_src` | 1 | the device's own clock in seconds, as **data** |
+| `t` | 1 | the device's own clock in seconds, as a **sync anchor**; last block only |
+
+`layout` names a combination of them:
 
 | `layout` | floats | frame | typical source |
 |---|---|---|---|
-| `accel_gyro_t` (default) | `ax ay az gx gy gz t` | 28 B + header | Simulink Serial Transmit, header `5aa5` |
+| `accel_gyro_t` | `ax ay az gx gy gz t` | 28 B + header | Simulink Serial Transmit |
 | `gyro_accel_t` | `gx gy gz ax ay az t` | 28 B + header | as above, channels swapped |
 | `accel_gyro` | `ax ay az gx gy gz` | 24 B + header | Arduino sketch, no clock |
 | `gyro_accel` | `gx gy gz ax ay az` | 24 B + header | Arduino sketch, no clock |
+| `exo_v1` (shipped) | `enable gyro accel knee4 fb6 trace5 t_src` | **92 B + header `aa55`** = 94 B | the full rig uplink |
+
+A layout that does not carry a block reports it as `None`, never as a zero — so "this link has
+no knee channels" stays distinguishable from "the knees are at zero". The table is checked at
+import (block names, no duplicates, `t` last, at most one clock, declared float count), because
+a misplaced block shifts every channel after it and that failure is completely silent.
+
+**`t` vs `t_src`** — same quantity, different job, and a layout may hold at most one. `t` gates
+sync: it must increase monotonically or the decoder re-aligns. `t_src` is an ordinary channel
+that gates nothing. Prefer `t_src` on a long frame: float32 quantises, and once its ulp exceeds
+the frame period two adjacent timestamps round to the same value, `Δt` reads 0 and a healthy
+stream is declared out of sync — at 100 Hz that is `t ≥ 2¹⁷ s` (~36 h), at 200 Hz ~18 h. A
+94-byte frame does not need the help: a 2-byte header matching at 9 consecutive frame boundaries
+is a ~(1/65536)⁹ false lock.
+
+**Telemetry is not a sensor signal.** The knee, motor, trace and enable channels belong to the
+rig, not to a labelled IMU, so they have no label layer, they are never axis-remapped (rotating
+a motor torque would be meaningless) and they get their own charts, their own Numbers card and
+their own CSVs. `imu_common.TELEMETRY_GROUPS` is the one table that names them — it drives the
+`/data` payload, the CSV headers, the offline loader and the charts at once.
+
+**Switching to `exo_v1` is not backward compatible.** 26 and 94 are not multiples of each other,
+so a device still sending the old frame never aligns and the UI shows `(no data)` forever. The
+reader logs a hint after 5 s (`open but no frame decoded … check [source] layout`), and
+`others/tools/serial_monitor.py` is the direct check:
+
+```bash
+python others/tools/serial_monitor.py --layout exo_v1
+```
+
+On a wide layout it prints **every channel by name**, refreshed in place. That block is the
+acceptance test for the transmitting side, because a Mux wired in the wrong order is silent on
+the wire — the frame length is unchanged and the header still aligns, only the values sit in the
+wrong columns. Move one joint at a time and check that only its own two channels react.
 
 **Alignment** needs a timestamp or a header, and the layout decides which. With a timestamp,
 byte alignment is recovered from it increasing monotonically, so the header is optional and a
@@ -195,9 +272,9 @@ wrong feeds the model input ~57× too large and predictions become meaningless w
 Verify on the device: hold it still (gyro ≈ 0, |accel| ≈ 9.8), then rotate ~90° in one second and
 watch `/data` — the peak should read ≈ 1.5, not ≈ 90.
 
-**Not available over serial**, because the stream carries only accelerometer and gyroscope:
-Euler and Quaternion plots, the 3D cube, `euler_angles.csv` / `quaternions.csv` (written with
-empty cells), and the calibration popup.
+**Not available over serial**, because the stream carries no fusion output: Euler and
+Quaternion plots, the 3D cube, `euler_angles.csv` / `quaternions.csv` (written with empty
+cells), and the calibration popup.
 
 The **axis remap does work over serial** — it is a host-side transform now, so it no longer
 matters that the link cannot reach the sensor's registers. It composes *on top of* whatever
@@ -241,6 +318,44 @@ if (millis() - last > 1500) failsafe();   // link went quiet
 The source button distinguishes the three ways this can fail: `(no link)` the port will not open,
 `(no data)` it opened but no frames arrive, `(TX blocked)` frames arrive but results are not
 being accepted.
+
+## Reviewing a recording
+
+**Load** in the toolbar lists every session under `<log_dir>` and reopens one in the same charts
+the live view uses. The page stops polling while a session is open; **Live** returns to the
+stream and **Full** zooms back out to the whole session.
+
+* **Decimation is server-side, and it is a min/max envelope.** Ten minutes at 200 Hz is 120k
+  rows across ~23 channels — far more than a few thousand pixels can show and far more than is
+  worth serialising. Each window is reduced to `max_points` per channel by taking the minimum
+  and maximum inside each time bucket, so a one-sample spike or dropout survives; plain "every
+  Nth row" would hide exactly what the viewer is opened to find.
+* **Zoom re-fetches.** Drag-select a range and the page requests that window again at full
+  budget, so full resolution is reachable everywhere without ever shipping the whole file.
+  Buckets are cut on time rather than per channel, so all channels keep one shared x axis; the
+  min/max pair inside a bucket may be ordered opposite to the samples, which shifts a point by
+  less than one bucket width and disappears as soon as you zoom in.
+* **A missing file means a missing channel, not zeros.** An I2C recording has no `knee.csv`, and
+  a serial one has `euler_angles.csv` full of empty cells. Both are reported as absent groups
+  rather than drawn as a flat line at zero, which would look like a real measurement.
+* **Sessions that cross midnight are handled.** The `Time` column is `%H:%M:%S.%f` with no date;
+  the folder name supplies the day and a backward step adds another, so the duration does not
+  come out negative.
+
+Scriptable without the browser:
+
+```bash
+curl -s localhost:8000/recordings | python -m json.tool
+curl -s 'localhost:8000/recordings/2026_08_20/14_03_11?from=12&to=18&max_points=8000'
+```
+
+Or in Python, with no server at all:
+
+```python
+from jetson_imu_tui.session_load import list_sessions, load_session
+d = load_session("./logs", "2026_08_20/14_03_11", t_from=12, t_to=18)
+d["telemetry"]["motor"]["channels"]["torque_l"]     # list[float | None]
+```
 
 ## Switching source at runtime
 

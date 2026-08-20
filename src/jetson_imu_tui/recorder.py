@@ -1,4 +1,19 @@
-"""Threaded CSV recorder that writes 4 files in lockstep."""
+"""Threaded CSV recorder that writes the per-sensor signals and the device telemetry in lockstep.
+
+Four per-sensor files always (quaternions / accelerometers / gyroscopes / euler_angles), plus one
+file per **telemetry group** the source carries (``imu_common.TELEMETRY_GROUPS``: knee, motor,
+trace, state) and the three CLS files when classification is running.
+
+Every file that describes a *sample* is written from a single ``samples_since`` batch, so their
+row counts are equal by construction rather than by luck. That is the whole reason telemetry
+rides inside the sample rows instead of having its own cursor: two cursors would let frames
+arrive between the two reads, and the files would silently drift apart — which is exactly the
+alignment a post-hoc analysis of "what was the motor doing when the classifier said walk" needs.
+
+The CLS files are the deliberate exception. ``model_input.csv`` and ``cls_vote.csv`` run at the
+model's and the voter's own rates, so they keep their own cursors and their real timestamps
+instead of being stretched onto the sample grid.
+"""
 
 from __future__ import annotations
 
@@ -11,6 +26,8 @@ from typing import TYPE_CHECKING
 
 from loguru import logger
 
+from jetson_imu_tui.imu_common import TELEMETRY_CHANNELS, TELEMETRY_GROUPS
+
 if TYPE_CHECKING:  # ImuService pulls in the Linux-only hardware stack; only needed for hints.
     from jetson_imu_tui.imu_service import ImuService
 
@@ -22,11 +39,21 @@ def _hdr(labels: list[str], axes: tuple[str, ...]) -> str:
     return ",".join(cols) + "\n"
 
 
+def telemetry_filename(group: str) -> str:
+    """Group name -> its CSV filename. One place, so the loader and the writer cannot disagree."""
+    return f"{group}.csv"
+
+
 class Recorder:
     def __init__(self, service: "ImuService", log_dir: Path, hz: float, cls=None) -> None:
         self._service = service
         self._labels = service.labels
         self._hz = float(hz)
+        # Telemetry groups this source carries, asked once. Duck-typed: only SerialImuService
+        # has the method, so the I2C source simply records no telemetry files. Asking the
+        # source beats inspecting a sample -- an all-zero frame must not read as "no channel".
+        avail = getattr(service, "available_telemetry", None)
+        self._tele_groups: tuple[str, ...] = tuple(avail()) if avail is not None else ()
         # Optional ClsService: when enabled, the held activity prediction is written to
         # cls.csv in lockstep with the IMU rows (one row per drained sample, 100 Hz).
         self._cls = cls
@@ -39,6 +66,7 @@ class Recorder:
         self._stop = threading.Event()
         self._thread: threading.Thread | None = None
         self._files: dict[str, TextIOWrapper] = {}
+        self._tele_files: dict[str, TextIOWrapper] = {}
         self._cls_file: TextIOWrapper | None = None
         self._model_file: TextIOWrapper | None = None
         self._vote_file: TextIOWrapper | None = None
@@ -58,6 +86,16 @@ class Recorder:
             fh.write(_hdr(self._labels, axes))
             self._files[fname] = fh
         self._layout = layout
+        # One file per telemetry group the source actually carries, columns straight from
+        # imu_common.TELEMETRY_GROUPS. A group the link does not have gets no file at all
+        # rather than a file of empty cells, so "this recording has no knee channels" is
+        # visible from the directory listing.
+        for group, channels, _unit in TELEMETRY_GROUPS:
+            if group not in self._tele_groups:
+                continue
+            fh = open(self.folder / telemetry_filename(group), "w", encoding="utf-8", newline="")
+            fh.write(",".join(["Time", *channels]) + "\n")
+            self._tele_files[group] = fh
         # cls.csv: Time, cls, conf, <one column per class prob>. Only when CLS is active.
         # model_input.csv: the exact 6-channel vectors (raw accel+gyro of the CLS sensor)
         # fed to the model, at the model's own rate — enough to replay inference offline.
@@ -91,12 +129,13 @@ class Recorder:
         self._stop.set()
         if self._thread is not None:
             self._thread.join(timeout=2.0)
-        for fh in self._files.values():
+        for fh in (*self._files.values(), *self._tele_files.values()):
             try:
                 fh.close()
             except Exception:
                 pass
         self._files.clear()
+        self._tele_files.clear()
         for attr in ("_cls_file", "_model_file", "_vote_file"):
             fh = getattr(self, attr)
             if fh is not None:
@@ -163,6 +202,19 @@ class Recorder:
                 fh = self._files.get(fname)
                 if fh is not None:
                     fh.write(",".join(cells) + "\n")
+            tele = sample.get("telemetry") or {}
+            for group, fh in self._tele_files.items():
+                vals = tele.get(group)
+                n = len(TELEMETRY_CHANNELS[group])
+                if vals is None:
+                    cells = ["" for _ in range(n)]
+                else:
+                    # A channel can be individually absent (the state group's enable is None
+                    # on a layout without that block). Empty cell, never 0.0 -- zero is a real
+                    # value for every one of these channels.
+                    cells = ["" if v is None else f"{v:.6f}" for v in vals[:n]]
+                    cells += ["" for _ in range(n - len(cells))]
+                fh.write(",".join([ts, *cells]) + "\n")
             if self._cls_file is not None:
                 self._cls_file.write(",".join([ts, *cls_cells]) + "\n")
         self._cursor = samples[-1]["t"]

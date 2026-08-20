@@ -52,6 +52,40 @@ _AXIS_LETTERS = {0: "X", 1: "Y", 2: "Z", 3: "INVALID"}
 # the browser derives its label list from ``euler``'s keys.
 SIGNAL_KEYS = ("euler", "accel", "gyro", "quat")
 
+# Units each signal is served in, for axis labels. Here rather than in the page so the
+# live charts and the offline viewer cannot disagree about what a number means.
+SIGNAL_UNITS: dict[str, str] = {
+    "euler": "deg", "accel": "m/s^2", "gyro": "rad/s", "quat": "",
+}
+
+# The axes each signal reports, in order. Quaternion is the odd one with four.
+SIGNAL_AXES: dict[str, tuple[str, ...]] = {
+    "euler": ("x", "y", "z"), "accel": ("x", "y", "z"),
+    "gyro": ("x", "y", "z"), "quat": ("w", "x", "y", "z"),
+}
+
+# Device-global telemetry the exoskeleton rig sends alongside the IMU (read_serial's knee4 /
+# fb6 / trace5 / enable / t_src blocks). Shape is deliberately NOT the per-sensor one: these
+# channels belong to the device, not to a labelled IMU, so they are {group: [values]} with no
+# label layer and never pass through the axis transform.
+#
+# This tuple is the single source of truth for four consumers — the /data payload keys, the
+# recorder's files and headers, the offline session loader's columns, and the chart definitions
+# injected into the page. Adding a channel means editing this table and nothing else.
+#
+# Each entry: (group name, channel names in wire order, unit string for the UI).
+TELEMETRY_GROUPS: tuple[tuple[str, tuple[str, ...], str], ...] = (
+    ("knee",  ("ang_r", "vel_r", "ang_l", "vel_l"), "deg"),
+    ("motor", ("pos_r", "speed_r", "torque_r", "pos_l", "speed_l", "torque_l"), ""),
+    ("trace", ("finalClass", "LU_AVEL_F", "L_KVEL", "L_KWRAP", "MotorCom_L"), ""),
+    ("state", ("enable", "t_src"), ""),
+)
+
+# Group name -> its channel names, for column lookups that do not need the units.
+TELEMETRY_CHANNELS: dict[str, tuple[str, ...]] = {g: ch for g, ch, _ in TELEMETRY_GROUPS}
+
+TELEMETRY_KEYS: tuple[str, ...] = tuple(g for g, _, _ in TELEMETRY_GROUPS)
+
 
 @dataclass
 class ImuInfo:
