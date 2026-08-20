@@ -28,8 +28,15 @@ from jetson_imu_tui.cls.model import CLASSES
 from jetson_imu_tui.cls.service import ClsService
 from jetson_imu_tui.cls.vote import SoftVoter
 from jetson_imu_tui.config import AppConfig
-from jetson_imu_tui.imu_common import PLACEMENTS, AxisState
+from jetson_imu_tui.imu_common import (
+    PLACEMENTS,
+    SIGNAL_AXES,
+    SIGNAL_UNITS,
+    TELEMETRY_GROUPS,
+    AxisState,
+)
 from jetson_imu_tui.recorder import Recorder
+from jetson_imu_tui.session_load import DEFAULT_MAX_POINTS, list_sessions, load_session
 
 # Both sources are optional *at import time*: the I2C stack (Blinka / adafruit-bno055) is
 # Linux-only and pyserial is an extra, so a machine set up for one source need not have the
@@ -315,19 +322,45 @@ def _payload(state: ServerState, since: float | None = None) -> dict:
         # Return channel health: None = nothing sent yet, False = the device is not accepting
         # results (usually because its sketch never reads its serial input).
         "source_tx": getattr(state.service, "tx_ok", None),
+        # The wire rate actually measured, so the page can show it against the configured
+        # sample_hz. A mismatch silently rescales every CLS window, and is invisible otherwise.
+        "observed_hz": getattr(state.service, "observed_hz", None),
         "sources": _source_available(),
+        # Which device-global telemetry groups this source carries. Empty on I2C. The page
+        # builds its telemetry charts from this, so a group the link lacks gets no chart
+        # rather than a flat line at zero.
+        "telemetry_groups": list(_available_telemetry(state.service)),
         "euler": {},
         "accel": {},
         "gyro": {},
         "quat": {},
+        "telemetry": {},
     }
     for label, sig in state.service.signals().items():
         for key in ("euler", "accel", "gyro", "quat"):
             out[key][label] = sig[key] if sig is not None else None
+    tele = getattr(state.service, "telemetry", None)
+    if tele is not None:
+        out["telemetry"] = tele()
     if since is not None:
         # Batch of buffered samples newer than the client's cursor (memory read, no I2C).
+        # Telemetry rides inside these rows -- see SerialImuService.samples_since for why it
+        # must not be a second cursor.
         out["samples"] = state.service.samples_since(since)
     return out
+
+
+def _available_telemetry(service) -> tuple[str, ...]:
+    """Telemetry groups a source carries, () for one that has none.
+
+    Input:  ``service`` = the active sensor source.
+    Output: tuple[str, ...] of ``imu_common.TELEMETRY_GROUPS`` names.
+
+    Duck-typed like ``send_result``: only ``SerialImuService`` defines the method, so the I2C
+    source needs no knowledge that device telemetry exists.
+    """
+    fn = getattr(service, "available_telemetry", None)
+    return tuple(fn()) if fn is not None else ()
 
 
 def create_app(state: ServerState, window_s: float, poll_ms: int) -> Flask:
@@ -337,6 +370,16 @@ def create_app(state: ServerState, window_s: float, poll_ms: int) -> Flask:
         .replace("__POLL_MS__", str(int(poll_ms)))
         # Index -> name for the decision markers; injected so it can never drift from CLASSES.
         .replace("__CLASSES__", json.dumps(list(CLASSES)))
+        # Channel tables, injected rather than written out in the page: imu_common owns the
+        # names, units and axis order, and the payload, the CSV headers and these charts all
+        # read that one table. A channel added there appears here with no JS edit.
+        .replace("__SIGNALS__", json.dumps(
+            {k: {"axes": list(SIGNAL_AXES[k]), "unit": SIGNAL_UNITS.get(k, "")}
+             for k in SIGNAL_AXES}
+        ))
+        .replace("__TELEMETRY__", json.dumps(
+            [{"key": g, "channels": list(ch), "unit": u} for g, ch, u in TELEMETRY_GROUPS]
+        ))
     )
 
     @app.route("/")
@@ -390,6 +433,45 @@ def create_app(state: ServerState, window_s: float, poll_ms: int) -> Flask:
         if state.cls is None or not state.cls.enabled:
             return jsonify({"running": False, "reason": "not configured"})
         return jsonify({"running": state.cls.toggle_running()})
+
+    @app.route("/recordings")
+    def recordings() -> Response:
+        """Every recorded session under the log directory, newest first — the Load picker."""
+        try:
+            limit = int(request.args["limit"])
+        except (KeyError, TypeError, ValueError):
+            limit = None
+        return jsonify({"sessions": list_sessions(state.cfg.log_dir, limit=limit)})
+
+    @app.route("/recordings/<path:session_id>")
+    def recording(session_id: str):
+        """One recorded session as uPlot-ready columns.
+
+        Query: ``from``/``to`` in seconds from the session start (both optional), and
+        ``max_points`` per channel. Zooming re-requests a narrower window, which is how full
+        resolution stays reachable without ever shipping the whole file.
+        """
+        def _f(name):
+            try:
+                return float(request.args[name])
+            except (KeyError, TypeError, ValueError):
+                return None
+
+        try:
+            max_points = int(request.args.get("max_points", DEFAULT_MAX_POINTS))
+        except (TypeError, ValueError):
+            max_points = DEFAULT_MAX_POINTS
+        try:
+            return jsonify(load_session(
+                state.cfg.log_dir, session_id,
+                t_from=_f("from"), t_to=_f("to"),
+                max_points=max(2, min(max_points, 20000)),
+            ))
+        except FileNotFoundError as err:
+            return jsonify({"error": str(err)}), 404
+        except Exception as err:  # a truncated or hand-edited CSV must not 500 the server
+            logger.warning(f"cannot load session {session_id}: {err}")
+            return jsonify({"error": f"cannot read session: {err}"}), 400
 
     @app.route("/axis-remap", methods=["GET"])
     def axis_remap_get() -> Response:
@@ -560,6 +642,11 @@ def run_server(cfg: AppConfig, host: str | None = None, port: int | None = None)
             print(f"  IPv4:   http://{ip4}:{port}")
     else:
         print(f"  URL:    http://{host}:{port}")
+    if host in ("127.0.0.1", "::1", "localhost"):
+        # The shipped default. Nothing is reachable off the machine, which is the point
+        # on a field Jetson with no network; the tunnel below is how a laptop still gets
+        # a browser onto it, and --lan is the deliberate opt-out.
+        print("  loopback only — use the tunnel below, or --lan to serve the network")
     print(f"  tunnel: ssh -L {port}:localhost:{port} <user>@<jetson>   then open http://localhost:{port}\n")
 
     from werkzeug.serving import make_server
@@ -630,6 +717,8 @@ _HTML = """<!DOCTYPE html>
   /* ---- axis-remap modal ---- */
   .overlay{position:fixed;inset:0;background:rgba(0,0,0,.55);display:none;align-items:center;justify-content:center;z-index:50}
   .overlay.open{display:flex}
+  .loadrow{padding:8px 10px;border:1px solid var(--border);border-radius:8px;margin-bottom:6px;cursor:pointer}
+  .loadrow:hover{border-color:var(--accent,#60a5fa);background:var(--hover,rgba(127,127,127,.08))}
   .modal{background:var(--panel);border:1px solid var(--border);border-radius:14px;width:min(820px,94vw);max-height:92vh;overflow:auto;box-shadow:0 18px 50px rgba(0,0,0,.45)}
   .mhead{display:flex;align-items:center;gap:12px;padding:13px 16px;border-bottom:1px solid var(--border)}
   .mtitle{font-weight:700;font-size:15px}
@@ -691,15 +780,11 @@ _HTML = """<!DOCTYPE html>
 <body>
   <div id="app">
     <div id="bar">
-      <div class="seg" id="sigseg">
-        <button class="sigbtn active" data-sig="euler" onclick="setSignal('euler')">Euler</button>
-        <button class="sigbtn" data-sig="accel" onclick="setSignal('accel')">Accel</button>
-        <button class="sigbtn" data-sig="gyro" onclick="setSignal('gyro')">Gyro</button>
-        <button class="sigbtn" data-sig="quat" onclick="setSignal('quat')">Quat</button>
-        <button class="sigbtn" data-sig="cls" onclick="setSignal('cls')">CLS</button>
-      </div>
+      <div class="seg" id="sigseg"></div>
       <button id="viewBtn" class="btn" onclick="toggleView()">Numbers</button>
       <button id="pauseBtn" class="btn" onclick="togglePause()">Pause</button>
+      <button id="loadBtn" class="btn" onclick="openLoad()"
+              title="Load a recorded session from the log folder and review it offline">Load</button>
       <button id="axisBtn" class="btn" onclick="openAxis()">Axis</button>
       <button id="calibBtn" class="btn" onclick="openCalib()">Calib</button>
       <button id="yBtn" class="btn" onclick="toggleYMode()">Y: Auto</button>
@@ -779,6 +864,21 @@ _HTML = """<!DOCTYPE html>
     </div>
   </div>
 
+  <div id="loadOverlay" class="overlay" onclick="if(event.target===this)closeLoad()">
+    <div class="modal" role="dialog" aria-modal="true" aria-label="Load a recording">
+      <div class="mhead">
+        <span class="mtitle">Recordings &nbsp;<span class="muted">from the log folder</span></span>
+        <span class="grow"></span>
+        <button class="btn" onclick="closeLoad()">Close</button>
+      </div>
+      <div class="mbody">
+        <div class="mcol" id="loadBody" style="min-width:520px">
+          <div class="muted">Loading…</div>
+        </div>
+      </div>
+    </div>
+  </div>
+
   <div id="calibOverlay" class="overlay" onclick="if(event.target===this)closeCalib()">
     <div class="modal" role="dialog" aria-modal="true" aria-label="Calibration status">
       <div class="mhead">
@@ -803,11 +903,21 @@ _HTML = """<!DOCTYPE html>
 <script>
 const WINDOW_S = __WINDOW_S__;
 const POLL_MS  = __POLL_MS__;
-const SIGNALS = { euler:['x','y','z'], accel:['x','y','z'], gyro:['x','y','z'], quat:['w','x','y','z'] };
-const UNITS   = { euler:'deg', accel:'m/s^2', gyro:'rad/s', quat:'' };
+// Channel tables, injected from imu_common so the page owns no channel names of its own.
+// SIGNALS: per-sensor, one chart per axis and one line per sensor label.
+// TELEMETRY: device-global, one chart per group and one line per channel — no label layer.
+const SIGNALS = __SIGNALS__;
+const TELEMETRY = __TELEMETRY__;
+const TELE_BY_KEY = Object.fromEntries(TELEMETRY.map(g => [g.key, g]));
+const UNITS = Object.fromEntries(Object.entries(SIGNALS).map(([k,v]) => [k, v.unit]));
+const isTele = k => !!TELE_BY_KEY[k];
+const axesOf = k => isTele(k) ? TELE_BY_KEY[k].channels : SIGNALS[k].axes;
+const unitOf = k => isTele(k) ? TELE_BY_KEY[k].unit : (SIGNALS[k] ? SIGNALS[k].unit : '');
 const THEMES = {
-  dark:  { axis:'#8b93a7', grid:'#222a38', series:['#e879f9','#22d3ee'], ax:{x:'#f87171',y:'#4ade80',z:'#60a5fa',w:'#fbbf24'} },
-  light: { axis:'#5b6472', grid:'#e2e6ee', series:['#c026d3','#0891b2'], ax:{x:'#dc2626',y:'#16a34a',z:'#2563eb',w:'#d97706'} },
+  dark:  { axis:'#8b93a7', grid:'#222a38', series:['#e879f9','#22d3ee'], ax:{x:'#f87171',y:'#4ade80',z:'#60a5fa',w:'#fbbf24'},
+           multi:['#e879f9','#22d3ee','#4ade80','#fbbf24','#f87171','#a78bfa'] },
+  light: { axis:'#5b6472', grid:'#e2e6ee', series:['#c026d3','#0891b2'], ax:{x:'#dc2626',y:'#16a34a',z:'#2563eb',w:'#d97706'},
+           multi:['#c026d3','#0891b2','#16a34a','#d97706','#dc2626','#7c3aed'] },
 };
 const theme = () => document.documentElement.classList.contains('light') ? THEMES.light : THEMES.dark;
 
@@ -816,9 +926,14 @@ let signal = 'euler';
 let view = 'plot';
 let paused = false;
 let samples = [];
-let charts = [], heads = [], ro = null;
+let charts = [], heads = [], ro = null, specs = [];
 let latestT = 0;
 let yBySignal = {};               // signal -> {auto:true} | {auto:false, min, max}
+let teleAvail = [];               // telemetry groups the live source carries
+// Offline viewing: null when live, otherwise the loaded session from /recordings/<id>.
+// While set, tick() does not fetch and the charts read their columns from here instead.
+let offline = null;
+let offlineBusy = false, zoomTimer = null;
 let clsMode = false;              // CLS page active (a pseudo-signal, not a plot)
 let clsSince = 0;                 // highest CLS entry id already shown
 let clsTimer = null;
@@ -831,22 +946,72 @@ const clsColor = c => CLS_COLORS[c] || '#60a5fa';
 
 const fmt = (sig, v) => v == null ? '--' : v.toFixed(sig === 'quat' ? 3 : 2);
 
-function chartOpts(w, h){
+// One chart spec per plot the current selection needs. Per-sensor signals cut one chart per
+// axis with a line per sensor; a telemetry group is one chart with a line per channel. Both
+// shapes come out as {title, key, series:[{name,color}]}, so everything downstream is shared.
+function chartSpecs(){
+  const T = theme();
+  if(isTele(signal)){
+    const g = TELE_BY_KEY[signal];
+    return [{ title: signal, key: signal,
+              series: g.channels.map((c,k) => ({ name:c, color: T.multi[k % T.multi.length] })) }];
+  }
+  const sg = SIGNALS[signal];
+  if(!sg) return [];
+  return sg.axes.map(ax => ({
+    title: signal + ' <span style="color:' + (T.ax[ax] || T.axis) + '">' + ax + '</span>',
+    key: ax,
+    series: labels.map((lab,k) => ({ name:lab, color: T.series[k % T.series.length] })),
+  }));
+}
+
+// Columns for one chart in uPlot order [xs, ...series]. The only place that knows where the
+// numbers come from, so live polling and offline replay differ here and nowhere else.
+function chartCols(spec, i){
+  if(offline){
+    if(isTele(signal)){
+      const g = offline.telemetry[signal];
+      if(!g) return [[], ...spec.series.map(()=>[])];
+      return [g.t, ...spec.series.map(sr => g.channels[sr.name] || [])];
+    }
+    const sg = offline.signals[signal];
+    if(!sg) return [[], ...spec.series.map(()=>[])];
+    const per = sg.axes[spec.key] || {};
+    return [sg.t, ...spec.series.map(sr => per[sr.name] || [])];
+  }
+  const ts = samples.map(s => s.t);
+  if(isTele(signal)){
+    return [ts, ...spec.series.map((sr, ci) =>
+      samples.map(s => { const v = s.telemetry && s.telemetry[signal]; return v ? v[ci] : null; }))];
+  }
+  return [ts, ...spec.series.map(sr =>
+    samples.map(s => { const v = s[signal] && s[signal][sr.name]; return v ? v[i] : null; }))];
+}
+
+function chartOpts(w, h, spec){
   const T = theme();
   const series = [{}];
-  labels.forEach((lab, k) => series.push({ stroke: T.series[k % T.series.length], width: 2, points:{show:false} }));
+  spec.series.forEach(sr => series.push({ stroke: sr.color, width: 2, points:{show:false} }));
   const ym = yBySignal[signal];
   const yscale = (ym && !ym.auto && ym.max > ym.min) ? { range: [ym.min, ym.max] } : {};
+  // Live: a rolling window pinned to the newest sample, ticks labelled as seconds ago.
+  // Offline: the window the server returned, ticks labelled as seconds into the session.
+  const xscale = offline ? { time:false }
+                         : { time:false, range: () => [latestT - WINDOW_S, latestT] };
+  const xvalues = offline ? (u,vs) => vs.map(v => v.toFixed(1))
+                          : (u,vs) => vs.map(v => (v - latestT).toFixed(0));
   return {
     width: w, height: h,
     legend: { show:false },
     cursor: { drag:{ x:true, y:false }, points:{ show:false } },
-    scales: { x: { time:false, range: () => [latestT - WINDOW_S, latestT] }, y: yscale },
+    scales: { x: xscale, y: yscale },
     axes: [
-      { stroke:T.axis, grid:{ stroke:T.grid }, ticks:{ stroke:T.grid },
-        values:(u,vs)=>vs.map(v=>(v - latestT).toFixed(0)) },
+      { stroke:T.axis, grid:{ stroke:T.grid }, ticks:{ stroke:T.grid }, values:xvalues },
       { stroke:T.axis, grid:{ stroke:T.grid }, ticks:{ stroke:T.grid }, size:54 },
     ],
+    // Offline only: a drag-zoom asks for more detail than the decimated window holds, so it
+    // re-fetches that range at full budget instead of magnifying the envelope.
+    hooks: offline ? { setScale: [ (u, key) => { if(key === 'x') onOfflineZoom(u); } ] } : {},
     series,
   };
 }
@@ -869,57 +1034,87 @@ function rebuildCharts(){
         u.setSize({ width: e.contentRect.width, height: e.contentRect.height });
     }
   });
-  SIGNALS[signal].forEach((ax) => {
+  const unit = unitOf(signal);
+  specs = chartSpecs();
+  specs.forEach((spec) => {
     const card = document.createElement('div'); card.className = 'chart';
     const head = document.createElement('div'); head.className = 'chead';
-    head.innerHTML = '<span class="ctitle">' + signal + ' <span style="color:' + T.ax[ax] + '">' + ax + '</span></span>'
-      + labels.map((lab,k)=>'<span class="cval"><i style="background:' + T.series[k%T.series.length] + '"></i>'
-          + lab + ' <b data-v="' + k + '">--</b></span>').join('');
+    head.innerHTML = '<span class="ctitle">' + spec.title
+        + (unit ? ' <span class="runit">' + unit + '</span>' : '') + '</span>'
+      + spec.series.map((sr,k)=>'<span class="cval"><i style="background:' + sr.color + '"></i>'
+          + sr.name + ' <b data-v="' + k + '">--</b></span>').join('');
     const body = document.createElement('div'); body.className = 'canvas';
     card.appendChild(head); card.appendChild(body); wrap.appendChild(card);
-    const u = new uPlot(chartOpts(body.clientWidth || 300, body.clientHeight || 140),
-                        [[], ...labels.map(()=>[])], body);
+    const u = new uPlot(chartOpts(body.clientWidth || 300, body.clientHeight || 140, spec),
+                        [[], ...spec.series.map(()=>[])], body);
     body.__u = u; charts.push(u); heads.push(head); ro.observe(body);
   });
   redraw();
 }
 
 function redraw(){
-  const ts = samples.map(s => s.t);
-  const last = samples[samples.length - 1];
   charts.forEach((u, i) => {
-    const cols = [ts];
-    labels.forEach(lab => cols.push(samples.map(s => { const v = s[signal] && s[signal][lab]; return v ? v[i] : null; })));
+    const spec = specs[i];
+    if(!spec) return;
+    const cols = chartCols(spec, i);
     u.setData(cols);
-    if(last) labels.forEach((lab,k) => {
+    // Header value: the newest sample live, the last point of the window offline.
+    const n = cols[0].length;
+    spec.series.forEach((sr,k) => {
       const el = heads[i].querySelector('b[data-v="' + k + '"]');
-      const v = last[signal] && last[signal][lab];
-      if(el) el.textContent = v ? fmt(signal, v[i]) : '--';
+      if(!el) return;
+      const col = cols[k+1];
+      const v = (n && col && col.length >= n) ? col[n-1] : null;
+      el.textContent = (v == null) ? '--' : fmt(signal, v);
     });
   });
 }
 
+// Numbers view: one card per sensor label for the per-sensor signals, then one card holding
+// every telemetry group the source carries. Telemetry has no label layer, hence its own card
+// rather than a column inside each sensor's.
 function buildReadout(){
   const T = theme();
   const wrap = document.getElementById('readout');
-  wrap.innerHTML = labels.map(lab =>
+  const sigKeys = Object.keys(SIGNALS);
+  let html = labels.map(lab =>
     '<div class="rcard"><div class="rtitle">' + lab + '</div>'
-    + ['euler','accel','gyro','quat'].map(sig =>
+    + sigKeys.map(sig =>
         '<div class="rgroup"><div class="rgname">' + sig
           + (UNITS[sig] ? '<span class="runit">' + UNITS[sig] + '</span>' : '') + '</div>'
         + '<div class="rvals">'
-        + SIGNALS[sig].map((ax,i) => '<span class="rax"><i style="color:' + T.ax[ax] + '">' + ax
+        + SIGNALS[sig].axes.map((ax,i) => '<span class="rax"><i style="color:' + (T.ax[ax] || T.axis) + '">' + ax
             + '</i><b data-k="' + lab + '|' + sig + '|' + i + '">--</b></span>').join('')
         + '</div></div>').join('')
     + '</div>').join('');
+  const groups = TELEMETRY.filter(g => teleAvail.indexOf(g.key) >= 0);
+  if(groups.length){
+    html += '<div class="rcard"><div class="rtitle">Telemetry</div>'
+      + groups.map(g =>
+          '<div class="rgroup"><div class="rgname">' + g.key
+            + (g.unit ? '<span class="runit">' + g.unit + '</span>' : '') + '</div>'
+          + '<div class="rvals">'
+          + g.channels.map((ch,i) => '<span class="rax"><i style="color:' + T.multi[i % T.multi.length] + '">'
+              + ch + '</i><b data-k="tele|' + g.key + '|' + i + '">--</b></span>').join('')
+          + '</div></div>').join('')
+      + '</div>';
+  }
+  wrap.innerHTML = html;
 }
 
 function updateReadout(d){
-  for(const lab of labels) for(const sig of ['euler','accel','gyro','quat']) SIGNALS[sig].forEach((ax,i) => {
+  for(const lab of labels) for(const sig of Object.keys(SIGNALS)) SIGNALS[sig].axes.forEach((ax,i) => {
     const el = document.querySelector('b[data-k="' + lab + '|' + sig + '|' + i + '"]');
     if(!el) return;
     const v = d[sig] && d[sig][lab];
     el.textContent = v ? fmt(sig, v[i]) : '--';
+  });
+  const tele = d.telemetry || {};
+  for(const g of TELEMETRY) g.channels.forEach((ch,i) => {
+    const el = document.querySelector('b[data-k="tele|' + g.key + '|' + i + '"]');
+    if(!el) return;
+    const v = tele[g.key];
+    el.textContent = (v && v[i] != null) ? fmt(g.key, v[i]) : '--';
   });
 }
 
@@ -931,6 +1126,113 @@ function setSignal(s){
   if(view === 'plot') rebuildCharts();
   syncYControls();
 }
+// ---- signal / telemetry buttons ------------------------------------------
+// Built from the injected tables rather than written into the markup, and filtered by what the
+// active source actually carries — so the page never offers a chart that could only be a flat
+// line, and a channel added in imu_common appears here with no edit.
+function buildSigButtons(){
+  const sigKeys = Object.keys(SIGNALS);
+  const tele = TELEMETRY.filter(g => teleAvail.indexOf(g.key) >= 0).map(g => g.key);
+  const want = sigKeys.concat(tele).concat(offline ? [] : ['cls']);
+  const seg = document.getElementById('sigseg');
+  if(seg.dataset.keys === want.join(',')) return;   // unchanged: leave the DOM alone
+  seg.dataset.keys = want.join(',');
+  seg.innerHTML = want.map(k => {
+    const on = clsMode ? (k === 'cls') : (k === signal);
+    const cap = k.charAt(0).toUpperCase() + k.slice(1);
+    return '<button class="sigbtn' + (on ? ' active' : '') + '" data-sig="' + k
+         + '" onclick="setSignal(&quot;' + k + '&quot;)">' + cap + '</button>';
+  }).join('');
+}
+
+// ---- offline viewing -----------------------------------------------------
+// `offline` holds one loaded session; while it is set, tick() does not fetch and every chart
+// reads its columns from it. The live cursor is reset on the way out so resuming cannot replay
+// a stale window.
+function offlineBanner(){
+  if(!offline) return;
+  const w = offline.window, sp = offline.span;
+  document.getElementById('status').innerHTML =
+    '<span id="dot"></span>offline · ' + offline.id
+    + ' · ' + w[0].toFixed(1) + '–' + w[1].toFixed(1) + ' s of ' + sp[1].toFixed(1) + ' s'
+    + ' <button class="btn" style="margin-left:8px" onclick="offlineFull()">Full</button>'
+    + ' <button class="btn" onclick="exitOffline()">Live</button>';
+}
+
+async function openLoad(){
+  document.getElementById('loadOverlay').classList.add('open');
+  const body = document.getElementById('loadBody');
+  body.innerHTML = '<div class="muted">Loading…</div>';
+  let d;
+  try { d = await (await fetch('/recordings')).json(); }
+  catch(e){ body.innerHTML = '<div class="muted">Could not list recordings.</div>'; return; }
+  const rows = d.sessions || [];
+  if(!rows.length){
+    body.innerHTML = '<div class="muted">No recordings yet — press Record to make one.</div>';
+    return;
+  }
+  body.innerHTML = rows.map(r => {
+    const dur = (r.duration_s == null) ? '—' : r.duration_s.toFixed(1) + ' s';
+    const groups = (r.signals || []).concat(r.telemetry || []).concat(r.has_cls ? ['cls'] : []);
+    return '<div class="loadrow" onclick="loadSession(&quot;' + r.id + '&quot;)">'
+      + '<b>' + r.started + '</b>'
+      + '<span class="muted"> · ' + r.n_rows + ' rows · ' + dur + '</span>'
+      + '<div class="muted" style="font-size:11px">' + groups.join(' · ') + '</div>'
+      + '</div>';
+  }).join('');
+}
+function closeLoad(){ document.getElementById('loadOverlay').classList.remove('open'); }
+
+async function loadSession(id, from, to){
+  if(offlineBusy) return;
+  offlineBusy = true;
+  let q = '/recordings/' + id + '?max_points=4000';
+  if(from != null && to != null) q += '&from=' + from + '&to=' + to;
+  let d;
+  try { d = await (await fetch(q)).json(); }
+  catch(e){ offlineBusy = false; return; }
+  if(d.error){ offlineBusy = false; alert(d.error); return; }
+  offline = d;
+  if(d.labels && d.labels.length) labels = d.labels;
+  teleAvail = Object.keys(d.telemetry || {});
+  closeLoad();
+  if(clsMode) exitCls();
+  // A recording need not hold whatever is selected — serial sessions have no euler/quat, an
+  // I2C one has no telemetry. Fall back to something the file actually contains.
+  const have = Object.keys(d.signals || {}).concat(teleAvail);
+  if(have.length && have.indexOf(signal) < 0) signal = have[0];
+  buildSigButtons();
+  document.querySelectorAll('.sigbtn').forEach(b => b.classList.toggle('active', b.dataset.sig === signal));
+  if(view === 'plot') rebuildCharts(); else { buildReadout(); fillReadout(); }
+  offlineBanner();
+  offlineBusy = false;
+}
+
+function offlineFull(){ if(offline && !offlineBusy) loadSession(offline.id); }
+
+function exitOffline(){
+  offline = null;
+  samples = [];
+  sinceT = 0;              // do not replay the pre-offline window against the new cursor
+  teleAvail = [];          // the next poll reports what the live source carries
+  buildSigButtons();
+  if(view === 'plot') rebuildCharts(); else buildReadout();
+}
+
+// Drag-zoom while offline: the visible envelope is decimated, so a zoom is a request for
+// detail the browser does not have. Re-fetch that range at full budget instead of magnifying
+// what is already drawn. Debounced, because uPlot fires setScale once per chart on the page.
+function onOfflineZoom(u){
+  if(!offline || offlineBusy) return;
+  const sc = u.scales.x;
+  if(sc.min == null || sc.max == null) return;
+  const w = offline.window;
+  if(Math.abs(sc.min - w[0]) < 1e-6 && Math.abs(sc.max - w[1]) < 1e-6) return;
+  const lo = sc.min, hi = sc.max;
+  if(zoomTimer) clearTimeout(zoomTimer);
+  zoomTimer = setTimeout(() => loadSession(offline.id, lo, hi), 250);
+}
+
 function togglePause(){
   paused = !paused;
   const b = document.getElementById('pauseBtn');
@@ -1005,7 +1307,30 @@ function toggleView(){
   document.getElementById('charts').style.display = (view === 'plot') ? 'flex' : 'none';
   document.getElementById('readout').style.display = (view === 'plot') ? 'none' : 'grid';
   if(view === 'plot'){ rebuildCharts(); }
-  else { buildReadout(); if(samples.length) updateReadout(samples[samples.length-1]); }
+  else { buildReadout(); fillReadout(); }
+}
+
+// Feed the Numbers view whatever the current mode has. Live, that is the newest polled sample;
+// offline, the last point of the loaded window — without this the view would sit at '--' while
+// a session is open, because tick() (its only other caller) does not run then.
+function fillReadout(){
+  if(offline){
+    const d = { telemetry: {} };
+    for(const [k, sg] of Object.entries(offline.signals || {})){
+      d[k] = {};
+      for(const lab of labels){
+        const vals = SIGNALS[k].axes.map(ax => ((sg.axes[ax] || {})[lab] || []).slice(-1)[0]);
+        d[k][lab] = vals.every(v => v == null) ? null : vals;
+      }
+    }
+    for(const [k, g] of Object.entries(offline.telemetry || {})){
+      d.telemetry[k] = (TELE_BY_KEY[k] ? TELE_BY_KEY[k].channels : [])
+        .map(ch => (g.channels[ch] || []).slice(-1)[0] ?? null);
+    }
+    updateReadout(d);
+  } else if(samples.length){
+    updateReadout(samples[samples.length - 1]);
+  }
 }
 
 // ---- manual Y range -------------------------------------------------------
@@ -1194,7 +1519,7 @@ function makeAxisLabel(text,color,pos){
 }
 function startCube(){
   const wrap=document.getElementById('cubeWrap'), canvas=document.getElementById('cube');
-  if(typeof THREE==='undefined'){ wrap.innerHTML='<div class="muted" style="padding:14px">3D library unavailable (the browser needs internet for the CDN).</div>'; return; }
+  if(typeof THREE==='undefined'){ wrap.innerHTML='<div class="muted" style="padding:14px">3D library unavailable (static/three.min.js failed to load).</div>'; return; }
   if(!cube.renderer){
     cube.renderer=new THREE.WebGLRenderer({canvas, antialias:true, alpha:true});
     cube.scene=new THREE.Scene();
@@ -1351,7 +1676,8 @@ let sinceT = 0;                        // cursor: newest buffered-sample t alrea
 let statPolls = 0, statSamples = 0, statStart = performance.now(), rateStr = '';
 
 async function tick(){
-  if(!paused){
+  // Offline viewing owns the charts; polling would fight it for setData and the x scale.
+  if(!paused && !offline){
     try {
       const d = await (await fetch('/data?since=' + sinceT)).json();
       if(d.t < sinceT){ sinceT = 0; samples = []; }   // server restarted (monotonic reset)
@@ -1359,6 +1685,15 @@ async function tick(){
       const ks = Object.keys(d.euler || {});
       if(ks.length && JSON.stringify(ks) !== JSON.stringify(labels)){
         labels = ks;
+        if(view === 'plot') rebuildCharts(); else buildReadout();
+      }
+      // Telemetry groups follow the source: switching to I2C drops all of them, and the
+      // selected one has to go with them or the charts would draw from a key that is gone.
+      const tg = d.telemetry_groups || [];
+      if(JSON.stringify(tg) !== JSON.stringify(teleAvail)){
+        teleAvail = tg;
+        if(isTele(signal) && tg.indexOf(signal) < 0) signal = Object.keys(SIGNALS)[0];
+        buildSigButtons();
         if(view === 'plot') rebuildCharts(); else buildReadout();
       }
       const batch = (d.samples && d.samples.length) ? d.samples : [d];
@@ -1374,7 +1709,10 @@ async function tick(){
                 + ' Hz · data ' + (statSamples * 1000 / elapsed).toFixed(0) + ' Hz';
         statPolls = 0; statSamples = 0; statStart = performance.now();
       }
-      document.getElementById('status').innerHTML = '<span id="dot"></span>live · t=' + d.t.toFixed(1) + 's' + rateStr;
+      // The measured wire rate next to the poll rate: it is the only visible check that
+      // [source] sample_hz matches reality, and a mismatch rescales every CLS window silently.
+      const obs = (d.observed_hz != null) ? ' · wire ' + d.observed_hz.toFixed(1) + ' Hz' : '';
+      document.getElementById('status').innerHTML = '<span id="dot"></span>live · t=' + d.t.toFixed(1) + 's' + rateStr + obs;
       const rb = document.getElementById('recBtn');
       rb.textContent = d.recording ? 'Recording' : 'Record';
       rb.classList.toggle('rec-on', !!d.recording);
@@ -1402,6 +1740,7 @@ window.addEventListener('DOMContentLoaded', () => {
   document.getElementById('ymin').addEventListener('change', applyYInput);
   document.getElementById('ymax').addEventListener('change', applyYInput);
   buildAxisControls();
+  buildSigButtons();
   rebuildCharts();
   syncYControls();
   tick();

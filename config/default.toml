@@ -3,23 +3,39 @@
 7 = "Left"
 
 [source]                  # boot default; the web UI can switch kinds at runtime (session only)
-kind = "i2c"              # "i2c" = BNO055 over I2C (see [buses]) | "serial" = binary frames from an Arduino/Simulink
+kind = "serial"           # "i2c" = BNO055 over I2C (see [buses]) | "serial" = binary frames from an Arduino/Simulink
 port = "/dev/ttyACM0"     # serial only; on Windows something like "COM17"
 baud = 115200
 label = "Left"            # label the serial IMU appears under; must match [cls] sensor
 magic = "aa55"            # frame header in hex; required unless the layout carries a timestamp
-layout = "gyro_accel"     # frame contents, see read_serial.LAYOUTS:
+layout = "exo_v1"         # frame contents, see read_serial.LAYOUTS. A layout is an ordered
+                          # list of channel BLOCKS, so a wider frame is one more table row:
                           #   accel_gyro_t  ax ay az gx gy gz t   (7 floats, Simulink)
                           #   gyro_accel_t  gx gy gz ax ay az t   (7 floats)
                           #   accel_gyro    ax ay az gx gy gz     (6 floats, no clock)
                           #   gyro_accel    gx gy gz ax ay az     (6 floats, no clock)
+                          #   exo_v1        the full rig uplink   (23 floats = 94 B w/ header):
+                          #                 enable | gx gy gz | ax ay az
+                          #                 | ang_r vel_r ang_l vel_l
+                          #                 | pos_r speed_r torque_r pos_l speed_l torque_l
+                          #                 | finalClass LU_AVEL_F L_KVEL L_KWRAP MotorCom_L
+                          #                 | t_src
+                          # Switch to exo_v1 only once the device sends that frame — the two
+                          # lengths are not multiples, so a mismatch never aligns and the UI
+                          # just shows "(no data)". The reader logs a hint after 5 s, and
+                          # `others/tools/serial_monitor.py --layout exo_v1` checks it directly.
                           # Channel order cannot be detected from the bytes: getting it wrong
                           # puts gravity in the gyro channels and degrades CLS silently.
-gyro_units = "rad"        # units the device sends: "deg" is scaled to rad/s, "rad" passes through
-sample_hz = 80            # rate the device sends at (measured 79.7 Hz); omit to inherit
-                          # [defaults] sample_hz. Drives the CLS decimation, so it must divide
-                          # [cls] target_hz evenly — 80/10 = 8. The serial reader logs the
-                          # observed rate on connect, so check it against this value.
+gyro_units = "deg"        # units the device sends: "deg" is scaled to rad/s, "rad" passes through
+sample_hz = 80            # rate the device sends at. MEASURED VALUE, not the nominal one:
+                          # it drives the CLS decimation (decim = sample_hz / [cls] target_hz),
+                          # so configuring 100 while the device sends 80 stretches every model
+                          # window by 25% with no error anywhere. Must divide target_hz evenly
+                          # — 80/10 = 8, 100/10 = 10, 200/10 = 20 are all fine; 90 is not.
+                          # 79.7 Hz was measured with the model's WiFi UDP telemetry still in
+                          # the loop. That block is gone now, which frees 1-5 ms of the 10 ms
+                          # step, so RE-MEASURE: the reader logs the rate a few seconds after
+                          # connecting and the page shows it next to the poll rate.
 
 [axis]                    # host-side axis remap, applied to BOTH sources (I2C and serial).
                           # Replaces the old BNO055 AXIS_MAP_CONFIG/SIGN register writes: the
@@ -43,7 +59,10 @@ sample_hz = 100           # sampler-thread rate per sensor (BNO055 fusion is fix
 plot_fps = 15             # browser poll rate; each poll now fetches the full sample batch
 plot_window_seconds = 10  # rolling time window shown in the plots
 record_hz = 100           # buffer drain cadence; CSV data rate follows sample_hz (no dup/skip)
-web_host = "::"           # bind host: "::" = IPv6+IPv4 dual-stack; "0.0.0.0" = IPv4 only
+web_host = "127.0.0.1"    # bind host. Loopback by default: a Jetson in the field exposes
+                          # nothing, and a laptop reaches the UI over an ssh tunnel (the
+                          # startup banner prints the command). Pass --lan, or set "::" here,
+                          # to serve the network instead; "0.0.0.0" is IPv4 only.
 web_port = 8000           # server port
 
 [cls]                     # real-time activity classification (CLS page)
