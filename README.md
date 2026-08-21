@@ -21,8 +21,9 @@ workloads (e.g. an AI model) on the same board.
   live 3D cube to confirm the result. Datasheet §3.4 placements P0–P7 remain as presets.
 - **Calib** popup: live onboard calibration status (sys / gyro / accel, 0–3) with guidance.
 - **IMU:** button switches between the onboard I2C IMUs and a serial (Arduino) IMU at runtime.
-- **CLS** page: online activity classification, with frame predictions aggregated by soft voting
-  into one stable decision — sent back to the Arduino as a class-index byte over the same link.
+- **CLS** page: online activity classification. Each frame prediction is sent back to the Arduino
+  as a class-index byte over the same link; aggregation into a stable decision happens on the
+  device, per gait step.
 - **Record** toggle with an adjustable **row rate** from the page — `0` writes every frame,
   a positive value thins the file to that many rows per second (see **Recording rate**).
 - **Load** a past recording and review it offline in the same charts, with zoom that
@@ -364,7 +365,8 @@ while (Serial.available()) {
 if (millis() - last > 1500) failsafe();   // link went quiet
 ```
 
-* **Rate:** one byte per decision — **2 Hz** at the shipped settings, not per frame.
+* **Rate:** one byte per decision. With aggregation device-side the host does not aggregate,
+  so that is **one byte per inference, ~10 Hz** at the shipped settings.
 * **No sentinel.** When there is no decision (CLS stopped, window still filling, a sensor stall)
   nothing is sent; the link simply goes quiet. Time out on the Arduino if that matters.
 * **Serial source only.** Switch to the I2C IMUs and the port is closed, so transmission stops.
@@ -395,7 +397,7 @@ record_hz = 0             # every frame the device sent
 * **All eight per-sample files thin identically**, so row *n* of `knee.csv` is still the same
   instant as row *n* of `accelerometers.csv`.
 * **`model_input.csv` and `cls_vote.csv` are unaffected.** They run at the model's and the
-  voter's own rates and keep their own cursors.
+  aggregator's own rates and keep their own cursors.
 * **No anti-alias filter is applied.** Thinning is decimation, so high-frequency content folds
   down — record at `0` and filter offline if you need a clean spectrum.
 
@@ -459,8 +461,8 @@ is re-pointed **without reloading the checkpoint**.
 * **Session only** — `config/default.toml` is never written; a restart returns to `[source] kind`.
 * An **active recording is stopped** (the CSV headers and label set are already fixed). Press
   Record again after switching to start a new session.
-* The CLS window and the vote buffer are cleared, so the first new decision takes about
-  `window × (1/target_hz)` + one vote window — roughly 2.5 s at the shipped settings.
+* The CLS window and the aggregator are cleared, so the first new prediction takes about
+  `window × (1/target_hz)` — roughly 2 s at the shipped settings.
 * If the device is not present the switch still happens and says so; the serial reader keeps
   retrying, so plugging it in afterwards recovers on its own.
 * Scriptable: `curl -X POST 'localhost:8000/source?kind=serial'` → `{"ok":true,...}`.
@@ -505,7 +507,7 @@ classes, ids 0–10: stand / walk / turn / jog / rampascent / stairascent / stai
 sit / sit-to-stand / stand-to-sit / rampdescent). It samples one IMU, **block-averages** the
 100 Hz stream down to 10 Hz (matching the training `down_sample`, not plain decimation), keeps
 a 20-sample (2 s) sliding window, and emits a prediction every ~100 ms. Those frame predictions
-are then aggregated into one stable **decision** (see below). It self-disables if `torch` or the
+are aggregated into a stable **decision on the device** (see below). It self-disables if `torch` or the
 checkpoint is missing.
 
 Enable it in `config/default.toml`:
@@ -520,56 +522,62 @@ window = 20               # 2 s @ 10 Hz
 stride = 1                # a new prediction every ~100 ms
 ```
 
-### Vote aggregation
+### Aggregation happens on the device
 
-A single frame prediction is noisy — sensor noise, transient poses and genuinely ambiguous
-points in the gait cycle all produce one-off misclassifications. A downstream consumer (a
-controller adjusting assistance) must not react to every frame or its behaviour jitters. So
-frames are pooled over a short window and reduced to one decision, trading a little latency for
-a large gain in stability. Same idea as the majority vote in the exosuit literature, except the
-windows here are a fixed number of frames: there is no gait-phase or step-segmentation signal
-available, the prediction stream is all there is.
+A single frame prediction is noisy — sensor noise, transient poses and genuinely ambiguous points
+in the gait cycle all produce one-off misclassifications, and a consumer that acts on the result (a
+controller adjusting assistance) must not react to every frame or its behaviour jitters. So frame
+predictions are pooled before they are acted on. **That pooling lives in the Simulink model on the
+device, not here**: it emits one decision per gait step, keyed on the zero crossing of knee angular
+velocity.
 
-**Soft voting**, not a majority vote: the probability vectors are averaged element-wise and the
-argmax of the average wins. At five votes that matters twice over — a label count over 3+ classes
-can split 2:2:1 and force an invented tie-break, and it throws away confidence, so two hesitant
-51% errors outvote one confident 99% correct frame. Averaging has neither problem and costs
-nothing.
+That is a change of premise, not just of location. This section used to argue for a window of a
+fixed *frame count* on the grounds that no gait-phase or step-segmentation signal was available.
+The `exo_v1` layout's `knee4` block carries both legs' knee angle and angular velocity, so step
+segmentation is now possible — and a window cut on the gait cycle beats one cut on a frame count,
+because its boundary means something.
+
+**The Jetson therefore emits every frame prediction, ~10 Hz**, and the device decides what to do
+with them. Note this is 5x the rate the return channel ran at when the host aggregated, which
+makes the "drain your serial input every `loop()`" warning above correspondingly easier to trip.
 
 ```toml
 [cls.vote]
-enabled = true            # false = passthrough (one decision per inference)
-window = 5                # frames averaged per decision
-emit_every = 5            # frames between decisions
-hysteresis = 0            # 0 = switch as soon as the vote does
+enabled = false           # aggregation is device-side (Simulink, per gait step)
 ```
 
-**decision rate = `target_hz / (stride × emit_every)`** — the voter counts *inferences*, not raw
-samples. The shipped values give **2 Hz**, one decision per 500 ms from 5 frames.
+With it off, `ClsService` is an exact passthrough — one decision per inference — and that is what
+the return channel and `cls_vote.csv` carry.
 
-| `window` / `emit_every` | behaviour |
-|---|---|
-| `5` / `5` | **tumbling** — each decision from 5 fresh frames (the baseline) |
-| `10` / `5` | **sliding** — same 2 Hz, averaging the last 10; steadier across class boundaries, more latency |
-| `1` / `1` | passthrough — every inference is its own decision |
+**Host-side voting, if you turn it back on.** `cls/vote.py` (`SoftVoter`) is still injected through
+`ClsService`'s `aggregator` seam, so `enabled = true` restores it:
 
-`hysteresis = n > 1` additionally requires a new class to win `n` consecutive windows before the
-output follows; until then the previous class is re-emitted. Use it if the output flickers at
-boundaries — the trade is false switches against delayed transitions, so it depends on which your
-consumer tolerates less. Start with the plain 5-frame version as a baseline.
+```toml
+[cls.vote]
+enabled = true
+window = 5                # frames averaged per decision
+emit_every = 5            # frames between decisions
+hysteresis = 0            # 0 = switch as soon as the vote does; n > 1 = require n windows
+```
 
-The decision is what the CLS banner shows, what goes back over serial, and what `cls_vote.csv`
-records; the 10 Hz frame stream stays visible in the log below the banner, with a `◀` marker on
-each frame that closed a window. A recording therefore holds both streams — `cls.csv`
-(frame-level, step-held at the IMU rate) and `cls_vote.csv` (one row per decision, at its own
-rate) — which is what an offline comparison of frame-level vs post-voting accuracy needs. Evaluate
-windows where the true class changes mid-window as their own category: that is where this kind of
-aggregation is weakest.
+**decision rate = `target_hz / (stride x emit_every)`** — the voter counts *inferences*, not raw
+samples, so `5`/`5` at 10 Hz gives 2 Hz. `window == emit_every` is tumbling; `window > emit_every`
+is sliding, which is steadier across class boundaries at the cost of latency; `1`/`1` is
+passthrough. It is a **soft** vote: probability vectors are averaged element-wise and the argmax of
+the average wins. Counting labels instead would tie (five votes over 3+ classes can split 2:2:1)
+and would discard confidence, letting two hesitant 51% errors outvote one confident 99% frame.
+
+Replaying the voter over `others/data/17_39_04`'s own frame probabilities (286 s) gives the trade
+concretely — passthrough: 284 class switches, 0.29 s median hold; `5`/`5`: 90 switches, 1.01 s;
+`10`/`5`: 53 switches, 2.75 s.
+
+A recording holds both streams either way — `cls.csv` (frame-level, step-held at the IMU rate) and
+`cls_vote.csv` (one row per decision, at its own rate) — which is what an offline comparison of
+frame-level versus post-aggregation accuracy needs.
 
 Any discontinuity — a sensor stall, pausing CLS, switching source — clears the partial window
-rather than voting across the gap, so no decision is ever built from two sides of a break.
-The aggregator itself is standalone (`cls/vote.py`: no torch, no numpy, no I/O) and injected
-into `ClsService`, so it can be swapped or unit-tested on its own.
+rather than aggregating across the gap, so no decision is ever built from two sides of a break.
+
 
 > **Checkpoint.** Use the winning finetune-high-lr jetson_leg checkpoint from
 > LIMU-BERT-Public (`bench_run45`, `finetune-high-lr__lr0.3__seed42.pt`). Copy the `.pt`
@@ -594,10 +602,8 @@ into `ClsService`, so it can be swapped or unit-tested on its own.
 Offline model-math parity is proven by `others/tools/parity_check_cls.py` (run from the
 LIMU-BERT-Public repo); the 100 Hz→10 Hz block-average is covered by
 `others/tests/test_cls_downsample.py`, serial decoding + unit conversion by
-`others/tests/test_read_serial.py`, vote aggregation by `others/tests/test_vote.py`, the return
-channel by `others/tests/test_serial_tx.py`, the runtime source switch by
-`others/tests/test_source_switch.py`, and the axis remap by
-`others/tests/test_axis_transform.py`.
+`others/tests/test_read_serial.py`, vote aggregation by `others/tests/test_vote.py`, and the
+axis remap by `others/tests/test_axis_transform.py`.
 
 > The checkpoint's output width must match `CLASSES` in `cls/model/__init__.py`. A 7-class `.pt`
 > against the 11-label list fails to load and CLS self-disables with a `size mismatch` warning.

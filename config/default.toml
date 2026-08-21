@@ -27,15 +27,20 @@ layout = "exo_v1"         # frame contents, see read_serial.LAYOUTS. A layout is
                           # Channel order cannot be detected from the bytes: getting it wrong
                           # puts gravity in the gyro channels and degrades CLS silently.
 gyro_units = "deg"        # units the device sends: "deg" is scaled to rad/s, "rad" passes through
-sample_hz = 80            # rate the device sends at. MEASURED VALUE, not the nominal one:
+sample_hz = 100           # rate the device sends at. MEASURED VALUE, not the nominal one:
                           # it drives the CLS decimation (decim = sample_hz / [cls] target_hz),
-                          # so configuring 100 while the device sends 80 stretches every model
-                          # window by 25% with no error anywhere. Must divide target_hz evenly
-                          # — 80/10 = 8, 100/10 = 10, 200/10 = 20 are all fine; 90 is not.
-                          # 79.7 Hz was measured with the model's WiFi UDP telemetry still in
-                          # the loop. That block is gone now, which frees 1-5 ms of the 10 ms
-                          # step, so RE-MEASURE: the reader logs the rate a few seconds after
-                          # connecting and the page shows it next to the poll rate.
+                          # so a wrong value rescales every model window with no error anywhere.
+                          # Must divide target_hz evenly — 100/10 = 10, 80/10 = 8, 200/10 = 20
+                          # are all fine; 90 is not.
+                          # 100 Hz is measured: three recordings under others/data/ come out at
+                          # 99.8 / 106.7 / 99.6 frames per second. An earlier edge-side value of
+                          # 150 gave decim 15, which stretched the 2 s model window to 3.0 s and
+                          # added ~0.7 s of classification latency, silently. The server now warns
+                          # when this disagrees with the measured rate by more than 5%.
+                          # CAVEAT: the device currently transmits each sample THREE times (its
+                          # Simulink model overruns real time 3x), so 100 frames/s carries only
+                          # ~33 distinct samples/s. This value is the FRAME rate, which is what
+                          # the decimation needs; the duplication is a separate device-side fix.
 
 [telemetry.clip]          # absolute limit per telemetry group (serial only). A value outside
                           # ±limit is clamped to it before the plots and the CSVs see it, so one
@@ -104,11 +109,20 @@ target_hz = 10            # sampling rate feeding the model (matches training 10
 window = 20               # samples per inference window (2 s @ 10 Hz)
 stride = 1                # emit a new prediction every N samples (1 = every 100 ms, sliding)
 
-[cls.vote]                # temporal aggregation: noisy 10 Hz frames -> one stable decision.
-                          # The decision is what the UI banner shows, what cls_vote.csv records,
-                          # and the only thing sent back over serial as a class-index byte.
-                          # Decision rate = target_hz / (stride * emit_every) = 2 Hz below.
-enabled = true            # false = passthrough (one decision per inference, as before)
+[cls.vote]                # HOST-SIDE temporal aggregation. OFF by design: aggregation now happens
+                          # on the device, where the Simulink model emits one decision per gait
+                          # step keyed on the zero crossing of knee angular velocity. A window
+                          # whose boundary is a gait event beats one cut on a fixed frame count,
+                          # and the exo_v1 layout's knee4 block is what made that possible.
+                          # With this off, ClsService is an exact passthrough: one decision per
+                          # inference, ~10 Hz, and that is what goes back over serial and into
+                          # cls_vote.csv. Note that is 5x the rate the return channel ran at when
+                          # the host aggregated -- the device must drain its serial input every
+                          # loop() or results stop reaching it (see README, return channel).
+                          # Setting enabled = true restores host-side voting; the parameters
+                          # below then apply and the decision rate becomes
+                          # target_hz / (stride * emit_every).
+enabled = false           # false = passthrough (one decision per inference)
 window = 5                # frames averaged per decision
 emit_every = 5            # frames between decisions; == window -> non-overlapping windows,
                           # < window -> sliding (e.g. window 10 / emit_every 5 is steadier)

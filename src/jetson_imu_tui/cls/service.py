@@ -231,7 +231,16 @@ class ClsService:
         if self._last_raw_t is not None and (t - self._last_raw_t) > MAX_RAW_GAP_S:
             self._reset_window()  # discontinuity — never average or window across a stall
         self._last_raw_t = t
-        vec = [*sample["accel"], *sample["gyro"]]
+        acc, gyr = sample["accel"], sample["gyro"]
+        # A source reports an unusable component as None (serial does this for a value that
+        # arrived non-finite). That is a hole in the signal, not a zero: substituting one would
+        # feed the model a reading the sensor never took, and passing None through reaches
+        # ``np.mean`` and kills this thread — ``_push_raw`` has no exception handler, and the
+        # loop would stop without CLS ever reporting itself as stopped.
+        if acc is None or gyr is None or any(v is None for v in (*acc, *gyr)):
+            self._reset_window()
+            return
+        vec = [*acc, *gyr]
         self._raw.append(vec)
         self._group.append(vec)
         if len(self._group) < self._decim:
@@ -399,6 +408,40 @@ class ClsService:
     def classes(self) -> list[str]:
         """Label order the model emits probabilities in (matches ``predict`` / CLASSES)."""
         return list(CLASSES)
+
+    @property
+    def decim(self) -> int:
+        """Raw samples block-averaged into one model-rate vector. Output: int >= 1."""
+        return self._decim
+
+    def timing(self, observed_hz: float | None = None) -> dict:
+        """What the model window actually spans, in seconds of real time.
+
+        Args:
+            observed_hz: float | None, the wire rate measured by the source. None (or a
+                         non-positive value) falls back to the configured ``sample_hz``.
+
+        Returns:
+            dict: {"decim": int, "window": int, "sample_hz": float, "target_hz": float,
+                   "window_s": float, "trained_window_s": float, "nominal": bool}
+            ``nominal`` is True when no measurement was available, i.e. ``window_s`` is
+            derived from the declared rate rather than the observed one.
+
+        The denominator has to be the OBSERVED rate. Using ``sample_hz`` makes this
+        ``window * decim / sample_hz``, which reduces to ``window / target_hz`` -- the trained
+        value, always, no matter how wrong the configuration is. That quantity can never report
+        a mismatch, which is the entire point of computing it.
+        """
+        hz = float(observed_hz) if observed_hz and observed_hz > 0 else self._sample_hz
+        return {
+            "decim": self._decim,
+            "window": self._window,
+            "sample_hz": self._sample_hz,
+            "target_hz": self._target_hz,
+            "window_s": self._window * self._decim / hz if hz > 0 else 0.0,
+            "trained_window_s": self._window / self._target_hz,
+            "nominal": not (observed_hz and observed_hz > 0),
+        }
 
     @property
     def vote_config(self) -> dict[str, int]:
