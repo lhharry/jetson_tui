@@ -2109,9 +2109,27 @@ async function pollCls(){
   if(tm && tm.window_s){
     const off = Math.abs(tm.window_s - tm.trained_window_s) > 0.15 * tm.trained_window_s;
     winNote = '<span class="clsvote' + (off ? ' warn' : '') + '" title="window '
-            + tm.window + ' vectors x decim ' + tm.decim + (tm.nominal ? ' / sample_hz' : ' / measured wire rate')
+            + tm.window + ' vectors x decim ' + Number(tm.decim).toFixed(2) + (tm.nominal ? ' / sample_hz' : ' / measured wire rate')
             + '">window ' + tm.window_s.toFixed(2) + 's'
             + (off ? ' (trained ' + tm.trained_window_s.toFixed(2) + 's)' : '') + '</span>';
+  }
+  // Thread health: model time per window, how far behind sample arrival the inference runs,
+  // and how often the window was thrown away on a discontinuity. A quiet CLS page is one of
+  // those three, and without them it looks the same whichever it is.
+  let healthNote = '';
+  if(d.infer_ms != null || d.resets != null){
+    const lr = d.last_reset;
+    const lagBad = d.lag_s != null && d.lag_s > 0.5;
+    healthNote = '<span class="clsvote' + (lagBad ? ' warn' : '') + '" title="infer: model time per'
+      + ' window (smoothed) · lag: how late behind sample arrival the last inference ran · resets:'
+      + ' windows discarded on a break in the raw stream (device clock gap or restart), with the'
+      + ' last one: reason, step, time">'
+      + (d.infer_ms != null ? 'infer ' + d.infer_ms.toFixed(0) + ' ms · ' : '')
+      + (d.lag_s != null ? 'lag ' + d.lag_s.toFixed(2) + ' s · ' : '')
+      + 'resets ' + (d.resets || 0)
+      + (lr ? ' (' + lr.reason + (lr.gap_s != null ? ' ' + lr.gap_s.toFixed(2) + ' s' : '')
+              + ' at ' + lr.clock + ')' : '')
+      + '</span>';
   }
   const v = d.vote || {};
   // The banner shows the aggregated decision — the service's actual output, and the only thing
@@ -2131,10 +2149,12 @@ async function pollCls(){
         + d.decision.cls + '</span>'
         + '<span class="clsconf">' + (d.decision.conf * 100).toFixed(0) + '%</span>'
         + '<span class="clsvote">' + voteNote + (d.decision.held ? ' · held' : '') + '</span>'
-        + winNote;
+        + winNote + healthNote;
   } else {
     banner.className = 'clsbanner';
-    banner.innerHTML = '<span class="muted">waiting for data (' + (d.sensor || '') + ')…</span>';
+    // Shown here too: a window being refilled after a reset is exactly the state this explains.
+    banner.innerHTML = '<span class="muted">waiting for data (' + (d.sensor || '') + ')…</span>'
+        + healthNote;
   }
   const log = document.getElementById('clsLog');
   for(const e of (d.entries || [])){

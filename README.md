@@ -231,11 +231,12 @@ a misplaced block shifts every channel after it and that failure is completely s
 
 **`t` vs `t_src`** — same quantity, different job, and a layout may hold at most one. `t` gates
 sync: it must increase monotonically or the decoder re-aligns. `t_src` is an ordinary channel
-that gates nothing. Prefer `t_src` on a long frame: float32 quantises, and once its ulp exceeds
-the frame period two adjacent timestamps round to the same value, `Δt` reads 0 and a healthy
-stream is declared out of sync — at 100 Hz that is `t ≥ 2¹⁷ s` (~36 h), at 200 Hz ~18 h. A
-94-byte frame does not need the help: a 2-byte header matching at 9 consecutive frame boundaries
-is a ~(1/65536)⁹ false lock.
+that gates nothing in the decoder (downstream, CLS reads it to tell a real break in the stream
+from a host stall — see **Real-time activity classification**). Prefer `t_src` on a long frame:
+float32 quantises, and once its ulp exceeds the frame period two adjacent timestamps round to the
+same value, `Δt` reads 0 and a healthy stream is declared out of sync — at 100 Hz that is
+`t ≥ 2¹⁷ s` (~36 h), at 200 Hz ~18 h. A 94-byte frame does not need the help: a 2-byte header
+matching at 9 consecutive frame boundaries is a ~(1/65536)⁹ false lock.
 
 **Telemetry is not a sensor signal.** The knee, motor, trace and enable channels belong to the
 rig, not to a labelled IMU, so they have no label layer, they are never axis-remapped (rotating
@@ -324,9 +325,12 @@ and choosing wrong puts gravity into the gyro channels: the classifier then degr
 error anywhere. Verify once on the device — hold it still and watch `/data`: one *accel* axis
 must read ≈ 9.8 and the gyro must read ≈ 0.
 
-`sample_hz` must equal the rate the device actually sends, since it drives the CLS decimation.
-The serial reader logs the measured rate a few seconds after connecting
-(`Left: 79.7 Hz observed on /dev/ttyACM0 — set sample_hz to match`), so check the two agree.
+`sample_hz` must equal the rate the device actually sends, since it drives the CLS resampling.
+It need not be a multiple of the model rate: 33.33 Hz (the rig's 30 ms frame period) into 10 Hz
+is resampled the way training's `down_sample` does it, in groups of 3, 3, 4, … samples. The serial
+reader logs the measured rate a few seconds after connecting
+(`Left: 33.3 Hz observed on /dev/ttyACM0 — set sample_hz to match`), the status bar shows it
+rolling, and the page badges a disagreement over 5% — so check the two agree.
 
 **Gyro units are the trap.** BNO055 firmware commonly reports **deg/s** (values quantized to
 1/16, peaking in the hundreds) while the classifier was trained on rad/s — leaving `gyro_units`
@@ -573,7 +577,9 @@ host, not written to the chip's `AXIS_MAP_CONFIG`/`AXIS_MAP_SIGN` registers.
 An optional page runs a vendored LIMU-BERT + GRU classifier on the live IMU stream (11
 classes, ids 0–10: stand / walk / turn / jog / rampascent / stairascent / stairdescent /
 sit / sit-to-stand / stand-to-sit / rampdescent). It samples one IMU, **block-averages** the
-100 Hz stream down to 10 Hz (matching the training `down_sample`, not plain decimation), keeps
+raw stream down to 10 Hz (matching the training `down_sample` in both its branches — fixed groups
+for an integer `sample_hz / target_hz`, alternating `floor`/`floor + 1` groups on a running
+remainder otherwise, so 33.33 Hz is resampled as 3, 3, 4, … — not plain decimation), keeps
 a 20-sample (2 s) sliding window, and emits a prediction every ~100 ms. Those frame predictions
 are aggregated into a stable **decision on the device** (see below). It self-disables if `torch` or the
 checkpoint is missing.
@@ -585,7 +591,7 @@ Enable it in `config/default.toml`:
 enabled = true
 model_path = "src/jetson_imu_tui/cls/model/<checkpoint>.pt"  # a BERT-finetune jetson_leg .pt
 sensor = "Left"           # which IMU to classify (leg source is robust to both mounts)
-target_hz = 10            # must match the training sampling rate; sample_hz must be an integer multiple, or CLS self-disables
+target_hz = 10            # must match the training sampling rate; sample_hz must be >= this (any ratio), or CLS self-disables
 window = 20               # 2 s @ 10 Hz
 stride = 1                # a new prediction every ~100 ms
 ```
@@ -645,6 +651,19 @@ frame-level versus post-aggregation accuracy needs.
 
 Any discontinuity — a sensor stall, pausing CLS, switching source — clears the partial window
 rather than aggregating across the gap, so no decision is ever built from two sides of a break.
+On the serial source a break is measured on the **device clock** (`t_src`), not on host arrival
+time: a scheduling stall on the host leaves the frames intact in the OS buffer and their device
+clocks 30 ms apart, and resetting on that threw away a full window — 2 s with no decision — for
+data that was never missing (recorded sessions showed every such host gap lining up with a 2 s
+hole in `cls_vote.csv`). A device restart (clock going backwards), a real device-side gap over
+100 ms, or a sample with a non-finite reading still resets. I2C has only the host clock, and there
+a host gap is a real hole.
+
+The CLS banner carries three health readouts next to the window span: `infer N ms` (model time per
+window, smoothed), `lag N s` (how late behind sample arrival the last inference ran; red past
+0.5 s — a starved thread), and `resets N (reason, step, time)` (windows discarded on a break; it
+should stay at 0 through a session except across a device power-cycle). Together they say whether
+a quiet CLS page is a stalled stream, a slow model or a starved thread.
 
 
 > **Checkpoint.** Use the winning finetune-high-lr jetson_leg checkpoint from

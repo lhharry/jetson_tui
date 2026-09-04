@@ -36,10 +36,12 @@ microseconds at most and never sees a half-closed port.
 Two invariants keep the rest of the app working unchanged:
 
 * Buffered ``"t"`` is the host's ``time.monotonic()`` at decode, exactly like
-  ``ImuService._sample_loop``. The recorder's monotonic->wall-clock mapping, the browser's
-  ``since`` cursor and CLS's ``MAX_RAW_GAP_S`` gap check all assume that clock; the source's own
-  timestamp rides along as ``"t_src"`` and gates nothing — it is there so a dropped frame can be
-  measured against the device's clock rather than inferred from host arrival jitter.
+  ``ImuService._sample_loop``. The recorder's monotonic->wall-clock mapping and the browser's
+  ``since`` cursor assume that clock. The source's own timestamp rides along as ``"t_src"`` and
+  gates nothing in the decoder; downstream it is what CLS measures its ``MAX_RAW_GAP_S``
+  discontinuity check against, because host arrival time reads a host scheduling stall (frames
+  waiting in the OS buffer, then a burst) as a hole in the data when nothing was lost. It is
+  also what a dropped frame is measured against, rather than inferred from arrival jitter.
 * ``gyro_scale`` is applied once, in the reader thread before buffering, so the plots, the CSVs
   and the model all see the same rad/s values. BNO055 firmware commonly emits deg/s (values
   quantized to 1/16, peaking in the hundreds) while the classifier was trained on rad/s — feeding

@@ -16,7 +16,7 @@ DEFAULT_CONFIG = Path(__file__).resolve().parents[2] / "config" / "default.toml"
 class AppConfig:
     bus_labels: dict[int, str] = field(default_factory=lambda: {1: "Left", 7: "Right"})
     log_dir: Path = Path("./logs")
-    sample_hz: int = 100
+    sample_hz: float = 100.0
     plot_fps: int = 15
     plot_window_seconds: float = 10.0
     # CSV rows per second; 0 = every frame the source produced. Not a polling cadence —
@@ -37,8 +37,10 @@ class AppConfig:
     serial_gyro_units: str = "deg"
     # Wire rate of the serial device. Defaults to ``sample_hz`` (the I2C rate); it exists
     # separately because the two sources can be swapped at runtime and the rate drives the
-    # CLS decimation, so one global value cannot be right for both if they differ.
-    serial_sample_hz: int = 100
+    # CLS decimation, so one global value cannot be right for both if they differ. A float:
+    # the device's 30 ms frame period is 33.33 Hz, and CLS resamples any ratio to target_hz
+    # (integer or not) the same way training did, so nothing rounds it.
+    serial_sample_hz: float = 100.0
     # Per-telemetry-group absolute limit: values outside +/- it are clamped before display and
     # recording (see SerialImuService._clean). A group absent from the table passes through
     # untouched — which is why "state" must never appear in it, its t_src being a device clock
@@ -68,7 +70,7 @@ class AppConfig:
     def labels(self) -> list[str]:
         return [self.bus_labels[k] for k in sorted(self.bus_labels)]
 
-    def sample_hz_for(self, kind: str) -> int:
+    def sample_hz_for(self, kind: str) -> float:
         """Wire rate of one source kind — what ``start_sampling`` and CLS decimation need."""
         return self.serial_sample_hz if kind == "serial" else self.sample_hz
 
@@ -85,7 +87,7 @@ def load_config(path: Path | None = None) -> AppConfig:
     source = raw.get("source", {})
     axis = raw.get("axis", {})
     clip = raw.get("telemetry", {}).get("clip", {})
-    sample_hz = int(defaults.get("sample_hz", 100))
+    sample_hz = float(defaults.get("sample_hz", 100.0))
     return AppConfig(
         config_path=str(Path(src).resolve()),
         bus_labels=bus_labels or {1: "Left", 7: "Right"},
@@ -103,7 +105,7 @@ def load_config(path: Path | None = None) -> AppConfig:
         serial_magic=str(source.get("magic", "")),
         serial_layout=str(source.get("layout", "accel_gyro_t")).lower(),
         serial_gyro_units=str(source.get("gyro_units", "deg")).lower(),
-        serial_sample_hz=int(source.get("sample_hz", sample_hz)),
+        serial_sample_hz=float(source.get("sample_hz", sample_hz)),
         telemetry_clip={str(k): abs(float(v)) for k, v in clip.items()},
         axis_ops=[str(op) for op in axis.get("ops", [])],
         cls_enabled=bool(cls.get("enabled", True)),

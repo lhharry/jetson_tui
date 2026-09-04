@@ -1,18 +1,25 @@
 """ClsService — background block-averaging sampler + sliding-window inference.
 
 Raw (gravity-inclusive, tare-bypassed) samples are pulled from ``raw_samples_since`` and
-block-averaged ``decim = sample_hz / target_hz`` at a time into one model-rate vector. That one
-method is the entire contract with the sensor source (``imu_common.SensorSource``), so either
-source works unchanged: ``ImuService`` over I2C or ``SerialImuService`` over a serial link.
-This mirrors training's anti-aliasing downsample (``dataset/jetson_leg.down_sample``): plain
-decimation (one instantaneous sample per tick) would alias >5 Hz energy and feed the model
-out-of-distribution input, hurting the dynamic classes (jog / stairs) most.
+block-averaged ``sample_hz / target_hz`` at a time into one model-rate vector. That one method
+is the entire contract with the sensor source (``imu_common.SensorSource``), so either source
+works unchanged: ``ImuService`` over I2C or ``SerialImuService`` over a serial link. This mirrors
+training's anti-aliasing downsample (``dataset/jetson_leg.down_sample``) in BOTH of its
+branches: an integer ratio means fixed groups of ``ratio`` samples; a non-integer ratio (33.3 Hz
+into 10 Hz is 3.33) alternates groups of ``floor`` and ``floor + 1`` samples on a running
+remainder, exactly as the training code does, so the stream is resampled at the trained rate
+whatever the device sends. Plain decimation (one instantaneous sample per tick) would alias
+>5 Hz energy and feed the model out-of-distribution input, hurting the dynamic classes (jog /
+stairs) most.
 
 Grouping is driven by *raw sample count*, not by tick timing: the CLS tick and the sampler
 thread drift independently, so a tick can deliver 9, 11 or (after a stall) ~20 samples. Only
-a full ``decim`` samples ever form a vector, so a late tick yields two correct vectors rather
-than one over-wide one. A raw-resolution gap check drops the whole window at a discontinuity
-so inference never runs across a stall.
+a full group ever forms a vector, so a late tick yields two correct vectors rather than one
+over-wide one. A raw-resolution gap check drops the whole window at a discontinuity so
+inference never runs across a stall. That check reads the **device clock** (``t_src``) when the
+source carries one: host arrival time reads a host scheduling stall -- frames waiting in the OS
+serial buffer, then arriving in a burst -- as a hole in the data, and each false reset costs a
+full window (2 s) of silence. Host time is the fallback for sources without a device clock.
 
 Per-frame predictions are not the service's output. They are pushed through an injected
 ``aggregator`` (``cls.vote.SoftVoter``) which averages several frames into one stable
@@ -29,13 +36,14 @@ between the I2C IMUs and a serial one) without reloading the checkpoint.
 All buffer mutation happens on the loop thread (``pause``/``resume``/``set_source`` only signal
 via ``_cursor_reset``), so the window can never be cleared mid-inference by a web request.
 
-Fails safe: if ``torch`` or the checkpoint is missing, or ``sample_hz`` is not an integer
-multiple of ``target_hz``, the service stays ``enabled=False`` and never touches the
+Fails safe: if ``torch`` or the checkpoint is missing, or ``sample_hz`` is below
+``target_hz`` (nothing to average), the service stays ``enabled=False`` and never touches the
 sensor, so the rest of the TUI is unaffected.
 """
 
 from __future__ import annotations
 
+import math
 import threading
 import time
 from collections import deque
@@ -54,12 +62,26 @@ from jetson_imu_tui.ring_buffer import RingBuffer
 if TYPE_CHECKING:  # hint only — importing a concrete source here would drag in its deps.
     from jetson_imu_tui.imu_common import SensorSource
 
-# Clear the rolling window if consecutive *raw* samples are further apart than this.
-# Count-based grouping already keeps every group at exactly ``decim`` samples, so this
-# guard only needs to catch true discontinuities (sensor stall / reconnect / resume —
-# hundreds of ms and up), not I2C jitter (tens of ms), which merely stretches a group
-# by a sample or two. 100 ms sits between the two regimes.
+# Clear the rolling window if consecutive *raw* samples are further apart than this, in seconds
+# of the DEVICE clock (``t_src``) when the source has one, else of host arrival time.
+# Count-based grouping already keeps every group the right size, so this guard only needs to
+# catch true discontinuities (sensor stall / reconnect / resume — hundreds of ms and up), not
+# jitter (tens of ms), which merely stretches a group by a sample or two. 100 ms sits between
+# the two regimes.
+#
+# Why the device clock: on a serial link the host stamps ``t`` when the reader thread decodes a
+# frame, so a 300 ms scheduling stall on the host (recorder, Flask, GIL) shows up as a 300 ms
+# hole in ``t`` while the frames sat intact in the OS buffer and their device clocks continued
+# 30 ms apart. Resetting there threw away a full window -- 2 s with no decision -- for data that
+# was never missing. Recorded sessions showed every one of those holes lining up with a 2 s gap
+# in cls_vote.csv. A device restart (clock going backwards) or a real device-side gap still
+# resets, which is what the check is for.
 MAX_RAW_GAP_S = 0.1
+
+# One log line per this many seconds while the window keeps being reset, however many resets.
+# A stall storm should be one warning, not one per stall; the counter in ``snapshot`` carries
+# the number.
+RESET_LOG_EVERY_S = 10.0
 
 
 class ClsService:
@@ -80,14 +102,18 @@ class ClsService:
         self._service = service
         self._model_path = Path(model_path)
         self._sensor = sensor
-        self._sample_hz = float(sample_hz)
         self._target_hz = float(target_hz)
         self._period = 1.0 / self._target_hz
         self._window = int(window)
         self._stride = int(stride)
-        # Raw samples per model-rate vector (100 Hz / 10 Hz = 10). ``start()`` refuses to run
-        # unless the ratio is an exact integer — the reshape in ``_infer`` relies on it.
-        self._decim = max(1, int(round(self._sample_hz / self._target_hz)))
+        # Raw samples per model-rate vector, as a ratio (100 Hz / 10 Hz = 10; 33.3 / 10 = 3.33).
+        # ``_base`` / ``_frac`` are its integer and fractional parts, which drive the group
+        # sizes below the same way training's ``down_sample`` drives them.
+        self._sample_hz = 0.0
+        self._ratio = 1.0
+        self._base = 1
+        self._frac = 0.0
+        self._configure_rate(sample_hz)
 
         # Frame predictions -> stable decisions. Injected so the scheme is swappable; the
         # default (window=1) is an exact passthrough, i.e. one decision per inference.
@@ -106,12 +132,16 @@ class ClsService:
         # ``set_source``). Guarded by ``_log_lock``.
         self._pending_source: tuple["SensorSource", float] | None = None
 
-        # Rolling *raw* window: exactly window*decim samples, i.e. the span one inference
-        # needs. Kept un-averaged so every window is rebuilt on a clean grid and can never
-        # inherit a malformed group. Only ever touched by the loop thread.
-        self._raw: deque[list[float]] = deque(maxlen=self._window * self._decim)
+        # Rolling window of model-rate vectors: exactly ``window`` block means, i.e. what one
+        # inference consumes. Each vector is the mean of one complete group, so the window is
+        # rebuilt on a clean grid after any reset and can never inherit a malformed group.
+        # Only ever touched by the loop thread.
+        self._vecs: deque[np.ndarray] = deque(maxlen=self._window)
         self._group: list[list[float]] = []  # raw samples accumulating into the next vector
-        self._last_raw_t: float | None = None
+        self._group_target = 0               # raw samples the current group needs
+        self._remainder = 0.0                # training's running remainder for non-integer ratios
+        self._last_raw_t: float | None = None    # host arrival time of the previous raw sample
+        self._last_src_t: float | None = None    # its device clock, when the source has one
         self._groups_since_pred = 0
         # Every 6-channel vector fed to the model, timestamped (monotonic). The recorder
         # drains this into model_input.csv so a recording captures the exact model input.
@@ -125,17 +155,55 @@ class ClsService:
         self._next_id = 1
         self._log_lock = threading.Lock()
 
+        # Health, for /cls: how often the window was thrown away and why, how long the model
+        # takes, and how far behind sample arrival the inference runs. Written by the loop
+        # thread under ``_log_lock``, read by HTTP threads under the same lock.
+        self._resets = 0
+        self._last_reset: dict | None = None
+        self._infer_ms: float | None = None
+        self._lag_s: float | None = None
+        self._reset_logged_at = 0.0              # loop-thread only
+
         self._stop = threading.Event()
         self._thread: threading.Thread | None = None
+
+    # --- rate ---------------------------------------------------------------
+    def _configure_rate(self, sample_hz: float) -> None:
+        """Derive the grouping from a wire rate. Loop-thread (or pre-start) only.
+
+        Args:    sample_hz: float, raw samples per second the source delivers.
+        Returns: None. Sets ``_sample_hz``, ``_ratio``, ``_base``, ``_frac``.
+
+        ``_base`` is floored at 1 so a ratio below 1 (refused by ``start``/``set_source`` before
+        it can matter) still produces well-formed groups rather than an infinite loop.
+        """
+        self._sample_hz = float(sample_hz)
+        self._ratio = self._sample_hz / self._target_hz
+        self._base = max(1, int(self._ratio))
+        self._frac = max(0.0, self._ratio - self._base)
+
+    def _rate_error(self, sample_hz: float) -> str | None:
+        """Why ``sample_hz`` cannot feed the model, or None if it can.
+
+        Args:    sample_hz: float.
+        Returns: str | None.
+
+        The only hard limit is training's: ``down_sample`` raises for a raw rate below the
+        target, since a group would need less than one sample. Any ratio >= 1, integer or not,
+        resamples the same way training did.
+        """
+        if not sample_hz or sample_hz < self._target_hz:
+            return (
+                f"sample_hz ({sample_hz:g}) must be >= target_hz ({self._target_hz:g})"
+            )
+        return None
 
     # --- lifecycle ---------------------------------------------------------
     def start(self) -> None:
         """Load the model and start the sampler thread. Self-disables on any failure."""
-        if abs(self._sample_hz / self._target_hz - self._decim) > 1e-9:
-            self._reason = (
-                f"sample_hz ({self._sample_hz:g}) must be an integer multiple of "
-                f"target_hz ({self._target_hz:g})"
-            )
+        err = self._rate_error(self._sample_hz)
+        if err is not None:
+            self._reason = err
             logger.warning(f"CLS disabled — {self._reason}")
             return
         if not self._model_path.exists():
@@ -154,7 +222,10 @@ class ClsService:
         self._reason = "ok"
         self._thread = threading.Thread(target=self._loop, daemon=True)
         self._thread.start()
-        logger.info(f"CLS enabled on '{self._sensor}' (device={self._clf.device})")
+        logger.info(
+            f"CLS enabled on '{self._sensor}' (device={self._clf.device}, "
+            f"sample_hz={self._sample_hz:g}, ratio={self._ratio:.3g})"
+        )
 
     def stop(self) -> None:
         self._stop.set()
@@ -191,46 +262,105 @@ class ClsService:
                 next_tick = time.monotonic()  # fell behind — resync
 
     def _reset_window(self) -> None:
-        """Drop all buffered raw data so the next window starts on a clean grid.
+        """Drop all buffered data so the next window starts on a clean grid.
 
         The aggregator is reset with it: a partial vote window spanning a discontinuity would
-        average predictions from either side of a stall, a pause or a source switch.
+        average predictions from either side of a stall, a pause or a source switch. The
+        grouping remainder restarts at zero too, which is where training's ``down_sample``
+        starts every file.
 
         Loop-thread only: web-thread callers signal via ``_cursor_reset`` instead."""
-        self._raw.clear()
+        self._vecs.clear()
         self._group.clear()
+        self._group_target = 0
+        self._remainder = 0.0
         self._last_raw_t = None
+        self._last_src_t = None
         self._groups_since_pred = 0
         self._agg.reset()
 
-    def _apply_pending_source(self) -> None:
-        """Land a ``set_source`` request. Loop-thread only — ``_raw`` is rebuilt here.
+    def _note_reset(self, reason: str, gap_s: float | None) -> None:
+        """Reset the window because the raw stream broke, and make that visible.
 
-        Re-pointing is all that is needed for the model itself: the window is rebuilt from raw
-        samples on every inference, so nothing carries over from the old source."""
+        Args:
+            reason: str, what broke ("device clock gap", "host clock went backwards", ...).
+            gap_s:  float | None, the measured step in seconds; None when no step applies.
+
+        Returns: None.
+
+        Only the resets the data forced are counted here. ``pause``/``resume``/``set_source``/
+        ``reset_window`` also clear the window, but those are operator actions with their own
+        UI, and folding them in would make the counter read "faults" when it means "clicks".
+        The log is rate-limited by time (``RESET_LOG_EVERY_S``): a stall storm is one warning
+        with the count in ``snapshot``, not a line per stall. Loop-thread only.
+        """
+        self._reset_window()
+        info = {
+            "reason": reason,
+            "gap_s": None if gap_s is None else float(gap_s),
+            "clock": datetime.now().strftime("%H:%M:%S"),
+        }
+        with self._log_lock:
+            self._resets += 1
+            self._last_reset = info   # replaced whole: published dicts are never mutated
+            n = self._resets
+        now = time.monotonic()
+        if now - self._reset_logged_at >= RESET_LOG_EVERY_S:
+            self._reset_logged_at = now
+            step = "" if gap_s is None else f", step {gap_s:+.3f}s"
+            logger.warning(
+                f"CLS window reset ({reason}{step}) — {n} since start; the next decision needs "
+                f"{self._window} fresh vectors (~{self._window / self._target_hz:.0f} s)"
+            )
+
+    def _apply_pending_source(self) -> None:
+        """Land a ``set_source`` request. Loop-thread only — the grouping is rebuilt here.
+
+        Re-pointing is all that is needed for the model itself: the window is rebuilt from
+        fresh groups after the reset, so nothing carries over from the old source."""
         with self._log_lock:
             pending, self._pending_source = self._pending_source, None
         if pending is None:
             return
         service, sample_hz = pending
         self._service = service
-        self._sample_hz = float(sample_hz)
-        self._decim = max(1, int(round(self._sample_hz / self._target_hz)))
-        # maxlen is fixed at construction, so a changed decim needs a fresh deque.
-        self._raw = deque(maxlen=self._window * self._decim)
+        self._configure_rate(sample_hz)
         self._reset_window()
         logger.info(
-            f"CLS source swapped (sample_hz={self._sample_hz:g}, decim={self._decim})"
+            f"CLS source swapped (sample_hz={self._sample_hz:g}, ratio={self._ratio:.3g})"
         )
 
     def _push_raw(self, sample: dict) -> None:
-        """Feed one raw sample: emits a model-rate vector every ``decim`` samples and runs
-        inference every ``stride`` vectors. Group size is fixed by sample count, so batching
-        by the caller — 9, 11 or 20 samples in one tick — cannot change what the model sees."""
+        """Feed one raw sample: emits a model-rate vector when a group completes and runs
+        inference every ``stride`` vectors.
+
+        Args:    sample: dict with ``t`` (host monotonic), ``accel``/``gyro`` (list[float] or
+                 None), and optionally ``t_src`` (device clock, seconds, float or None).
+        Returns: None.
+
+        Group size is fixed by sample count, so batching by the caller — 9, 11 or 20 samples in
+        one tick — cannot change what the model sees. Sizes follow training's ``down_sample``:
+        every group takes ``_base`` samples, plus one whenever the running remainder of the
+        fractional part crosses 1, so 3.33 comes out as 3, 3, 4, 3, 3, 4, ... and an integer
+        ratio degenerates to the fixed groups it always had.
+        """
         t = sample["t"]
-        if self._last_raw_t is not None and (t - self._last_raw_t) > MAX_RAW_GAP_S:
-            self._reset_window()  # discontinuity — never average or window across a stall
-        self._last_raw_t = t
+        t_src = sample.get("t_src")
+        if t_src is not None and not math.isfinite(t_src):
+            t_src = None   # a NaN clock is no clock (the serial filter already refuses these)
+        if self._last_raw_t is not None:
+            # Device clock when both sides have one, host arrival time otherwise. A repeated
+            # device timestamp (dt == 0) is normal — float32 quantisation, and historically
+            # a device resending each sample — and is not a break.
+            if t_src is not None and self._last_src_t is not None:
+                gap, clock = t_src - self._last_src_t, "device clock"
+            else:
+                gap, clock = t - self._last_raw_t, "host clock"
+            if gap < 0.0:
+                self._note_reset(f"{clock} went backwards", gap)     # device restart
+            elif gap > MAX_RAW_GAP_S:
+                self._note_reset(f"{clock} gap", gap)                # a real hole in the data
+        self._last_raw_t, self._last_src_t = t, t_src
         acc, gyr = sample["accel"], sample["gyro"]
         # A source reports an unusable component as None (serial does this for a value that
         # arrived non-finite). That is a hole in the signal, not a zero: substituting one would
@@ -238,35 +368,42 @@ class ClsService:
         # ``np.mean`` and kills this thread — ``_push_raw`` has no exception handler, and the
         # loop would stop without CLS ever reporting itself as stopped.
         if acc is None or gyr is None or any(v is None for v in (*acc, *gyr)):
-            self._reset_window()
+            self._note_reset("invalid sample", None)
             return
-        vec = [*acc, *gyr]
-        self._raw.append(vec)
-        self._group.append(vec)
-        if len(self._group) < self._decim:
+        if not self._group:
+            # A new group: decide its size the way training does, remainder first.
+            self._remainder += self._frac
+            if self._remainder >= 1.0:
+                self._remainder -= 1.0
+                self._group_target = self._base + 1
+            else:
+                self._group_target = self._base
+        self._group.append([*acc, *gyr])
+        if len(self._group) < self._group_target:
             return
-        # One full group -> one model-rate vector (== down_sample's integer branch).
+        # One full group -> one model-rate vector (== down_sample's block mean).
         avg = np.mean(self._group, axis=0)
         self._group.clear()
+        self._vecs.append(avg)
         self._input_buf.append(
             {"t": t, "acc": [float(v) for v in avg[:3]], "gyr": [float(v) for v in avg[3:]]}
         )
         self._groups_since_pred += 1
-        if self._groups_since_pred >= self._stride and len(self._raw) == self._raw.maxlen:
+        if self._groups_since_pred >= self._stride and len(self._vecs) == self._window:
             self._groups_since_pred = 0
             self._infer(t)
 
     def _infer(self, t: float) -> None:
+        # How far behind arrival this thread runs, measured before the model adds its own time.
+        lag = time.monotonic() - t
         try:
-            # Rebuild the window from raw: exactly ``decim`` samples per row, grid-aligned
-            # because we only get here on a group boundary. Bit-identical to
-            # ``down_sample(raw, sample_hz, target_hz)`` — see others/tests/test_cls_downsample.py.
-            window = (
-                np.asarray(self._raw, dtype=np.float32)
-                .reshape(self._window, self._decim, 6)
-                .mean(axis=1)
-            )
+            # The window is the last ``window`` group means, grid-aligned because a vector only
+            # exists once its whole group is in. Bit-identical to ``down_sample(raw, sample_hz,
+            # target_hz)`` up to the float32 cast — see others/tests/test_cls_downsample.py.
+            window = np.asarray(self._vecs, dtype=np.float32)
+            t0 = time.perf_counter()
             cls_name, conf, probs = self._clf.predict(window)
+            ms = (time.perf_counter() - t0) * 1e3
         except Exception as err:  # pragma: no cover - runtime safety, never kill the thread
             logger.warning(f"CLS inference error: {err}")
             return
@@ -298,6 +435,10 @@ class ClsService:
                 "held": decision.held,
             }
         with self._log_lock:
+            # Timing is recorded even for an inference that ends up unpublished: it measures
+            # the thread, not the result.
+            self._lag_s = lag
+            self._infer_ms = ms if self._infer_ms is None else 0.8 * self._infer_ms + 0.2 * ms
             # Stopped while this inference was running. ``pause`` sets the flag under this same
             # lock, so checking it here makes the two mutually exclusive: once Stop returns,
             # nothing further is published and — crucially — no further byte is transmitted.
@@ -367,22 +508,18 @@ class ClsService:
         and rebuilds the buffers on its next tick (≤ one CLS period), so it can never race an
         in-flight inference.
 
-        A non-integral ``sample_hz / target_hz`` is refused rather than applied: the reshape in
-        ``_infer`` depends on that ratio, so the service pauses with a reason instead of feeding
-        the model mis-sized windows."""
+        A ``sample_hz`` below ``target_hz`` is refused rather than applied: there would be less
+        than one raw sample per model vector, so the service pauses with a reason instead of
+        feeding the model nothing."""
         hz = self._sample_hz if sample_hz is None else float(sample_hz)
         if not self._enabled:
             # No loop thread, so swap directly — and leave ``_reason`` alone: it holds why CLS
             # is disabled (missing torch, bad checkpoint), which the page still needs to show.
             self._service = service
-            self._sample_hz = hz
+            self._configure_rate(hz)
             return None
-        decim = max(1, int(round(hz / self._target_hz)))
-        if abs(hz / self._target_hz - decim) > 1e-9:
-            reason = (
-                f"sample_hz ({hz:g}) must be an integer multiple of "
-                f"target_hz ({self._target_hz:g})"
-            )
+        reason = self._rate_error(hz)
+        if reason is not None:
             logger.warning(f"CLS paused — {reason}")
             self.pause()
             with self._log_lock:
@@ -410,9 +547,12 @@ class ClsService:
         return list(CLASSES)
 
     @property
-    def decim(self) -> int:
-        """Raw samples block-averaged into one model-rate vector. Output: int >= 1."""
-        return self._decim
+    def decim(self) -> float:
+        """Raw samples block-averaged into one model-rate vector, on average.
+
+        Output: float >= 1 — ``sample_hz / target_hz``. An integer (10.0) means every group is
+        that size; 3.33 means groups of 3 and 4 in training's remainder pattern."""
+        return self._ratio
 
     def timing(self, observed_hz: float | None = None) -> dict:
         """What the model window actually spans, in seconds of real time.
@@ -422,7 +562,7 @@ class ClsService:
                          non-positive value) falls back to the configured ``sample_hz``.
 
         Returns:
-            dict: {"decim": int, "window": int, "sample_hz": float, "target_hz": float,
+            dict: {"decim": float, "window": int, "sample_hz": float, "target_hz": float,
                    "window_s": float, "trained_window_s": float, "nominal": bool}
             ``nominal`` is True when no measurement was available, i.e. ``window_s`` is
             derived from the declared rate rather than the observed one.
@@ -434,11 +574,11 @@ class ClsService:
         """
         hz = float(observed_hz) if observed_hz and observed_hz > 0 else self._sample_hz
         return {
-            "decim": self._decim,
+            "decim": self._ratio,
             "window": self._window,
             "sample_hz": self._sample_hz,
             "target_hz": self._target_hz,
-            "window_s": self._window * self._decim / hz if hz > 0 else 0.0,
+            "window_s": self._window * self._ratio / hz if hz > 0 else 0.0,
             "trained_window_s": self._window / self._target_hz,
             "nominal": not (observed_hz and observed_hz > 0),
         }
@@ -477,7 +617,8 @@ class ClsService:
 
     # --- web accessor ------------------------------------------------------
     def snapshot(self, since: int = 0) -> dict:
-        """Payload for GET /cls: enabled flag, latest decision, frame entries after ``since``."""
+        """Payload for GET /cls: enabled flag, latest decision, frame entries after ``since``,
+        and the health counters (``resets``/``last_reset``/``infer_ms``/``lag_s``)."""
         if not self._enabled:
             return {
                 "enabled": False,
@@ -492,6 +633,10 @@ class ClsService:
             decision = dict(self._current_decision) if self._current_decision else None
             running = not self._paused
             reason = self._reason
+            resets = self._resets
+            last_reset = dict(self._last_reset) if self._last_reset else None
+            infer_ms = self._infer_ms
+            lag_s = self._lag_s
         return {
             "enabled": True,
             "running": running,
@@ -503,4 +648,12 @@ class ClsService:
             # without this the page would just go quiet with no explanation.
             "reason": reason,
             "entries": entries,
+            # Window resets forced by the data (not by pause/resume/source switches), with the
+            # last one's reason and step; model time per window (EMA); and how late behind
+            # sample arrival the last inference ran. Together they say whether a quiet CLS
+            # page is a stalled stream, a slow model or a starved thread.
+            "resets": resets,
+            "last_reset": last_reset,
+            "infer_ms": infer_ms,
+            "lag_s": lag_s,
         }

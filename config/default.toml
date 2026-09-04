@@ -27,20 +27,26 @@ layout = "exo_v1"         # frame contents, see read_serial.LAYOUTS. A layout is
                           # Channel order cannot be detected from the bytes: getting it wrong
                           # puts gravity in the gyro channels and degrades CLS silently.
 gyro_units = "deg"        # units the device sends: "deg" is scaled to rad/s, "rad" passes through
-sample_hz = 100           # rate the device sends at. MEASURED VALUE, not the nominal one:
-                          # it drives the CLS decimation (decim = sample_hz / [cls] target_hz),
-                          # so a wrong value rescales every model window with no error anywhere.
-                          # Must divide target_hz evenly — 100/10 = 10, 80/10 = 8, 200/10 = 20
-                          # are all fine; 90 is not.
-                          # 100 Hz is measured: three recordings under others/data/ come out at
-                          # 99.8 / 106.7 / 99.6 frames per second. An earlier edge-side value of
-                          # 150 gave decim 15, which stretched the 2 s model window to 3.0 s and
-                          # added ~0.7 s of classification latency, silently. The server now warns
-                          # when this disagrees with the measured rate by more than 5%.
-                          # CAVEAT: the device currently transmits each sample THREE times (its
-                          # Simulink model overruns real time 3x), so 100 frames/s carries only
-                          # ~33 distinct samples/s. This value is the FRAME rate, which is what
-                          # the decimation needs; the duplication is a separate device-side fix.
+sample_hz = 33.33         # rate the device sends at. MEASURED VALUE, not the nominal one:
+                          # it drives the CLS resampling (sample_hz / [cls] target_hz raw
+                          # samples are averaged into each model vector), so a wrong value
+                          # rescales every model window with no error anywhere.
+                          # Any value >= target_hz works, integer ratio or not: 33.33/10 = 3.33
+                          # is handled exactly the way training's down_sample handles it (groups
+                          # of 3, 3, 4, ...). Below target_hz CLS self-disables.
+                          # 33.33 Hz is measured: two recordings on 2026-09-04 come out at
+                          # 33.3 frames per second by row count over 80 s and 27 s, with the
+                          # device clock (t_src) advancing 0.030 s per frame, i.e. a 30 ms
+                          # period. An earlier value of 40 gave a 2.4 s model window against the
+                          # trained 2.0 s and slowed every motion to 0.83x for the model. Before
+                          # that, 150 against a real 100 stretched the window to 3.0 s. The server
+                          # warns when this disagrees with the measured rate by more than 5%, and
+                          # the status bar shows the rolling wire rate — that is the value to
+                          # put here.
+                          # HISTORY: until 2026-09 the device transmitted each sample three times
+                          # (dup_ratio 0.667 in others/data/), so 100 frames/s carried only ~33
+                          # distinct samples/s. That is fixed on the device (dup_ratio 0 in the
+                          # new recordings); the page's "stale" badge would show it coming back.
 
 [telemetry.clip]          # absolute limit per telemetry group (serial only). A value outside
                           # ±limit is clamped to it before the plots and the CSVs see it, so one
@@ -105,7 +111,7 @@ web_port = 8000           # server port
 enabled = true            # master switch; CLS also self-disables if torch/checkpoint missing
 model_path = "src/jetson_imu_tui/cls/model/model.pt"           # BERT-finetune jetson_leg .pt, 11-class label map ids 0..10 (see README → CLS and cls/model/__init__.py CLASSES)
 sensor = "Left"           # which IMU label to classify (single-IMU model)
-target_hz = 10            # sampling rate feeding the model (matches training 10 Hz); sample_hz must be an integer multiple, or CLS self-disables
+target_hz = 10            # sampling rate feeding the model (matches training 10 Hz); sample_hz must be >= this, any ratio, or CLS self-disables
 window = 20               # samples per inference window (2 s @ 10 Hz)
 stride = 1                # emit a new prediction every N samples (1 = every 100 ms, sliding)
 
