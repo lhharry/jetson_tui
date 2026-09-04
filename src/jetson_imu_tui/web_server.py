@@ -28,6 +28,7 @@ from jetson_imu_tui.cls.model import CLASSES
 from jetson_imu_tui.cls.service import ClsService
 from jetson_imu_tui.cls.vote import SoftVoter
 from jetson_imu_tui.config import AppConfig
+from jetson_imu_tui.gt_label import NO_LABEL, GroundTruth
 from jetson_imu_tui.imu_common import (
     PLACEMENTS,
     SIGNAL_AXES,
@@ -176,6 +177,10 @@ class ServerState:
         self.record_hz = record_hz
         self.recorder: Recorder | None = None
         self.cls: "ClsService | None" = None
+        # The operator's ground-truth activity. Lives here rather than on the Recorder so it
+        # survives the recorder being rebuilt by set_record_hz, and so a label can never outlive
+        # the state object that decides whether labelling is allowed at all.
+        self.gt = GroundTruth()
         self._lock = threading.Lock()
 
     def toggle_zero(self) -> bool:
@@ -198,6 +203,10 @@ class ServerState:
             self.recorder.__exit__(None, None, None)
         finally:
             self.recorder = None
+        # A label belongs to the session it was pressed in. Clearing here covers every way a
+        # recording ends -- the button, switch_source, shutdown -- so no band is left on screen
+        # for a session that is over and no stale label leaks into the next one.
+        self.gt.reset()
         return True
 
     def recorder_meta(self) -> dict:
@@ -245,8 +254,9 @@ class ServerState:
     def toggle_record(self) -> bool:
         with self._lock:
             if self.recorder is None:
+                self.gt.reset()
                 self.recorder = Recorder(
-                    self.service, self.log_dir, self.record_hz, cls=self.cls,
+                    self.service, self.log_dir, self.record_hz, cls=self.cls, gt=self.gt,
                     meta=self.recorder_meta(),
                 ).__enter__()
                 return True
@@ -326,11 +336,32 @@ class ServerState:
                     self.recorder.__exit__(None, None, None)
                 except Exception:
                     pass
+                # Deliberately no gt.reset(): changing the row rate opens a new session folder
+                # mid-run, and the activity the operator is part-way through has not ended.
                 self.recorder = Recorder(
-                    self.service, self.log_dir, self.record_hz, cls=self.cls,
+                    self.service, self.log_dir, self.record_hz, cls=self.cls, gt=self.gt,
                     meta=self.recorder_meta(),
                 ).__enter__()
         return self.record_hz
+
+    def set_gt(self, label: str | None) -> dict:
+        """Start/stop a ground-truth label. Returns ``{"label": str | None, "recording": bool}``.
+
+        Args:    label: str | None. A name from ``gt_label.LABELS`` toggles it (pressing the one
+                 already running ends it); None or "" ends whatever is running.
+        Returns: dict, JSON-ready.
+        Raises:  ValueError for a name that is not a known class.
+
+        Refused while not recording, and refused here rather than only in the page: a label that
+        no CSV row can carry is not a label, and the greyed-out button is a courtesy, not the rule.
+        ``GroundTruth`` holds its own lock and never calls back, so taking it under ``_lock``
+        (which is not reentrant) is safe.
+        """
+        with self._lock:
+            if self.recorder is None:
+                return {"label": None, "recording": False}
+            current = self.gt.toggle(label) if label else self.gt.set(None)
+            return {"label": current, "recording": True}
 
     @property
     def recording(self) -> bool:
@@ -421,12 +452,18 @@ def _payload(state: ServerState, since: float | None = None) -> dict:
         # builds its telemetry charts from this, so a group the link lacks gets no chart
         # rather than a flat line at zero.
         "telemetry_groups": list(_available_telemetry(svc)),
+        # Ground truth: the label running now, plus the labelled intervals the plot window can
+        # still reach. Sent whole every poll rather than behind a cursor -- a human produces a
+        # handful of intervals, so there is nothing to page and nothing for the page to merge.
+        "gt": None,
         "euler": {},
         "accel": {},
         "gyro": {},
         "quat": {},
         "telemetry": {},
     }
+    keep_s = max(60.0, 2.0 * float(state.cfg.plot_window_seconds))
+    out["gt"] = {"label": state.gt.current, "spans": state.gt.spans(out["t"] - keep_s)}
     for label, sig in svc.signals().items():
         for key in ("euler", "accel", "gyro", "quat"):
             out[key][label] = sig[key] if sig is not None else None
@@ -480,6 +517,9 @@ def create_app(state: ServerState, window_s: float, poll_ms: int) -> Flask:
         # the limit its values were clamped to, shown in the header so a flat line at the limit
         # is not mistaken for the signal genuinely sitting there.
         .replace("__ENUMS__", json.dumps(ENUM_TICKS))
+        # What an unlabelled row says. Injected so the page cannot spell it differently from the
+        # CSV column it has to agree with.
+        .replace("__NO_LABEL__", json.dumps(NO_LABEL))
         .replace("__TELEMETRY__", json.dumps(
             [{"key": g, "channels": list(ch), "unit": u,
               "clip": state.cfg.telemetry_clip.get(g),
@@ -503,6 +543,21 @@ def create_app(state: ServerState, window_s: float, poll_ms: int) -> Flask:
     @app.route("/record", methods=["POST"])
     def record() -> Response:
         return jsonify({"recording": state.toggle_record()})
+
+    @app.route("/gt", methods=["POST"])
+    def gt() -> Response:
+        """``?label=walk`` toggles that ground-truth label; ``?label=`` (or none) ends it.
+
+        A toggle rather than separate start/stop routes, matching ``/record`` and ``/zero``: the
+        page has one button per class and pressing the running one again is how a stretch ends.
+        """
+        label = request.args.get("label")
+        if label is None:
+            label = (request.get_json(silent=True) or {}).get("label")
+        try:
+            return jsonify(state.set_gt(label))
+        except ValueError as err:
+            return jsonify({"error": str(err)}), 400
 
     @app.route("/zero", methods=["POST"])
     def zero() -> Response:
@@ -810,6 +865,22 @@ _HTML = """<!DOCTYPE html>
   .grow{flex:1}
   #status{font-variant-numeric:tabular-nums;color:var(--muted);font-size:12px;white-space:nowrap}
   #dot{display:inline-block;width:8px;height:8px;border-radius:50%;background:#22c55e;margin-right:7px;vertical-align:middle}
+  /* Ground-truth row: one button per class, colour-matched to the CLS palette, and the label
+     running right now. Its own bar rather than more buttons in #bar, which twelve would not fit.
+     Greyed as a whole when there is no recording to attach a label to. */
+  #gtbar{display:flex;gap:6px;align-items:center;padding:6px 14px;background:var(--panel);border-bottom:1px solid var(--border);flex-wrap:wrap}
+  #gtbar.off{opacity:.6}
+  #gtbtns{display:contents}   /* so the buttons take part in #gtbar's own flex gap */
+  .gtnow{display:inline-flex;align-items:center;gap:7px;min-width:180px;font-size:12px;color:var(--muted)}
+  .gtnow i{width:11px;height:11px;border-radius:3px;background:var(--border);display:inline-block}
+  .gtnow b{color:var(--fg);font-size:13px}
+  #gttime{font-variant-numeric:tabular-nums}
+  .gtbtn{display:inline-flex;align-items:center;gap:6px;border:1px solid var(--border);background:var(--panel2);color:var(--fg);padding:6px 9px;border-radius:8px;font-size:12px;cursor:pointer}
+  .gtbtn:hover:not(:disabled){filter:brightness(1.08)}
+  .gtbtn:disabled{opacity:.45;cursor:not-allowed}
+  .gtbtn i{width:9px;height:9px;border-radius:2px;display:inline-block}
+  .gtbtn kbd{font:inherit;font-size:10px;color:var(--muted);border:1px solid var(--border);border-radius:3px;padding:0 3px;line-height:1.6}
+  .gtbtn.active kbd{color:inherit;border-color:currentColor;opacity:.7}
   /* Charts never shrink below their floor: a group split into 5 or 6 plots would otherwise
      squeeze each one flat. Few charts still grow to fill; too many scroll instead. Drag a
      chart's grip to pin it to a height (see addGrip); the floor drops to MIN_CHART_PX then,
@@ -930,6 +1001,12 @@ _HTML = """<!DOCTYPE html>
         Rec Hz <input id="freq" class="num" type="number" min="0" max="500" step="1"></label>
       <span id="status"><span id="dot"></span>connecting…</span>
     </div>
+    <div id="gtbar">
+      <span class="gtnow">GT <i id="gtdot"></i><b id="gtlabel">&#8212;</b><span id="gttime"></span></span>
+      <span id="gtbtns"></span>
+      <span class="grow"></span>
+      <span id="gthint" class="srcmsg"></span>
+    </div>
     <div id="charts"></div>
     <div id="readout"></div>
     <div id="clsview">
@@ -1040,9 +1117,13 @@ const isTele = k => !!TELE_BY_KEY[k];
 const unitOf = k => isTele(k) ? TELE_BY_KEY[k].unit : (SIGNALS[k] ? SIGNALS[k].unit : '');
 const THEMES = {
   dark:  { axis:'#8b93a7', grid:'#222a38', series:['#e879f9','#22d3ee'], ax:{x:'#f87171',y:'#4ade80',z:'#60a5fa',w:'#fbbf24'},
-           multi:['#e879f9','#22d3ee','#4ade80','#fbbf24','#f87171','#a78bfa'] },
+           multi:['#e879f9','#22d3ee','#4ade80','#fbbf24','#f87171','#a78bfa'],
+           // Opacity of a ground-truth band. High enough to read at a glance, low enough that a
+           // trace crossing it keeps its own colour.
+           bandAlpha:0.20 },
   light: { axis:'#5b6472', grid:'#e2e6ee', series:['#c026d3','#0891b2'], ax:{x:'#dc2626',y:'#16a34a',z:'#2563eb',w:'#d97706'},
-           multi:['#c026d3','#0891b2','#16a34a','#d97706','#dc2626','#7c3aed'] },
+           multi:['#c026d3','#0891b2','#16a34a','#d97706','#dc2626','#7c3aed'],
+           bandAlpha:0.15 },
 };
 const theme = () => document.documentElement.classList.contains('light') ? THEMES.light : THEMES.dark;
 
@@ -1071,6 +1152,47 @@ const CLS_COLORS = { stand:'#9aa4b2', walk:'#22c55e', turn:'#eab308', jog:'#ef44
                      sit:'#14b8a6', 'sit-to-stand':'#f97316', 'stand-to-sit':'#8b5cf6',
                      rampdescent:'#06b6d4' };
 const clsColor = c => CLS_COLORS[c] || '#60a5fa';
+
+// ---- ground truth ---------------------------------------------------------
+// The activity the operator declares while recording; the server writes it to gt_label.csv, one
+// row per sample. Deliberately shares CLS_COLORS with the classifier's own output: a GT band and
+// the CLS row for that class come out the same hue, which is exactly the comparison being made.
+const NO_LABEL = __NO_LABEL__;   // what an unlabelled row says, injected from gt_label.py
+// Display order and hotkeys. Presentation only: CLASSES order is the model's, and the serial
+// return byte's, so it must never be reordered. Laid out along the usual protocol -- walk,
+// stairs, ramps, then the stand/sit cycle whose three keys sit together for the repeats.
+const GT_ORDER = [
+  ['walk','Walk','1'], ['turn','Turn','2'], ['jog','Jog','3'], ['stand','Stand','4'],
+  ['stairascent','Stair ↑','5'],  ['stairdescent','Stair ↓','6'],
+  ['rampascent','Ramp ↑','7'],    ['rampdescent','Ramp ↓','8'],
+  ['stand-to-sit','Stand→Sit','9'], ['sit','Sit','0'], ['sit-to-stand','Sit→Stand','-'],
+];
+// What actually gets a button: the table above restricted to classes the model has, then any
+// class the model has that the table forgot. A class can therefore never become unlabelable
+// because someone edited CLASSES and not this list.
+const GT_ROW = GT_ORDER.filter(e => CLS_NAMES.indexOf(e[0]) >= 0)
+  .concat(CLS_NAMES.filter(c => !GT_ORDER.some(e => e[0] === c)).map(c => [c, c, null]));
+const GT_TEXT = Object.fromEntries(GT_ROW.map(e => [e[0], e[1]]));
+const GT_KEYS = Object.fromEntries(GT_ROW.filter(e => e[2]).map(e => [e[2], e[0]]));
+const gtText = c => GT_TEXT[c] || c;
+
+let gtLabel = null;        // class being recorded as ground truth right now, or null
+let gtSpans = [];          // [{t0, t1|null, label}] in the live monotonic clock
+let gtRecording = false;   // mirrors /data.recording — a label exists only inside a recording
+
+// '#rrggbb' + alpha -> 'rgba(...)'. CLS_COLORS are opaque foreground hues, and a band is drawn
+// straight to the canvas where CSS opacity does not apply, so the alpha has to be in the colour.
+function rgba(hex, a){
+  const v = parseInt(hex.slice(1), 16);
+  return 'rgba(' + ((v >> 16) & 255) + ',' + ((v >> 8) & 255) + ',' + (v & 255) + ',' + a + ')';
+}
+// Readable text on a filled button: several class colours are light enough that white vanishes.
+function onColor(hex){
+  const v = parseInt(hex.slice(1), 16);
+  return (0.299*((v>>16)&255) + 0.587*((v>>8)&255) + 0.114*(v&255)) > 150 ? '#111' : '#fff';
+}
+const mmss = s => { s = Math.max(0, Math.floor(s));
+  return String(Math.floor(s/60)).padStart(2,'0') + ':' + String(s%60).padStart(2,'0'); };
 
 const fmt = (sig, v) => v == null ? '--' : v.toFixed(sig === 'quat' ? 3 : 2);
 
@@ -1195,6 +1317,40 @@ function addGrip(card, spec){
 }
 
 
+// Ground-truth bands, painted from the drawClear hook: uPlot has just wiped the canvas and has
+// not drawn a series yet, so a band lands *behind* the traces and recolours none of them. An
+// unlabelled stretch has no span, so nothing is painted there and the card's own --panel shows
+// through exactly as it did before this existed.
+//
+// One accessor for both time bases: live spans are in the host-monotonic clock the x axis already
+// uses, offline ones are in seconds from the session start, which is likewise that view's x axis.
+function drawGtBands(u){
+  const bands = offline ? (offline.gt || []) : gtSpans;
+  if(!bands.length) return;
+  const sc = u.scales.x;
+  if(sc.min == null || sc.max == null) return;
+  const T = theme(), ctx = u.ctx, bb = u.bbox, dpr = window.devicePixelRatio || 1;
+  ctx.save();
+  ctx.beginPath(); ctx.rect(bb.left, bb.top, bb.width, bb.height); ctx.clip();
+  ctx.font = Math.round(10 * dpr) + 'px system-ui,sans-serif';
+  ctx.textBaseline = 'top';
+  for(const b of bands){
+    const end = (b.t1 == null) ? sc.max : b.t1;   // a running band reaches the right edge
+    if(end < sc.min || b.t0 > sc.max) continue;
+    const x0 = u.valToPos(Math.max(b.t0, sc.min), 'x', true);
+    const x1 = u.valToPos(Math.min(end,   sc.max), 'x', true);
+    const w = Math.max(1, x1 - x0);
+    ctx.fillStyle = rgba(clsColor(b.label), T.bandAlpha);
+    ctx.fillRect(x0, bb.top, w, bb.height);
+    // Name it when there is room, so a glance identifies the band with no legend to consult.
+    if(w > 44 * dpr){
+      ctx.fillStyle = T.axis;
+      ctx.fillText(gtText(b.label), x0 + 4 * dpr, bb.top + 3 * dpr);
+    }
+  }
+  ctx.restore();
+}
+
 function chartOpts(w, h, spec){
   const T = theme();
   // A chart drawing a single enum channel (finalClass) is categorical: its Y axis is named
@@ -1243,9 +1399,12 @@ function chartOpts(w, h, spec){
       { stroke:T.axis, grid:{ stroke:T.grid }, ticks:{ stroke:T.grid }, values:xvalues },
       yaxis,
     ],
-    // Offline only: a drag-zoom asks for more detail than the decimated window holds, so it
+    // drawClear paints the ground-truth bands under the traces, in both views. setScale is
+    // offline only: a drag-zoom asks for more detail than the decimated window holds, so it
     // re-fetches that range at full budget instead of magnifying the envelope.
-    hooks: offline ? { setScale: [ (u, key) => { if(key === 'x') onOfflineZoom(u); } ] } : {},
+    hooks: offline
+      ? { drawClear: [drawGtBands], setScale: [ (u, key) => { if(key === 'x') onOfflineZoom(u); } ] }
+      : { drawClear: [drawGtBands] },
     series,
   };
 }
@@ -1385,6 +1544,60 @@ function buildSigButtons(){
   }).join('');
 }
 
+// ---- ground-truth bar -----------------------------------------------------
+// Built from GT_ROW rather than written out, so the row follows CLASSES. Rebuilt once at start-up:
+// unlike the signal buttons, the class list cannot change while the page is open.
+function buildGtButtons(){
+  const wrap = document.getElementById('gtbtns');
+  wrap.innerHTML = GT_ROW.map(e =>
+      '<button class="gtbtn" data-gt="' + e[0] + '" title="' + e[0]
+    + '" onclick="setGt(&quot;' + e[0] + '&quot;, this)">'
+    + '<i style="background:' + clsColor(e[0]) + '"></i>' + e[1]
+    + (e[2] ? '<kbd>' + e[2] + '</kbd>' : '') + '</button>').join('')
+    + '<button class="gtbtn" data-gt="" title="end the current label"'
+    + ' onclick="setGt(null, this)">&#10005; Clear<kbd>space</kbd></button>';
+  syncGtBar();
+}
+
+// The server owns the toggle -- pressing the label already running is how a stretch ends -- so the
+// response is applied straight away and the next /data poll confirms it.
+async function setGt(label, btn){
+  if(btn) btn.blur();                      // or Space would re-press the button it just focused
+  if(!gtRecording || offline) return;
+  try {
+    const d = await (await fetch('/gt?label=' + encodeURIComponent(label == null ? '' : label),
+                                 { method:'POST' })).json();
+    if(d.error) return;
+    gtLabel = d.label; gtRecording = !!d.recording;
+    syncGtBar();
+  } catch(e) { /* the next poll shows the truth */ }
+}
+
+function syncGtBar(){
+  const on = gtRecording && !offline;
+  document.getElementById('gtbar').classList.toggle('off', !on);
+  document.querySelectorAll('.gtbtn').forEach(b => {
+    b.disabled = !on;
+    const k = b.dataset.gt;
+    const active = on && k && k === gtLabel;
+    b.classList.toggle('active', !!active);
+    b.style.background  = active ? clsColor(k) : '';
+    b.style.borderColor = active ? clsColor(k) : '';
+    b.style.color       = active ? onColor(clsColor(k)) : '';
+  });
+  document.getElementById('gtdot').style.background = gtLabel ? clsColor(gtLabel) : '';
+  document.getElementById('gtlabel').textContent =
+    gtLabel ? gtText(gtLabel) : (on ? NO_LABEL : '—');
+  // Elapsed from the running span's own start, which is in the same clock as latestT — the
+  // recording's elapsed time, not the browser's.
+  const open = gtSpans.length ? gtSpans[gtSpans.length - 1] : null;
+  document.getElementById('gttime').textContent =
+    (gtLabel && open && open.t1 == null) ? ' ' + mmss(latestT - open.t0) : '';
+  document.getElementById('gthint').textContent =
+    offline ? 'reviewing a recording — labels are read-only'
+            : (gtRecording ? '' : 'press Record to label');
+}
+
 // ---- offline viewing -----------------------------------------------------
 // `offline` holds one loaded session; while it is set, tick() does not fetch and every chart
 // reads its columns from it. The live cursor is reset on the way out so resuming cannot replay
@@ -1413,7 +1626,8 @@ async function openLoad(){
   }
   body.innerHTML = rows.map(r => {
     const dur = (r.duration_s == null) ? '—' : r.duration_s.toFixed(1) + ' s';
-    const groups = (r.signals || []).concat(r.telemetry || []).concat(r.has_cls ? ['cls'] : []);
+    const groups = (r.signals || []).concat(r.telemetry || [])
+      .concat(r.has_cls ? ['cls'] : []).concat(r.has_gt ? ['gt'] : []);
     return '<div class="loadrow" onclick="loadSession(&quot;' + r.id + '&quot;)">'
       + '<b>' + r.started + '</b>'
       + '<span class="muted"> · ' + r.n_rows + ' rows · ' + dur + '</span>'
@@ -1445,6 +1659,7 @@ async function loadSession(id, from, to){
   document.querySelectorAll('.sigbtn').forEach(b => b.classList.toggle('active', b.dataset.sig === signal));
   if(view === 'plot') rebuildCharts(); else { buildReadout(); fillReadout(); }
   offlineBanner();
+  syncGtBar();              // read-only while a past session is open
   offlineBusy = false;
 }
 
@@ -1453,9 +1668,11 @@ function offlineFull(){ if(offline && !offlineBusy) loadSession(offline.id); }
 function exitOffline(){
   offline = null;
   samples = [];
+  gtSpans = [];            // same reason as samples: these are pre-offline, in the old window
   sinceT = 0;              // do not replay the pre-offline window against the new cursor
   teleAvail = [];          // the next poll reports what the live source carries
   buildSigButtons();
+  syncGtBar();
   if(view === 'plot') rebuildCharts(); else buildReadout();
 }
 
@@ -1840,6 +2057,20 @@ async function pollCalib(){
 }
 window.addEventListener('keydown', e=>{ if(e.key==='Escape'){ closeAxis(); closeCalib(); } });
 
+// Ground-truth hotkeys: aiming a mouse at one of twelve buttons is the slow part of labelling a
+// circuit. Guarded on the focused element because #freq, #ymin, #ymax and the Axis modal's
+// selects all take keystrokes of their own — a digit typed into Rec Hz must not also change what
+// the recording claims the subject was doing.
+window.addEventListener('keydown', e=>{
+  if(e.ctrlKey || e.metaKey || e.altKey) return;
+  const el = document.activeElement;
+  if(el && /^(INPUT|SELECT|TEXTAREA)$/.test(el.tagName)) return;
+  if(!gtRecording || offline) return;
+  if(e.key === ' '){ e.preventDefault(); setGt(null); return; }
+  const cls = GT_KEYS[e.key];
+  if(cls){ e.preventDefault(); setGt(cls); }
+});
+
 // ---- CLS (activity classification) page -----------------------------------
 function enterCls(){
   clsMode = true;
@@ -1986,6 +2217,12 @@ async function tick(){
         ? ('Recording' + (d.rows_hz != null ? ' · ' + d.rows_hz.toFixed(0) + '/s' : ''))
         : 'Record';
       rb.classList.toggle('rec-on', !!d.recording);
+      // Ground truth follows the recording: the buttons are live only while one is running, and
+      // the spans are replaced wholesale rather than merged — the server sends the whole visible
+      // set every poll, so there is no cursor to keep and nothing to prune here.
+      gtRecording = !!d.recording;
+      if(d.gt){ gtLabel = d.gt.label; gtSpans = d.gt.spans || []; }
+      syncGtBar();
       const zb = document.getElementById('zeroBtn');
       zb.textContent = d.zeroed ? 'Zeroed' : 'Zero';
       zb.classList.toggle('rec-on', !!d.zeroed);
@@ -2011,6 +2248,7 @@ window.addEventListener('DOMContentLoaded', () => {
   document.getElementById('ymax').addEventListener('change', applyYInput);
   buildAxisControls();
   buildSigButtons();
+  buildGtButtons();
   rebuildCharts();
   syncYControls();
   tick();

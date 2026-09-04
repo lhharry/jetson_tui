@@ -18,6 +18,11 @@ reachable everywhere.
 midnight wraps to 00:00 and naive parsing reports a negative duration. The folder name supplies
 the date and a backward step adds a day, which is correct for any session shorter than 24 h.
 
+**Ground truth is run-length encoded, not returned per row.** ``gt_label.csv`` carries one row
+per sample so it stays in lockstep with the signals, but what a viewer wants is the handful of
+intervals the operator actually pressed. They are returned whole, never windowed or decimated: the
+list is tiny, and returning all of it keeps the bands from shifting under a zoom re-fetch.
+
 **Files may be missing, and that is information.** An I2C recording has no ``knee.csv`` because
 that source has no knee channels — distinct from a serial recording whose knees read zero. A
 missing file is reported as a missing group rather than as an error or as zeros.
@@ -31,8 +36,9 @@ from pathlib import Path
 
 import numpy as np
 
+from jetson_imu_tui.gt_label import NO_LABEL
 from jetson_imu_tui.imu_common import SIGNAL_UNITS, TELEMETRY_GROUPS
-from jetson_imu_tui.recorder import telemetry_filename
+from jetson_imu_tui.recorder import GT_FILE, telemetry_filename
 
 # Signal key -> the file Recorder writes it to. Mirrors the ``layout`` dict in Recorder.__enter__;
 # both sides name the same four files and neither invents a fifth.
@@ -134,6 +140,52 @@ def _read_csv(path: Path) -> tuple[np.ndarray, dict[str, np.ndarray]] | None:
     return times, cols
 
 
+def _read_gt_spans(folder: Path) -> list[dict]:
+    """``gt_label.csv`` -> the labelled intervals in it, in seconds from the session start.
+
+    Input:  ``folder`` = Path to one session directory.
+    Output: list[dict], oldest first, each ``{"t0": float, "t1": float, "label": str}``. Empty
+            when the file is absent — every recording made before ground-truth labelling existed —
+            or when no row carries a label.
+
+    ``NO_LABEL`` runs are dropped rather than returned as intervals. That absence is what leaves an
+    unlabelled stretch showing the page's own colours instead of a band, and it matches what
+    ``GroundTruth.spans`` sends the live view, so the drawing code needs one shape, not two.
+
+    A run ends at the first row of the next one, so intervals abut with no visual seam; the last
+    run ends at its own last row, which is where the recording stops.
+
+    ``_read_csv`` cannot be reused: it floats every column after ``Time``, and this one holds class
+    names. Times still go through ``_parse_times``, so the midnight wrap is handled the same way as
+    everywhere else — and because this file is written from the same drain batch as
+    ``accelerometers.csv``, its first row shares that file's timestamp and therefore its origin.
+    """
+    path = folder / GT_FILE
+    if not path.is_file():
+        return []
+    with open(path, encoding="utf-8", newline="") as fh:
+        rows = list(csv.reader(fh))
+    if len(rows) < 2:
+        return []
+    body = rows[1:]
+    times = _parse_times([r[0] if r else "" for r in body])
+    labels = [r[1].strip() if len(r) > 1 else "" for r in body]
+    out: list[dict] = []
+    i, n = 0, len(labels)
+    while i < n:
+        j = i + 1
+        while j < n and labels[j] == labels[i]:
+            j += 1
+        if labels[i] and labels[i] != NO_LABEL:
+            out.append({
+                "t0": float(times[i]),
+                "t1": float(times[j]) if j < n else float(times[n - 1]),
+                "label": labels[i],
+            })
+        i = j
+    return out
+
+
 def _envelope(
     times: np.ndarray, cols: dict[str, np.ndarray], max_points: int
 ) -> tuple[np.ndarray, dict[str, np.ndarray]]:
@@ -226,7 +278,8 @@ def list_sessions(log_dir, limit: int | None = None) -> list[dict]:
     Output: list[dict], each
             {"id": "YYYY_MM_DD/HH_MM_SS", "date": str, "time": str,
              "started": str | None, "n_rows": int, "duration_s": float | None,
-             "signals": list[str], "telemetry": list[str], "has_cls": bool}
+             "signals": list[str], "telemetry": list[str], "has_cls": bool,
+             "has_gt": bool}
 
     A folder whose name is not a date/time is skipped rather than reported, so ``axis_remap.json``
     and anything else living in the log directory cannot appear as a session.
@@ -255,6 +308,7 @@ def list_sessions(log_dir, limit: int | None = None) -> list[dict]:
                     if (folder / telemetry_filename(g)).is_file()
                 ],
                 "has_cls": (folder / "cls.csv").is_file(),
+                "has_gt": (folder / GT_FILE).is_file(),
             })
             if limit is not None and len(out) >= limit:
                 return out
@@ -285,6 +339,7 @@ def load_session(
                                 "axes": {axis: {label: list[float | None]}}}},
          "telemetry": {group:  {"unit": str, "t": list[float],
                                 "channels": {channel: list[float | None]}}},
+         "gt": [{"t0": float, "t1": float, "label": str}],
          "missing": {"signals": list[str], "telemetry": list[str]}}
 
     Raises FileNotFoundError if the folder does not exist or holds no readable session.
@@ -374,5 +429,8 @@ def load_session(
         "labels": labels,
         "signals": signals,
         "telemetry": telemetry,
+        # Whole session, never windowed: see the module docstring. The charts clip to their own x
+        # range anyway, and a zoom re-fetch must not make the bands jump.
+        "gt": _read_gt_spans(folder),
         "missing": {"signals": missing_signals, "telemetry": missing_telemetry},
     }
