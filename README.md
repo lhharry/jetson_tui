@@ -26,6 +26,9 @@ workloads (e.g. an AI model) on the same board.
   device, per gait step.
 - **Record** toggle with an adjustable **row rate** from the page — `0` writes every frame,
   a positive value thins the file to that many rows per second (see **Recording rate**).
+- **Ground truth**: a row of one button per activity class (plus number-key hotkeys) declares
+  what the subject is actually doing while recording. The charts tint behind the traces and the
+  label lands in `gt_label.csv` beside every sample (see **Ground-truth labelling**).
 - **Load** a past recording and review it offline in the same charts, with zoom that
   re-fetches at full resolution.
 - Recording writes one directory of comma-separated files per session under
@@ -37,6 +40,7 @@ workloads (e.g. an AI model) on the same board.
   - one file per **telemetry group** the source carries — `knee.csv`, `motor.csv`,
     `trace.csv`, `state.csv` (serial `exo_v1` only; a group the link lacks gets no file
     rather than a file of empty cells)
+  - `gt_label.csv` — `Time,gt_label`, the activity you declared by hand; `No Label` where none
   - with CLS active: `cls.csv` (frame predictions + per-class probabilities),
     `cls_vote.csv` (one row per aggregated decision) and `model_input.csv` (the exact
     6-channel vectors fed to the model)
@@ -414,6 +418,65 @@ constant — it changes how much is batched per write, never what ends up in the
 used to *be* that cadence while looking like a row rate, so changing it did nothing to the
 output: wake-ups × rows-per-wake stayed constant at the device's rate.
 
+## Ground-truth labelling
+
+`cls.csv` is what the model thought. **Ground truth is what actually happened** — and without it a
+recording can be plotted but not scored, and not used as training data. The row of buttons under
+the toolbar declares it as you go: press one, and every CSV row from that instant until the next
+press carries that class name.
+
+```
+GT ■ Stair ↓ 00:14   [Walk 1][Turn 2][Jog 3][Stand 4][Stair ↑ 5][Stair ↓ 6]
+                     [Ramp ↑ 7][Ramp ↓ 8][Stand→Sit 9][Sit 0][Sit→Stand -][✕ Clear space]
+```
+
+* **One button starts and stops.** Pressing the class already running ends it. Pressing a
+  different one hands over on the instant — no unlabelled sliver in between — and `✕ Clear`, or
+  `Space`, ends whatever is running. There is nothing to arm and nothing to confirm, because the
+  slow part of labelling a circuit is deciding, not clicking.
+* **Use the number keys.** They are the point: `1`–`9`, `0` and `-` in the order shown on the
+  buttons, chosen so the usual protocol runs left to right and the three stand/sit keys sit
+  together for the repeats. They are ignored while a text or number field has focus, so a digit
+  typed into **Rec Hz** cannot also change what the recording claims you were doing.
+* **Only while recording.** The buttons grey out otherwise and `POST /gt` refuses, because a label
+  no CSV row can carry is not a label. Pressing **Record** clears whatever was set: a label
+  belongs to the session it was pressed in and must never leak into the next one.
+* **The charts tint.** The labelled stretch gets a translucent band in that class's colour, drawn
+  *behind* the traces and scrolling with them, and named in the corner where there is room. It is
+  the same hue the CLS page uses for that class, which is the comparison being made. An unlabelled
+  stretch is painted with nothing at all, so it looks exactly as it did before this existed.
+
+`gt_label.csv` holds **one row per recorded sample**, with the same `Time` column and the same
+thinning as `accelerometers.csv` — row *n* is the same instant in both, so it joins with no
+alignment step. The names are the model's own class strings, so it compares to `cls.csv` directly:
+
+```
+Time,gt_label
+14:48:39.111916,No Label
+14:48:39.121880,walk
+14:48:39.131905,walk
+```
+
+```python
+import pandas as pd
+gt  = pd.read_csv(f"{session}/gt_label.csv")
+cls = pd.read_csv(f"{session}/cls.csv")
+labelled = gt.gt_label != "No Label"
+(gt.gt_label[labelled] == cls.cls[labelled]).mean()      # frame accuracy against the answer key
+```
+
+`No Label` is a **value, not a gap**: a session recorded with no button ever pressed is a column of
+it, which states that the session went unlabelled. An empty cell means "the device had no reading"
+everywhere else in a recording, and a missing file would only mean something did not run.
+
+Scriptable, and the same toggle the buttons use:
+
+```bash
+curl -X POST 'localhost:8000/gt?label=stairdescent'   # start it, or end it if already running
+curl -X POST 'localhost:8000/gt?label='               # end whatever is running
+curl -X POST 'localhost:8000/gt?label=nonsense'       # 400: the class list is the model's
+```
+
 ## Reviewing a recording
 
 **Load** in the toolbar lists every session under `<log_dir>` and reopens one in the same charts
@@ -430,6 +493,11 @@ stream and **Full** zooms back out to the whole session.
   Buckets are cut on time rather than per channel, so all channels keep one shared x axis; the
   min/max pair inside a bucket may be ordered opposite to the samples, which shifts a point by
   less than one bucket width and disappears as soon as you zoom in.
+* **Ground-truth bands come back too.** `gt_label.csv` is run-length encoded into intervals on
+  the way out, so the same tint appears over the offline charts and a mislabelled stretch is
+  visible after the fact. The whole session's intervals are returned whatever window is asked
+  for — they are a handful of objects, and re-cutting them per zoom would make the bands jump.
+  A session recorded before this existed has no file and simply draws none.
 * **A missing file means a missing channel, not zeros.** An I2C recording has no `knee.csv`, and
   a serial one has `euler_angles.csv` full of empty cells. Both are reported as absent groups
   rather than drawn as a flat line at zero, which would look like a real measurement.

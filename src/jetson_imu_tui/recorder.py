@@ -2,7 +2,8 @@
 
 Four per-sensor files always (quaternions / accelerometers / gyroscopes / euler_angles), plus one
 file per **telemetry group** the source carries (``imu_common.TELEMETRY_GROUPS``: knee, motor,
-trace, state) and the three CLS files when classification is running.
+trace, state), the three CLS files when classification is running, and ``gt_label.csv`` -- the
+activity the operator set by hand, the answer key ``cls.csv`` is scored against.
 
 Every file that describes a *sample* is written from a single ``samples_since`` batch, so their
 row counts are equal by construction rather than by luck. That is the whole reason telemetry
@@ -64,6 +65,11 @@ def telemetry_filename(group: str) -> str:
     return f"{group}.csv"
 
 
+# The hand-set ground-truth activity, one row per recorded sample. Named here for the same reason
+# telemetry_filename exists: session_load reads it back and must not spell it independently.
+GT_FILE = "gt_label.csv"
+
+
 # How often the writer thread wakes to move buffered samples to disk. Not a row rate: each wake
 # writes everything that arrived since the last one, so raising it shrinks the batches rather
 # than producing more rows. 100 Hz keeps at most ~10 ms of data un-written without waking the
@@ -80,7 +86,7 @@ GRID_EPS = 1e-9
 
 
 class Recorder:
-    def __init__(self, service: "ImuService", log_dir: Path, hz: float, cls=None,
+    def __init__(self, service: "ImuService", log_dir: Path, hz: float, cls=None, gt=None,
                  meta: dict | None = None) -> None:
         self._service = service
         # Effective settings, written to <session>/config.json so a recording is
@@ -106,6 +112,10 @@ class Recorder:
         # Optional ClsService: when enabled, the held activity prediction is written to
         # cls.csv in lockstep with the IMU rows (one row per drained sample, 100 Hz).
         self._cls = cls
+        # Optional GroundTruth (jetson_imu_tui.gt_label): the activity the operator has set by
+        # hand. Written to gt_label.csv from this same drain batch, so the answer key and the
+        # signals line up row for row instead of having to be re-aligned on timestamps later.
+        self._gt = gt
         now = datetime.now()
         self.folder: Path = (
             Path(log_dir).expanduser()
@@ -119,6 +129,7 @@ class Recorder:
         self._cls_file: TextIOWrapper | None = None
         self._model_file: TextIOWrapper | None = None
         self._vote_file: TextIOWrapper | None = None
+        self._gt_file: TextIOWrapper | None = None
         self._model_cursor: float = 0.0
         self._decision_cursor: float = 0.0
 
@@ -156,6 +167,13 @@ class Recorder:
             fh = open(self.folder / telemetry_filename(group), "w", encoding="utf-8", newline="")
             fh.write(",".join(["Time", *channels]) + "\n")
             self._tele_files[group] = fh
+        # gt_label.csv: Time, gt_label. Always created when a GroundTruth is supplied, even if no
+        # button is ever pressed -- the file is then a column of "No Label", which states that the
+        # session went unlabelled. A missing file could only say that something did not run.
+        if self._gt is not None:
+            fh = open(self.folder / GT_FILE, "w", encoding="utf-8", newline="")
+            fh.write("Time,gt_label\n")
+            self._gt_file = fh
         # cls.csv: Time, cls, conf, <one column per class prob>. Only when CLS is active.
         # model_input.csv: the exact 6-channel vectors (raw accel+gyro of the CLS sensor)
         # fed to the model, at the model's own rate — enough to replay inference offline.
@@ -214,7 +232,7 @@ class Recorder:
                 pass
         self._files.clear()
         self._tele_files.clear()
-        for attr in ("_cls_file", "_model_file", "_vote_file"):
+        for attr in ("_cls_file", "_model_file", "_vote_file", "_gt_file"):
             fh = getattr(self, attr)
             if fh is not None:
                 try:
@@ -299,6 +317,11 @@ class Recorder:
                     cells = ["" if v is None else f"{v:.6f}" for v in vals[:n]]
                     cells += ["" for _ in range(n - len(cells))]
                 fh.write(",".join([ts, *cells]) + "\n")
+            if self._gt_file is not None:
+                # Resolved per sample rather than snapshotted once per drain the way cls_cells is:
+                # the label is a step function of the sample's own timestamp, and a button press
+                # lands between two drain wake-ups as often as not.
+                self._gt_file.write(ts + "," + self._gt.label_at(sample["t"]) + "\n")
             if self._cls_file is not None:
                 self._cls_file.write(",".join([ts, *cls_cells]) + "\n")
         # Past the whole batch, including the samples the gate skipped: they were considered and
