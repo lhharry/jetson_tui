@@ -19,6 +19,7 @@ import socket
 import sys
 import threading
 import time
+from datetime import datetime
 from pathlib import Path
 
 from flask import Flask, Response, jsonify, request
@@ -424,6 +425,9 @@ def _payload(state: ServerState, since: float | None = None) -> dict:
     observed = getattr(svc, "observed_hz", None)
     out: dict = {
         "t": time.monotonic(),
+        # Wall clock for the FinalClass page's time column: same clock and format as the CLS
+        # entries (cls/service.py), so the two pages' time columns read against each other.
+        "clock": datetime.now().strftime("%H:%M:%S"),
         "recording": state.recording,
         "zeroed": svc.is_zeroed,
         "hz": state.record_hz,
@@ -948,8 +952,8 @@ _HTML = """<!DOCTYPE html>
   .calseg{width:30px;height:12px;border-radius:3px;background:var(--panel2);border:1px solid var(--border)}
   .calseg.on{background:#22c55e;border-color:#22c55e}
   .calready{font-size:12px;font-weight:700;margin-left:8px}
-  /* ---- CLS page ---- */
-  #clsview{display:none;flex:1;min-height:0;flex-direction:column;padding:12px;gap:10px}
+  /* ---- CLS page (and FinalClass, which borrows its layout) ---- */
+  #clsview,#finalview{display:none;flex:1;min-height:0;flex-direction:column;padding:12px;gap:10px}
   .clstools{display:flex;justify-content:flex-end}
   .clsbanner{display:flex;align-items:center;justify-content:center;gap:18px;min-height:96px;
              background:var(--panel);border:1px solid var(--border);border-radius:12px}
@@ -959,7 +963,7 @@ _HTML = """<!DOCTYPE html>
   .clshead{display:flex;gap:12px;padding:0 12px;font-size:11px;text-transform:uppercase;
            letter-spacing:.05em;color:var(--muted)}
   .clshcol{width:78px}.clshcol.grow{flex:1;width:auto}
-  #clsLog{flex:1;min-height:0;overflow:auto;background:var(--panel);border:1px solid var(--border);
+  #clsLog,#finalLog{flex:1;min-height:0;overflow:auto;background:var(--panel);border:1px solid var(--border);
           border-radius:12px;padding:4px 0}
   .clsrow{display:flex;align-items:center;gap:12px;padding:7px 12px;border-top:1px solid var(--border);
           font-variant-numeric:tabular-nums}
@@ -1020,6 +1024,13 @@ _HTML = """<!DOCTYPE html>
         <span class="clshcol">conf</span><span class="clshcol" style="width:150px">decision</span>
       </div>
       <div id="clsLog"></div>
+    </div>
+    <div id="finalview">
+      <div id="finalBanner" class="clsbanner"><span class="muted">waiting for data…</span></div>
+      <div class="clshead">
+        <span class="clshcol">time</span><span class="clshcol grow">finalClass (device)</span>
+      </div>
+      <div id="finalLog"></div>
     </div>
   </div>
 
@@ -1143,6 +1154,8 @@ let offlineBusy = false, zoomTimer = null;
 let clsMode = false;              // CLS page active (a pseudo-signal, not a plot)
 let clsSince = 0;                 // highest CLS entry id already shown
 let clsTimer = null;
+let finalMode = false;            // FinalClass page active (the device's decision, from /data)
+const FINAL_MAX_ROWS = 3000;      // ~90 s at the 33 Hz wire rate
 const CLS_NAMES = __CLASSES__;    // index -> label, injected from cls/model/__init__.py CLASSES
 // Telemetry channel -> the names its integer values stand for (see ENUM_TICKS). A chart drawing
 // one of these labels its Y ticks by name instead of by number.
@@ -1518,8 +1531,10 @@ function updateReadout(d){
 }
 
 function setSignal(s){
-  if(s === 'cls'){ enterCls(); return; }
+  if(s === 'cls'){ if(finalMode) exitFinal(); enterCls(); return; }
+  if(s === 'finalClass'){ if(clsMode) exitCls(); enterFinal(); return; }
   if(clsMode) exitCls();
+  if(finalMode) exitFinal();
   signal = s;
   document.querySelectorAll('.sigbtn').forEach(b => b.classList.toggle('active', b.dataset.sig === s));
   if(view === 'plot') rebuildCharts();
@@ -1532,12 +1547,14 @@ function setSignal(s){
 function buildSigButtons(){
   const sigKeys = Object.keys(SIGNALS);
   const tele = TELEMETRY.filter(g => teleAvail.indexOf(g.key) >= 0).map(g => g.key);
-  const want = sigKeys.concat(tele).concat(offline ? [] : ['cls']);
+  // FinalClass rides in the trace group, so it is offered only where that group is.
+  const want = sigKeys.concat(tele).concat(offline ? [] : ['cls'])
+    .concat(!offline && tele.indexOf('trace') >= 0 ? ['finalClass'] : []);
   const seg = document.getElementById('sigseg');
   if(seg.dataset.keys === want.join(',')) return;   // unchanged: leave the DOM alone
   seg.dataset.keys = want.join(',');
   seg.innerHTML = want.map(k => {
-    const on = clsMode ? (k === 'cls') : (k === signal);
+    const on = clsMode ? (k === 'cls') : finalMode ? (k === 'finalClass') : (k === signal);
     const cap = k.charAt(0).toUpperCase() + k.slice(1);
     return '<button class="sigbtn' + (on ? ' active' : '') + '" data-sig="' + k
          + '" onclick="setSignal(&quot;' + k + '&quot;)">' + cap + '</button>';
@@ -1651,6 +1668,7 @@ async function loadSession(id, from, to){
   teleAvail = Object.keys(d.telemetry || {});
   closeLoad();
   if(clsMode) exitCls();
+  if(finalMode) exitFinal();
   // A recording need not hold whatever is selected — serial sessions have no euler/quat, an
   // I2C one has no telemetry. Fall back to something the file actually contains.
   const have = Object.keys(d.signals || {}).concat(teleAvail);
@@ -1758,7 +1776,7 @@ function syncSourceBtn(d){
 }
 
 function toggleView(){
-  if(clsMode) return;   // CLS is its own page; Numbers/Plots toggle doesn't apply
+  if(clsMode || finalMode) return;   // pages of their own; Numbers/Plots toggle doesn't apply
   view = (view === 'plot') ? 'numbers' : 'plot';
   document.getElementById('viewBtn').textContent = (view === 'plot') ? 'Numbers' : 'Plots';
   document.getElementById('charts').style.display = (view === 'plot') ? 'flex' : 'none';
@@ -2175,7 +2193,51 @@ async function pollCls(){
   while(log.childNodes.length > 3000) log.removeChild(log.lastChild);
 }
 
-let sinceT = 0;                        // cursor: newest buffered-sample t already fetched
+// ---- FinalClass page ------------------------------------------------------
+// The device's own decision (trace5's finalClass), one row per frame. There is no confidence
+// column because the device sends none -- only the class index. Rows come from the /data batches
+// tick() already fetches, so they keep accumulating while the page is hidden and stop with Pause.
+function enterFinal(){
+  finalMode = true;
+  document.querySelectorAll('.sigbtn').forEach(b => b.classList.toggle('active', b.dataset.sig === 'finalClass'));
+  document.getElementById('charts').style.display = 'none';
+  document.getElementById('readout').style.display = 'none';
+  document.getElementById('finalview').style.display = 'flex';
+}
+function exitFinal(){
+  finalMode = false;
+  document.getElementById('finalview').style.display = 'none';
+  document.getElementById('charts').style.display = (view === 'plot') ? 'flex' : 'none';
+  document.getElementById('readout').style.display = (view === 'plot') ? 'none' : 'grid';
+}
+// Index -> '<span>' naming it. null (a non-finite value the server dropped) reads '--'; a value
+// that is no class index is shown as the number itself rather than guessed at.
+function finalSpan(v, cls){
+  const name = (v != null) ? CLS_NAMES[v] : null;
+  if(name != null) return '<span class="' + cls + '" style="color:' + clsColor(name) + '">' + name + '</span>';
+  return '<span class="' + cls + ' muted">' + (v == null ? '--' : v) + '</span>';
+}
+// ponytail: every row of a batch shares the poll's clock (off by < one poll, ~67 ms); per-frame
+// wall time would need samples_since to carry one.
+function appendFinal(batch, clock){
+  const log = document.getElementById('finalLog');
+  let last, any = false;
+  for(const s of batch){
+    const tr = s.telemetry && s.telemetry.trace;
+    if(!tr) continue;                    // a frame without the trace block
+    last = tr[0]; any = true;
+    const row = document.createElement('div'); row.className = 'clsrow';
+    row.innerHTML = '<span class="clstime">' + clock + '</span>' + finalSpan(last, 'clsname');
+    log.insertBefore(row, log.firstChild);
+  }
+  if(!any) return;
+  while(log.childNodes.length > FINAL_MAX_ROWS) log.removeChild(log.lastChild);
+  const banner = document.getElementById('finalBanner');
+  banner.className = 'clsbanner on';
+  banner.innerHTML = finalSpan(last, 'clscls');
+}
+
+let sinceT = 0;                       // cursor: newest buffered-sample t already fetched
 let statPolls = 0, statSamples = 0, statStart = performance.now(), rateStr = '';
 
 async function tick(){
@@ -2196,12 +2258,14 @@ async function tick(){
       if(JSON.stringify(tg) !== JSON.stringify(teleAvail)){
         teleAvail = tg;
         if(isTele(signal) && tg.indexOf(signal) < 0) signal = Object.keys(SIGNALS)[0];
+        if(finalMode && tg.indexOf('trace') < 0) exitFinal();
         buildSigButtons();
         if(view === 'plot') rebuildCharts(); else buildReadout();
       }
       const batch = (d.samples && d.samples.length) ? d.samples : [d];
       if(d.samples && d.samples.length) sinceT = d.samples[d.samples.length - 1].t;
       for(const s of batch) samples.push(s);
+      if(d.samples) appendFinal(d.samples, d.clock);   // new frames only, never the [d] fallback
       const cutoff = latestT - WINDOW_S;
       while(samples.length && samples[0].t < cutoff) samples.shift();
 

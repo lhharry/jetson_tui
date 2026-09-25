@@ -665,6 +665,13 @@ window, smoothed), `lag N s` (how late behind sample arrival the last inference 
 should stay at 0 through a session except across a device power-cycle). Together they say whether
 a quiet CLS page is a stalled stream, a slow model or a starved thread.
 
+**FinalClass page.** Next to CLS, a **FinalClass** tab shows the device's own per-step decision —
+`finalClass` from the `trace5` block — as a banner plus a log of one row per received frame,
+newest on top (the last 3000 rows, ~90 s at 33 Hz). There is no confidence column: the device sends
+only the class index. The tab exists only while the live source carries the `trace` group, and
+the log is fed from the same `/data` poll as the plots, so it keeps filling while the tab is hidden
+and stops with **Pause**. The `trace` charts still draw `finalClass` as before.
+
 
 > **Checkpoint.** Use the winning finetune-high-lr jetson_leg checkpoint from
 > LIMU-BERT-Public (`bench_run45`, `finetune-high-lr__lr0.3__seed42.pt`). Copy the `.pt`
